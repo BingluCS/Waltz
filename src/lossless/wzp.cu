@@ -1391,7 +1391,7 @@ void wzp_encode_with_sign_launch(const uint16_t* input,
     check(cudaEventRecord(s.signed_end, stream), "record signed encode end");
     // Prepare counters for the next call after the measured payload is complete.
     // Keeping the tiny reset out of the front of the queue prevents a competing
-    // cooperative IDWT from occupying every SM in the gap before encode_kernel.
+    // concurrent IDWT from occupying every SM in the gap before encode_kernel.
     reset_counter_kernel<<<1, 1, 0, stream>>>();
     check(cudaGetLastError(), "launch signed encode kernels");
 }

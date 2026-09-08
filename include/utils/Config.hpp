@@ -36,6 +36,12 @@ enum EB { EB_ABS, EB_REL, EB_PSNR, EB_L2NORM, EB_ABS_AND_REL, EB_ABS_OR_REL };
 
 enum CMP { HOST, DEVICE };
 
+enum class QuantMode : uint8_t {
+    None,
+    High,
+    All,
+};
+
 struct GPUConfig {
     int device = 0;
     cudaDeviceProp properties{};

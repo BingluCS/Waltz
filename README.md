@@ -10,8 +10,25 @@ bound.
 The current production path uses multi-kernel transforms with quantization
 fused into the final coefficient writes. WZP is the default magnitude/sign
 backend. A lightweight data-driven tuner selects between dyadic and plane
-transform topologies. Forward and inverse kernels share a 384-thread block
-configuration (`TPB=384`). One-time prewarming is disabled by default.
+transform topologies. Forward Z/axis kernels use `DWT_TPB=512`, inverse kernels
+use `IDWT_TPB=384`, and fused forward XY kernels launch with 256 threads.
+One-time prewarming is disabled by default.
+
+The source update dated 2026-09-08 includes:
+
+- Dyadic DWT: fused XY followed by a single-level Z kernel, with static shared
+  memory or direct global loads selected for each level. Float and double use
+  the common `dwt_3d_z_single_static<T>` / `dwt_3d_z_single_global<T>` entries.
+- Plane DWT: all Z levels in one launch, followed by fused XY/quantization
+  launches per level. Plane Z-all retains its shared-memory configuration.
+- `QuantMode::None`, `High`, and `All` name the quantization modes. Z tile
+  alignment and quantization-block regularity are handled independently.
+- Updated single-level IDWT Z kernels, including the bounded 32-bit reflection
+  calculation in the float4 boundary path that resolved the observed RTX PRO
+  6000 timeout in repeated tests.
+- Removal of cooperative launch paths, unused Y-chain code, and disabled
+  shared-memory search code. Compression overlaps lossless coding with IDWT;
+  supported WZP decode layouts fuse reordering and dequantization.
 
 ## Status
 
@@ -33,13 +50,16 @@ before publishing or redistributing the repository.
 - NVIDIA CUDA Toolkit 11.8 or newer
 - An NVIDIA GPU with compute capability 7.0 or newer
 
-Waltz has been validated on NVIDIA H100, H200, and RTX 4090 GPUs. Set the CUDA
-architecture explicitly for a shorter build and the best generated code:
+Earlier revisions were validated on NVIDIA H100, H200, and RTX 4090 GPUs.
+The updated IDWT reflection path was validated on H100 and RTX PRO 6000
+Blackwell; the complete synchronized repository is checked separately below.
+Set the CUDA architecture explicitly:
 
 | GPU | CMake architecture |
 | --- | --- |
 | H100 / H200 | `90` |
 | RTX 4090 | `89` |
+| RTX PRO 6000 Blackwell | `120` (tested with CUDA 13.1) |
 | A100 | `80` |
 | RTX 30 series | `86` |
 
@@ -168,19 +188,27 @@ switches are:
 
 | Variable | Effect |
 | --- | --- |
-| `WALTZ_REPORT_CE2E=1` | report complete compression/decompression call time |
+| `WALTZ_REPORT_CE2E=1` | report wall time for the timed compression/decompression region; see scope below |
 | `WALTZ_ASYNC_ALLOC=1` | enable explicit one-time pipeline preallocation/warmup |
 | `WALTZ_WZP=0` | select the legacy LC magnitude backend instead of default WZP |
-| `WALTZ_DWT_COOPERATIVE=1` | use the cooperative transform fallback for A/B testing |
+| `WALTZ_WZP_DEQUANT_FUSE_OFF=1` | disable fused WZP decode/reorder/dequantization for comparison |
 
 The default benchmark path is cold-start compatible: no hidden warmup pass is
 performed unless `WALTZ_ASYNC_ALLOC=1` is explicitly set.
 
+`WALTZ_REPORT_CE2E` starts the compression timer after optional prewarming and
+the REL range scan. It excludes input loading, input H2D transfer, and archive
+file output. The decompression timer includes reconstruction file output when
+a non-null output path is passed. To compare device-resident API wall time,
+time the API externally and pass a null reconstruction path. The stage table's
+`total` is an aggregate of GPU intervals, not a full process E2E measurement.
+Throughput labels currently say GB/s, but the calculations use GiB/s.
+
 ## Validation snapshot
 
-The current `TPB=384` revision was tested with five repetitions per field on
-H100, H200, and RTX 4090. Compression ratio and reconstruction quality were
-identical across the three GPUs:
+The synchronized 2026-09-08 repository is validated on H100 with the default
+WZP backend and prewarming disabled. The following fields retain the same
+compressed sizes and reconstruction quality as the production source:
 
 | Field | Type and dimensions | REL | CR | PSNR (dB) | Max_RE |
 | --- | --- | ---: | ---: | ---: | ---: |

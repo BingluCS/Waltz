@@ -190,12 +190,6 @@ void d_pipeline_prealloc(const WALTZ::Config& config, void* stream) {
         cudaMallocHost(reinterpret_cast<void**>(&g_pipeline_host_header),
                        sizeof(WaltzBlobHeader));
 
-    const bool prealloc_cooperative = std::getenv("WALTZ_DWT_COOPERATIVE") != nullptr;
-    if (prealloc_cooperative) {
-        if (!WALTZ::gpu_config().properties.cooperativeLaunch)
-            throw std::runtime_error("current CUDA device does not support cooperative launch");
-    }
-
     if (g_tune_acc == nullptr) {
         cudaMallocAsync(reinterpret_cast<void**>(&g_tune_acc),
                        6U * sizeof(double) + sizeof(unsigned int), st);
@@ -252,10 +246,9 @@ void d_pipeline_prealloc(const WALTZ::Config& config, void* stream) {
     cudaFreeAsync(warm_tb, st);
 
     const dim3 dims(config.dimx, config.dimy, config.dimz);
-    CDF97::idwt3d_prealloc<T>(dims, true, prealloc_cooperative, st);
-    CDF97::idwt3d_prealloc<T>(dims, false, prealloc_cooperative, st);
-    if (!prealloc_cooperative)
-        CDF97::dwt3d_split_prealloc<T>(dims, false);
+    CDF97::idwt3d_prealloc<T>(dims, true, st);
+    CDF97::idwt3d_prealloc<T>(dims, false, st);
+    CDF97::dwt3d_split_prealloc<T>(dims, false);
     cudaStreamSynchronize(st);
 }
 template <typename T, uint32_t STEP>
@@ -432,7 +425,6 @@ static int autotune_pick_mode_fast(const T* d_data, dim3 dims, uint8_t levels_xy
 template <typename T, int NDIMS>
 size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& config, const char* cmpPath, void* stream) {
     dim3 data_dims(config.dimx, config.dimy, config.dimz);
-    dim3 data_leaps(1, config.dimx, config.dimx * config.dimy);
     uint32_t datasize = config.num;
     if constexpr (NDIMS != 3) {
         throw std::runtime_error("CPU CDF97 path currently only supports 3D");
@@ -444,15 +436,6 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
         const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
         if (g_host_outlier_counts == nullptr)
             cudaMallocHost(reinterpret_cast<void**>(&g_host_outlier_counts), 2U * sizeof(unsigned int));
-        const bool use_cooperative = std::getenv("WALTZ_DWT_COOPERATIVE") != nullptr;
-        int cooperative_sm_count = 0;
-        if (use_cooperative) {
-            const WALTZ::GPUConfig& gpu = WALTZ::gpu_config();
-            if (!gpu.properties.cooperativeLaunch)
-                throw std::runtime_error("current CUDA device does not support cooperative launch");
-            cooperative_sm_count = gpu.sm_count();
-        }
-
         // Decide dyadic vs non-dyadic (wavelet packet) just like SPERR's can_use_dyadic.
         uint8_t levels_xy = 0, levels_z = 0;
         calculate_dwt_levels(data_dims, levels_xy, levels_z);
@@ -465,21 +448,7 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
 
         const uint32_t reorder_bz = WALTZ::lossless::select_block_zband(data_dims, levels_z, use_dyadic != 0U);
 
-        int blocks_per_sm = 1;
-        int i_blocks_per_sm = 1;
-        if (use_cooperative) {
-            if (use_dyadic) {
-                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, CDF97::dwt3d<T>, TPB, 0);
-                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&i_blocks_per_sm, CDF97::idwt3d<T>, TPB, 0);
-            } else {
-                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, CDF97::dwt3d_plane<T>, TPB, 0);
-                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&i_blocks_per_sm, CDF97::idwt3d_plane<T>, TPB, 0);
-            }
-        } else {
-            CDF97::dwt3d_split_prealloc<T>(data_dims, use_dyadic != 0U);
-        }
-        const int coop_blocks = use_cooperative ? blocks_per_sm * cooperative_sm_count : 0;
-        const int icoop_blocks = use_cooperative ? i_blocks_per_sm * cooperative_sm_count : 0;
+        CDF97::dwt3d_split_prealloc<T>(data_dims, use_dyadic != 0U);
 
         const char* const wzp_env = std::getenv("WALTZ_WZP");
         const uint8_t expected_mag_coder = wzp_env == nullptr || std::atoi(wzp_env) != 0 ? 7U : 0U;
@@ -503,11 +472,7 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
         const size_t mag_bytes = static_cast<size_t>(datasize) * sizeof(uint16_t);
         const size_t sb_bytes = ((static_cast<size_t>(datasize) + 8191) / 8192) * 1024;
         const size_t mk_bytes = ((static_cast<size_t>(datasize) + 63) / 64) * 8;
-        const bool plane_z_direct = !use_dyadic && !use_cooperative;
-        // The production multi-kernel transform always quantizes coefficients at
-        // their final DWT write.  The cooperative path is retained only as a
-        // transform A/B fallback and uses the standalone quantizer.
-        const bool fused_dwt_quant = !use_cooperative;
+        const bool plane_z_direct = !use_dyadic;
         const uint32_t fused_bz = reorder_bz;
         GPUTimer block_rank_timer;
 
@@ -528,19 +493,17 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
         if (!plane_z_direct)
             cudaMemcpyAsync(d_data, d_oridata, bytes, cudaMemcpyDeviceToDevice, cuda_stream);
 
-        if (fused_dwt_quant) {
-            block_rank_timer.start(stream);
-            WALTZ::lossless::d_build_block_rank<<<(16U * 16U * fused_bz + 255U) / 256U, 256, 0, cuda_stream>>>(d_tb, 16U, 16U, fused_bz);
-            block_rank_timer.record_stop(stream);
+        block_rank_timer.start(stream);
+        WALTZ::lossless::d_build_block_rank<<<(16U * 16U * fused_bz + 255U) / 256U, 256, 0, cuda_stream>>>(d_tb, 16U, 16U, fused_bz);
+        block_rank_timer.record_stop(stream);
 
-            cudaMemsetAsync(d_q, 0, bytes, cuda_stream);
-            cudaMemsetAsync(d_q_abs, 0, mag_bytes, cuda_stream);
-            cudaMemsetAsync(d_q_sign, 0, sb_bytes, cuda_stream);
-            cudaMemsetAsync(d_qoc, 0, sizeof(unsigned int), cuda_stream);
+        cudaMemsetAsync(d_q, 0, bytes, cuda_stream);
+        cudaMemsetAsync(d_q_abs, 0, mag_bytes, cuda_stream);
+        cudaMemsetAsync(d_q_sign, 0, sb_bytes, cuda_stream);
+        cudaMemsetAsync(d_qoc, 0, sizeof(unsigned int), cuda_stream);
 
-            CDF97::set_quant_params<T>(d_q_abs, d_q_sign, reinterpret_cast<T*>(d_q), d_tb, data_dims, fused_bz, 
-                quantity, d_qoi, d_qov, d_qoc, qout_cap, cuda_stream);
-        }
+        CDF97::set_quant_params<T>(d_q_abs, d_q_sign, reinterpret_cast<T*>(d_q), d_tb,
+            data_dims, fused_bz, quantity, d_qoi, d_qov, d_qoc, qout_cap, cuda_stream);
         cudaStreamSynchronize(cuda_stream);
 
         double gpu_predict_ms;
@@ -549,37 +512,22 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
         timer.start(stream);
         CDF97::d_reset<<<1, 1, 0, cuda_stream>>>();
         if (use_dyadic) {
-            if (!use_cooperative) {
-                CDF97::dwt3d_xy_halo_zstage<T, 2>(
-                    d_data, tmp_data, data_dims, dyadic_level, fused_bz, cuda_stream);
-            } else {
-                void* args[] = {&d_data, &tmp_data, &data_dims, &data_leaps, &datasize, &dyadic_level};
-                cudaLaunchCooperativeKernel(
-                    reinterpret_cast<void*>(CDF97::dwt3d<T>), dim3(coop_blocks), dim3(TPB), args, 0, cuda_stream);
-            }
+            CDF97::dwt3d_xy_halo_zstage<T>(d_data, tmp_data, data_dims, dyadic_level, fused_bz, cuda_stream);
         } else {
-            if (!use_cooperative) {
-                if constexpr (std::is_same_v<T, float>) {
-                    // The fused first XY level is out-of-place; the launcher
-                    // swaps these host pointers after enqueueing all kernels,
-                    // so no volume copy is required before quantization.
-                    float*& fdata = reinterpret_cast<float*&>(d_data);
-                    float*& ftmp = reinterpret_cast<float*&>(tmp_data);
-                    const float* const plane_source = reinterpret_cast<const float*>(d_oridata);
-                    CDF97::dwt3d_plane_xy_halo_float<2>(
-                        fdata, ftmp, data_dims, levels_xy, levels_z, plane_source, cuda_stream);
-                } else {
-                    T*& plane_data = d_data;
-                    T*& plane_tmp = tmp_data;
-                    CDF97::dwt3d_plane_xy_halo_generic<T, 2>(
-                        plane_data, plane_tmp, data_dims, levels_xy, levels_z, d_oridata, cuda_stream);
-                }
+            if constexpr (std::is_same_v<T, float>) {
+                // The fused first XY level is out-of-place; the launcher
+                // swaps these host pointers after enqueueing all kernels,
+                // so no volume copy is required before quantization.
+                float*& fdata = reinterpret_cast<float*&>(d_data);
+                float*& ftmp = reinterpret_cast<float*&>(tmp_data);
+                const float* const plane_source = reinterpret_cast<const float*>(d_oridata);
+                CDF97::dwt3d_plane_xy_halo_float(
+                    fdata, ftmp, data_dims, levels_xy, levels_z, plane_source, fused_bz, cuda_stream);
             } else {
-                void* args[] = {&d_data, &tmp_data, &data_dims, &data_leaps,
-                                &levels_xy, &levels_z};
-                cudaLaunchCooperativeKernel(reinterpret_cast<void*>(CDF97::dwt3d_plane<T>),
-                                            dim3(coop_blocks), dim3(TPB), args, 0,
-                                            cuda_stream);
+                T*& plane_data = d_data;
+                T*& plane_tmp = tmp_data;
+                CDF97::dwt3d_plane_xy_halo_generic<T, QuantMode::All>(
+                    plane_data, plane_tmp, data_dims, levels_xy, levels_z, d_oridata, fused_bz, cuda_stream);
             }
         }
         timer.record_stop(stream);
@@ -591,125 +539,71 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
                     static_cast<unsigned>(levels_xy),
                     static_cast<unsigned>(levels_z));
 
-        cudaStreamSynchronize(cuda_stream);
-
-        const uint32_t q_bx = 16u;
-        const uint32_t q_by = 16u;
-        const uint32_t q_bz = fused_bz;
-        const uint32_t q_nbx = (data_dims.x + q_bx - 1u) / q_bx;
-        const uint32_t q_nby = (data_dims.y + q_by - 1u) / q_by;
-        const uint32_t q_nbz = (data_dims.z + q_bz - 1u) / q_bz;
-        const uint32_t q_blocks = q_nbx * q_nby * q_nbz;
-        const uint32_t tb_n = q_bx * q_by * q_bz; // iperm table entries
-
-        // Error-bounded compression: quantize/reorder -> lossless magnitude/sign ->
-        // IDWT -> record exact reconstruction errors that exceed the bound.
-        GPUTimer quant_timer, lc_timer, idwt_timer, outlier_timer;
-        double t_quant;
-        quant_timer.start(stream);
-        if (!fused_dwt_quant) {
-            cudaMemsetAsync(d_qoc, 0, sizeof(unsigned int), cuda_stream);
-            cudaMemsetAsync(d_q_sign, 0, sb_bytes, cuda_stream);
-            WALTZ::quantizer::d_build_block_ioffset<<<(tb_n + 255) / 256, 256, 0, cuda_stream>>>(
-                reinterpret_cast<uint32_t*>(d_tb), q_bx, q_by, q_bz, data_dims.x,
-                static_cast<size_t>(data_dims.x) * data_dims.y);
-            WALTZ::quantizer::d_quant_reorder_kernel<T, true, true><<<q_blocks, 128, 0, cuda_stream>>>(
-                d_data, d_q_abs, d_q_sign, d_q, data_dims.x, data_dims.y, data_dims.z,
-                q_bx, q_by, q_bz, q_nbx, q_nby, d_tb, quantity, d_qoi, d_qov, d_qoc,
-                qout_cap);
-        }
-        quant_timer.record_stop(stream);
-
-        // Reconstruct on a side stream while the lossless backend consumes
-        // the independent quantized stream.  This scheduling depends only on
-        // transform topology and implementation support, never field shape.
-        const bool overlap_idwt = !use_cooperative;
+        // Error-bounded compression: lossless magnitude/sign runs on the main
+        // stream while reconstruction runs on an independent stream.
+        GPUTimer lc_timer, outlier_timer;
+        const double t_quant = 0.0;
         cudaStream_t cuda_stream1;
         cudaEvent_t overlap_done, overlap_begin;
-        const bool plane_pwe_fused = !use_dyadic && levels_z > 0 && data_dims.z * 2U <= WALTZ::IDWT_SHARED_BYTES / sizeof(T);
+        const bool plane_pwe_fused =
+            !use_dyadic && levels_z > 0 &&
+            data_dims.z * 2U <= WALTZ::IDWT_SHARED_BYTES / sizeof(T);
         long long magc;
         uint32_t nnz;
         double t_mag;
+
         lc_timer.start(stream);
         if (expected_mag_coder == 7)
-            WALTZ::lossless::wzp_encode_with_sign_launch(d_q_abs, d_q_sign, datasize, cuda_stream);
+            WALTZ::lossless::wzp_encode_with_sign_launch(
+                d_q_abs, d_q_sign, datasize, cuda_stream);
         else
-            WALTZ::lossless::lc_compress_bit2_rze1_with_sign_launch(d_q_abs, static_cast<long long>(mag_bytes), d_q_sign, d_mk, datasize,cuda_stream);
+            WALTZ::lossless::lc_compress_bit2_rze1_with_sign_launch(
+                d_q_abs, static_cast<long long>(mag_bytes), d_q_sign, d_mk, datasize,
+                cuda_stream);
         lc_timer.record_stop(stream);
 
-        if (overlap_idwt) {
-            cudaStreamCreateWithFlags(&cuda_stream1, cudaStreamNonBlocking);
-            cudaStreamWaitEvent(cuda_stream1, quant_timer.end, 0);
-            cudaEventCreate(&overlap_begin);
-            cudaEventCreate(&overlap_done);
-            cudaMemsetAsync(d_cnt, 0, sizeof(unsigned int), cuda_stream1);
-            cudaEventRecord(overlap_begin, cuda_stream1);
-            if (use_dyadic) {
-                CDF97::idwt3d_dyadic<T>(d_q, data_dims, dyadic_level, cuda_stream1, nullptr, 0, d_oridata, real_error, d_cnt, 
-                    d_poi, d_poe, pout_cap, tmp_data);
-            } else if constexpr (std::is_same_v<T, float>) {
-                CDF97::idwt3d_plane_hybrid_float(reinterpret_cast<float*>(d_q), reinterpret_cast<float*>(tmp_data), data_dims,
-                    levels_xy, levels_z, cuda_stream1, plane_pwe_fused ? reinterpret_cast<const float*>(d_oridata) : nullptr, real_error, d_cnt,
-                    d_poi, reinterpret_cast<float*>(d_poe), pout_cap, false);
-            } else {
-                CDF97::idwt3d_plane_hybrid_double(reinterpret_cast<double*>(d_q), reinterpret_cast<double*>(tmp_data), data_dims,
-                    levels_xy, levels_z, cuda_stream1, plane_pwe_fused ? reinterpret_cast<const double*>(d_oridata) : nullptr, real_error, d_cnt,
-                    d_poi, reinterpret_cast<double*>(d_poe), pout_cap);
-            }
-            cudaEventRecord(overlap_done, cuda_stream1);
+        cudaStreamCreateWithFlags(&cuda_stream1, cudaStreamNonBlocking);
+        cudaStreamWaitEvent(cuda_stream1, timer.end, 0);
+        cudaEventCreate(&overlap_begin);
+        cudaEventCreate(&overlap_done);
+        cudaMemsetAsync(d_cnt, 0, sizeof(unsigned int), cuda_stream1);
+        cudaEventRecord(overlap_begin, cuda_stream1);
+        if (use_dyadic) {
+            CDF97::idwt3d_dyadic<T>(d_q, data_dims, dyadic_level, cuda_stream1, nullptr,
+                d_oridata, real_error, d_cnt, d_poi, d_poe, pout_cap, tmp_data);
+        } else if constexpr (std::is_same_v<T, float>) {
+            CDF97::idwt3d_plane_hybrid_float(
+                reinterpret_cast<float*>(d_q), reinterpret_cast<float*>(tmp_data),
+                data_dims, levels_xy, levels_z, cuda_stream1,
+                plane_pwe_fused ? reinterpret_cast<const float*>(d_oridata) : nullptr,
+                real_error, d_cnt, d_poi, reinterpret_cast<float*>(d_poe), pout_cap,
+                false);
+        } else {
+            CDF97::idwt3d_plane_hybrid_double(
+                reinterpret_cast<double*>(d_q), reinterpret_cast<double*>(tmp_data),
+                data_dims, levels_xy, levels_z, cuda_stream1,
+                plane_pwe_fused ? reinterpret_cast<const double*>(d_oridata) : nullptr,
+                real_error, d_cnt, d_poi, reinterpret_cast<double*>(d_poe), pout_cap);
         }
+        cudaEventRecord(overlap_done, cuda_stream1);
 
         // Fused magnitude+sign backends pack negative bits while each
         // magnitude chunk is resident; WZP additionally keeps sign
         // ranks local to independently decodable groups.
         if (expected_mag_coder == 7)
-            magc = static_cast<long long>(WALTZ::lossless::wzp_encode_with_sign_finish(&nnz, &t_mag, cuda_stream));
+            magc = static_cast<long long>(
+                WALTZ::lossless::wzp_encode_with_sign_finish(
+                    &nnz, &t_mag, cuda_stream));
         else
-            nnz = WALTZ::lossless::lc_compress_bit2_rze1_with_sign_finish(&magc, cuda_stream);
-        const long long sign_bytes = expected_mag_coder == 7 ? 0 : (static_cast<long long>(nnz) + 7) / 8;
+            nnz = WALTZ::lossless::lc_compress_bit2_rze1_with_sign_finish(
+                &magc, cuda_stream);
+        const long long sign_bytes =
+            expected_mag_coder == 7 ? 0 : (static_cast<long long>(nnz) + 7) / 8;
 
-        // IDWT(dequant) -> x_hat in d_q.  Supported multi-kernel paths fuse
-        // outlier detection into their final inverse pass when resources permit.
-        double t_idwt;
-        if (!overlap_idwt) {
-            cudaMemsetAsync(d_cnt, 0, sizeof(unsigned int), cuda_stream);
-            idwt_timer.start(stream);
-            if (use_dyadic) {
-                CDF97::idwt3d_dyadic<T>(d_q, data_dims, dyadic_level, cuda_stream, nullptr,
-                    use_cooperative ? icoop_blocks : 0, d_oridata, real_error, d_cnt, d_poi,
-                    d_poe, pout_cap, tmp_data, use_cooperative);
-            } else {
-                int lvl_xy = levels_xy, lvl_z = levels_z;
-                uint32_t plane_ocap = pout_cap;
-                const T* d_orig_arg = plane_pwe_fused ? d_oridata : nullptr;
-                if constexpr (std::is_same_v<T, float>) {
-                    if (!use_cooperative) {
-                        CDF97::idwt3d_plane_hybrid_float(reinterpret_cast<float*>(d_q), reinterpret_cast<float*>(tmp_data), data_dims, 
-                        lvl_xy, lvl_z, cuda_stream, reinterpret_cast<const float*>(d_orig_arg), real_error, d_cnt, d_poi, d_poe, plane_ocap, false);
-                    } else {
-                        void* iargs[] = {&d_q, &tmp_data, &data_dims.x, &data_dims.y,
-                            &data_dims.z, &lvl_xy, &lvl_z, &d_orig_arg, &real_error,
-                            &d_cnt, &d_poi, &d_poe, &plane_ocap};
-                        cudaLaunchCooperativeKernel(reinterpret_cast<void*>(CDF97::idwt3d_plane<T>), dim3(icoop_blocks), dim3(TPB), iargs, 0, cuda_stream);
-                    }
-                } else if (!use_cooperative) {
-                    CDF97::idwt3d_plane_hybrid_double(reinterpret_cast<double*>(d_q), reinterpret_cast<double*>(tmp_data), data_dims, lvl_xy, lvl_z, 
-                    cuda_stream, reinterpret_cast<const double*>(d_orig_arg), real_error, d_cnt, d_poi, reinterpret_cast<double*>(d_poe), plane_ocap);
-                } else {
-                    void* iargs[] = {&d_q, &tmp_data, &data_dims.x, &data_dims.y,
-                        &data_dims.z, &lvl_xy, &lvl_z, &d_orig_arg, &real_error,
-                        &d_cnt, &d_poi, &d_poe, &plane_ocap};
-                    cudaLaunchCooperativeKernel(reinterpret_cast<void*>(CDF97::idwt3d_plane<T>), dim3(icoop_blocks), dim3(TPB), iargs,
-                        0, cuda_stream);
-                }
-            }
-            idwt_timer.record_stop(stream);
-        } else {
-            cudaEventSynchronize(overlap_done);
-            float overlap_ms = 0.0f;
-            cudaEventElapsedTime(&overlap_ms, overlap_begin, overlap_done);
-            t_idwt = overlap_ms;
-        }
+        cudaEventSynchronize(overlap_done);
+        float overlap_ms = 0.0f;
+        cudaEventElapsedTime(&overlap_ms, overlap_begin, overlap_done);
+        const double t_idwt = overlap_ms;
         double t_out = 0.0; // dyadic: fused into IDWT above
         const bool needs_pwe_scan = !use_dyadic && !plane_pwe_fused;
         if (needs_pwe_scan) {
@@ -729,18 +623,13 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
         // per-stage kernel timings without inserting bubbles between
         // dependent stages in the actual cE2E path.
         gpu_predict_ms = timer.elapsed_ready();
-        t_quant = quant_timer.elapsed_ready();
         if (expected_mag_coder != 7)
             t_mag = lc_timer.elapsed_ready();
-        if (!overlap_idwt)
-            t_idwt = idwt_timer.elapsed_ready();
         if (needs_pwe_scan)
             t_out = outlier_timer.elapsed_ready();
-        if (overlap_idwt) {
-            cudaEventDestroy(overlap_begin);
-            cudaEventDestroy(overlap_done);
-            cudaStreamDestroy(cuda_stream1);
-        }
+        cudaEventDestroy(overlap_begin);
+        cudaEventDestroy(overlap_done);
+        cudaStreamDestroy(cuda_stream1);
         if (nqo > qout_cap)
             std::printf("[WALTZ] WARNING: q-outliers %u exceed cap %u (records dropped)\n", nqo, qout_cap);
         if (no > pout_cap)
@@ -765,7 +654,7 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
             // the exact reorder z-band.  Legacy blobs have zero in
             // the high bits and remain decodable via the old rule.
             hdr.use_dyadic =
-                static_cast<uint8_t>((use_dyadic ? 1U : 0U) | (q_bz << 1U));
+                static_cast<uint8_t>((use_dyadic ? 1U : 0U) | (fused_bz << 1U));
             hdr.sep_xy = 0U;
             hdr.levels_xy = levels_xy;
             hdr.levels_z = levels_z;
@@ -810,8 +699,8 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
         }
 
         const double orig = static_cast<double>(datasize) * sizeof(T);
-        const double t_block_rank = fused_dwt_quant ? block_rank_timer.elapsed_ready() : 0.0;
-        const double t_codec_overlap = overlap_idwt ? max(t_mag, t_idwt) : (t_mag + t_idwt);
+        const double t_block_rank = block_rank_timer.elapsed_ready();
+        const double t_codec_overlap = max(t_mag, t_idwt);
         const double t_tot = tune_ms + t_block_rank + gpu_predict_ms + t_quant + t_codec_overlap + t_out;
         const double GiB = 1024.0 * 1024.0 * 1024.0;
         const long long stored_bytes = blob_bytes != 0U ? static_cast<long long>(blob_bytes) : payload_bytes;
@@ -909,26 +798,6 @@ size_t d_WALTZ_decompress(
                                       : WALTZ::lossless::block_zband(dims.z, hdr.levels_z);
     if (dec_quant_bz < 1U || dec_quant_bz > 32U)
         throw std::runtime_error("invalid Waltz reorder z-band");
-    const bool use_cooperative = std::getenv("WALTZ_DWT_COOPERATIVE") != nullptr;
-    const bool dec_cooperative_idwt = use_cooperative;
-    int dec_i_blocks_per_sm = 1;
-    int dec_cooperative_sm_count = 0;
-    if (dec_cooperative_idwt) {
-        const WALTZ::GPUConfig& gpu = WALTZ::gpu_config();
-        if (!gpu.properties.cooperativeLaunch)
-            throw std::runtime_error("current CUDA device does not support cooperative launch");
-        dec_cooperative_sm_count = gpu.sm_count();
-        if (dec_use_dyadic)
-            check_cuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                           &dec_i_blocks_per_sm, CDF97::idwt3d<T>, TPB, 0),
-                       "query decode cooperative dyadic IDWT occupancy");
-        else
-            check_cuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                           &dec_i_blocks_per_sm, CDF97::idwt3d_plane<T>, TPB, 0),
-                       "query decode cooperative plane IDWT occupancy");
-    }
-    const int dec_icoop_blocks =
-        dec_cooperative_idwt ? dec_i_blocks_per_sm * dec_cooperative_sm_count : 0;
     // section offsets (mirror the compressor)
     size_t bo = blob_align(sizeof(WaltzBlobHeader));
     const size_t s_mag = bo;
@@ -965,10 +834,9 @@ size_t d_WALTZ_decompress(
     check_cuda(cudaMemsetAsync(d_q_sign, 0, sb_bytes, cuda_stream), "dec premap sb");
     check_cuda(cudaMemsetAsync(d_tb, 0, 32 * 32 * 32 * sizeof(uint16_t), cuda_stream),
                "dec premap tb");
-    check_cuda(
-        CDF97::idwt3d_prealloc<T>(dims, dec_use_dyadic, dec_cooperative_idwt, cuda_stream),
-        "dec idwt prealloc");
-    if (!dec_use_dyadic && !dec_cooperative_idwt) {
+    check_cuda(CDF97::idwt3d_prealloc<T>(dims, dec_use_dyadic, cuda_stream),
+               "dec idwt prealloc");
+    if (!dec_use_dyadic) {
         check_cuda(CDF97::idwt3d_plane_prealloc<T>(dims), "dec prealloc plane IDWT");
     }
     GPUTimer lc_timer, block_iperm_timer, unquant_timer, idwt_timer, pwe_timer;
@@ -1099,41 +967,17 @@ size_t d_WALTZ_decompress(
     idwt_timer.start(stream); // 5) IDWT (in place)
     if (dec_use_dyadic) {
         const int level = std::min(hdr.levels_xy, hdr.levels_z);
-        check_cuda(CDF97::idwt3d_dyadic<T>(d_decData,
-                                           dims,
-                                           level,
-                                           cuda_stream,
-                                           nullptr,
-                                           dec_cooperative_idwt ? dec_icoop_blocks : 0,
-                                           nullptr,
-                                           0.0,
-                                           nullptr,
-                                           nullptr,
-                                           nullptr,
-                                           0,
-                                           nullptr,
-                                           dec_cooperative_idwt),
+        check_cuda(CDF97::idwt3d_dyadic<T>(d_decData, dims, level, cuda_stream),
                    "dec selected dyadic idwt");
     } else if constexpr (std::is_same_v<T, float>) {
-        if (!dec_cooperative_idwt) {
-            check_cuda(CDF97::idwt3d_plane_hybrid_float(reinterpret_cast<float*>(d_decData),
-                                                        nullptr,
-                                                        dims,
-                                                        hdr.levels_xy,
-                                                        hdr.levels_z,
-                                                        cuda_stream),
-                       "dec plane IDWT hybrid");
-        } else {
-            check_cuda(CDF97::idwt3d_plane_levels<T>(d_decData,
-                                                     dims,
-                                                     hdr.levels_xy,
-                                                     hdr.levels_z,
-                                                     cuda_stream,
-                                                     nullptr,
-                                                     dec_icoop_blocks),
-                       "dec idwt plane");
-        }
-    } else if (!dec_cooperative_idwt) {
+        check_cuda(CDF97::idwt3d_plane_hybrid_float(reinterpret_cast<float*>(d_decData),
+                                                    nullptr,
+                                                    dims,
+                                                    hdr.levels_xy,
+                                                    hdr.levels_z,
+                                                    cuda_stream),
+                   "dec plane IDWT hybrid");
+    } else {
         check_cuda(CDF97::idwt3d_plane_hybrid_double(reinterpret_cast<double*>(d_decData),
                                                      nullptr,
                                                      dims,
@@ -1141,15 +985,6 @@ size_t d_WALTZ_decompress(
                                                      hdr.levels_z,
                                                      cuda_stream),
                    "dec double plane IDWT hybrid");
-    } else {
-        check_cuda(CDF97::idwt3d_plane_levels<T>(d_decData,
-                                                 dims,
-                                                 hdr.levels_xy,
-                                                 hdr.levels_z,
-                                                 cuda_stream,
-                                                 nullptr,
-                                                 dec_icoop_blocks),
-                   "dec idwt plane");
     }
     idwt_timer.record_stop(stream);
     double t_idwt = 0.0;

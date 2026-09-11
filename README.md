@@ -14,18 +14,25 @@ transform topologies. Forward Z/axis kernels use `DWT_TPB=512`, inverse kernels
 use `IDWT_TPB=384`, and fused forward XY kernels launch with 256 threads.
 One-time prewarming is disabled by default.
 
-The source update dated 2026-09-08 includes:
+The source update dated 2026-09-11 includes:
 
 - Dyadic DWT: fused XY followed by a single-level Z kernel, with static shared
   memory or direct global loads selected for each level. Float and double use
   the common `dwt_3d_z_single_static<T>` / `dwt_3d_z_single_global<T>` entries.
 - Plane DWT: all Z levels in one launch, followed by fused XY/quantization
-  launches per level. Plane Z-all retains its shared-memory configuration.
+  launches per level. Plane Z-all now uses a fixed 45 KiB static shared-memory
+  allocation; float and double share the `dwt3d_plane_xy_halo_z<T>` launcher.
 - `QuantMode::None`, `High`, and `All` name the quantization modes. Z tile
   alignment and quantization-block regularity are handled independently.
-- Updated single-level IDWT Z kernels, including the bounded 32-bit reflection
-  calculation in the float4 boundary path that resolved the observed RTX PRO
-  6000 timeout in repeated tests.
+- Updated single-level IDWT Z kernels, with float4 and aligned double2 paths,
+  bounded 32-bit shared-memory reflection, and corrected four-output Y/Z
+  interior bounds. Launch grids are cached in `IDWTConfig<T>` during
+  preallocation rather than queried inside each transform level.
+- Wide float dyadic IDWT uses whole-row Y-then-X fusion when a row pair fits
+  in its 48 KiB shared allocation. The row-pair count adapts to the active
+  width. Compression-side PWE reconstruction and decompression share this
+  path; narrow float, double and plane paths keep their existing algorithms.
+  Oversized or degenerate cases retain the separate-axis fallback.
 - Removal of cooperative launch paths, unused Y-chain code, and disabled
   shared-memory search code. Compression overlaps lossless coding with IDWT;
   supported WZP decode layouts fuse reordering and dequantization.
@@ -51,8 +58,10 @@ before publishing or redistributing the repository.
 - An NVIDIA GPU with compute capability 7.0 or newer
 
 Earlier revisions were validated on NVIDIA H100, H200, and RTX 4090 GPUs.
-The updated IDWT reflection path was validated on H100 and RTX PRO 6000
-Blackwell; the complete synchronized repository is checked separately below.
+The updated wide float IDWT implementation was compared on H100, RTX 4090
+and RTX PRO 6000 Blackwell, including kernel and API end-to-end timings.
+It is not claimed to be the fastest implementation on every GPU or shape;
+the complete synchronized repository is checked separately below.
 Set the CUDA architecture explicitly:
 
 | GPU | CMake architecture |
@@ -206,9 +215,21 @@ Throughput labels currently say GB/s, but the calculations use GiB/s.
 
 ## Validation snapshot
 
-The synchronized 2026-09-08 repository is validated on H100 with the default
-WZP backend and prewarming disabled. The following fields retain the same
-compressed sizes and reconstruction quality as the production source:
+The synchronized 2026-09-11 repository was freshly built and installed with
+CUDA 13.1 for H100 (`sm_90`). An external CMake consumer using
+`find_package(Waltz CONFIG REQUIRED)` also compiled and ran successfully.
+
+On H100 CUDA0, API regression against the current production source passed
+12 processes / 36 compression-decompression repetitions with WZP and
+`WALTZ_ASYNC_ALLOC=1`. Mode and compressed size were checked each repetition;
+CR, PSNR, Max_RE and decoded-data hashes matched at each process's final
+repetition. Tests covered the four fields below, SCALE PRES, and a synthetic
+1024 x 512 x 256 reshape of NYX to exercise the new wide float dyadic branch.
+The reshape is a branch-coverage test, not a physical NYX field or a
+performance result. Normal SCALE and Hurricane retained plane mode.
+
+The following fields retain the same compressed sizes and reconstruction
+quality as the production source:
 
 | Field | Type and dimensions | REL | CR | PSNR (dB) | Max_RE |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -234,6 +255,10 @@ tools/wzp_gpu_bench.cu   optional WZP round-trip benchmark
 ## Known limitations
 
 - Only 3D float32 and float64 compression/decompression is supported.
+- When the tuner selects plane mode with a Z transform, the static Z-all
+  buffer requires `NZ <= 5760` for float32 or `NZ <= 2880` for float64.
+  Larger plane columns currently raise an error; there is no automatic
+  dynamic-shared-memory fallback for this stage.
 - The command-line tool does not yet implement standalone reopening of a saved
   `.waltz` archive.
 - The blob header currently follows the native host ABI and endianness.

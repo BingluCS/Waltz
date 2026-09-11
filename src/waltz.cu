@@ -446,9 +446,15 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
             cuda_stream, &tune_ms);
         use_dyadic = mode == 0 ? 1 : 0;
 
+        if (!use_dyadic && levels_z > 0 &&
+            data_dims.z > CDF97::DWT_Z_STATIC_BYTES / (2U * sizeof(T)))
+            throw std::invalid_argument("Waltz: plane Z column exceeds the 45 KiB static shared-memory capacity");
+
         const uint32_t reorder_bz = WALTZ::lossless::select_block_zband(data_dims, levels_z, use_dyadic != 0U);
 
         CDF97::dwt3d_split_prealloc<T>(data_dims, use_dyadic != 0U);
+        check_cuda(CDF97::idwt3d_prealloc<T>(data_dims, use_dyadic != 0U, cuda_stream, false),
+                   "compress idwt prealloc");
 
         const char* const wzp_env = std::getenv("WALTZ_WZP");
         const uint8_t expected_mag_coder = wzp_env == nullptr || std::atoi(wzp_env) != 0 ? 7U : 0U;
@@ -512,23 +518,10 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
         timer.start(stream);
         CDF97::d_reset<<<1, 1, 0, cuda_stream>>>();
         if (use_dyadic) {
-            CDF97::dwt3d_xy_halo_zstage<T>(d_data, tmp_data, data_dims, dyadic_level, fused_bz, cuda_stream);
+            CDF97::dwt3d_xy_halo_z<T>(d_data, tmp_data, data_dims, dyadic_level, fused_bz, cuda_stream);
         } else {
-            if constexpr (std::is_same_v<T, float>) {
-                // The fused first XY level is out-of-place; the launcher
-                // swaps these host pointers after enqueueing all kernels,
-                // so no volume copy is required before quantization.
-                float*& fdata = reinterpret_cast<float*&>(d_data);
-                float*& ftmp = reinterpret_cast<float*&>(tmp_data);
-                const float* const plane_source = reinterpret_cast<const float*>(d_oridata);
-                CDF97::dwt3d_plane_xy_halo_float(
-                    fdata, ftmp, data_dims, levels_xy, levels_z, plane_source, fused_bz, cuda_stream);
-            } else {
-                T*& plane_data = d_data;
-                T*& plane_tmp = tmp_data;
-                CDF97::dwt3d_plane_xy_halo_generic<T, QuantMode::All>(
-                    plane_data, plane_tmp, data_dims, levels_xy, levels_z, d_oridata, fused_bz, cuda_stream);
-            }
+            CDF97::dwt3d_plane_xy_halo_z<T>(
+                d_data, tmp_data, data_dims, levels_xy, levels_z, d_oridata, fused_bz, cuda_stream);
         }
         timer.record_stop(stream);
 
@@ -569,17 +562,17 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
         cudaMemsetAsync(d_cnt, 0, sizeof(unsigned int), cuda_stream1);
         cudaEventRecord(overlap_begin, cuda_stream1);
         if (use_dyadic) {
-            CDF97::idwt3d_dyadic<T>(d_q, data_dims, dyadic_level, cuda_stream1, nullptr,
-                d_oridata, real_error, d_cnt, d_poi, d_poe, pout_cap, tmp_data);
+            CDF97::idwt3d_xy_halo_z<T>(d_q, tmp_data, data_dims, dyadic_level, cuda_stream1,
+                d_oridata, real_error, d_cnt, d_poi, d_poe, pout_cap);
         } else if constexpr (std::is_same_v<T, float>) {
-            CDF97::idwt3d_plane_hybrid_float(
+            CDF97::idwt3d_plane_xy_halo_z_float(
                 reinterpret_cast<float*>(d_q), reinterpret_cast<float*>(tmp_data),
                 data_dims, levels_xy, levels_z, cuda_stream1,
                 plane_pwe_fused ? reinterpret_cast<const float*>(d_oridata) : nullptr,
                 real_error, d_cnt, d_poi, reinterpret_cast<float*>(d_poe), pout_cap,
                 false);
         } else {
-            CDF97::idwt3d_plane_hybrid_double(
+            CDF97::idwt3d_plane_xy_halo_z_double(
                 reinterpret_cast<double*>(d_q), reinterpret_cast<double*>(tmp_data),
                 data_dims, levels_xy, levels_z, cuda_stream1,
                 plane_pwe_fused ? reinterpret_cast<const double*>(d_oridata) : nullptr,
@@ -967,10 +960,12 @@ size_t d_WALTZ_decompress(
     idwt_timer.start(stream); // 5) IDWT (in place)
     if (dec_use_dyadic) {
         const int level = std::min(hdr.levels_xy, hdr.levels_z);
-        check_cuda(CDF97::idwt3d_dyadic<T>(d_decData, dims, level, cuda_stream),
+        check_cuda(CDF97::idwt3d_xy_halo_z<T>(
+                       d_decData, static_cast<T*>(CDF97::IdwtScratch<T>::tmp), dims, level,
+                       cuda_stream),
                    "dec selected dyadic idwt");
     } else if constexpr (std::is_same_v<T, float>) {
-        check_cuda(CDF97::idwt3d_plane_hybrid_float(reinterpret_cast<float*>(d_decData),
+        check_cuda(CDF97::idwt3d_plane_xy_halo_z_float(reinterpret_cast<float*>(d_decData),
                                                     nullptr,
                                                     dims,
                                                     hdr.levels_xy,
@@ -978,7 +973,7 @@ size_t d_WALTZ_decompress(
                                                     cuda_stream),
                    "dec plane IDWT hybrid");
     } else {
-        check_cuda(CDF97::idwt3d_plane_hybrid_double(reinterpret_cast<double*>(d_decData),
+        check_cuda(CDF97::idwt3d_plane_xy_halo_z_double(reinterpret_cast<double*>(d_decData),
                                                      nullptr,
                                                      dims,
                                                      hdr.levels_xy,

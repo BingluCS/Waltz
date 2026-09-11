@@ -27,6 +27,11 @@
 #define IDWT_TPB 384
 #define TPB IDWT_TPB
 
+// The wide row-fused path keeps the original 12-pair algorithm in a fixed
+// 48-KiB shared allocation.  The host chooses the largest pair count that fits
+// that allocation for the active X width.
+inline constexpr size_t IDWT_YX_FLOAT_WIDE_SHARED_BYTES = 48U * 1024U;
+
 // even-output (low-phase) polyphase filter, symmetric: {IL0,IL1,IL2,IL3,IL2,IL1,IL0}
 #ifdef WALTZ_P4_TRANSFORM
 #define IL0 0.0
@@ -158,6 +163,39 @@ __device__ __forceinline__ float4 idwt_odd4(float4 c0,
             float(IH3) * (c3.w + c5.w) + float(IH4) * c4.w);
 }
 
+// Two-column companion of the float4 Z synthesis helpers.  The vector only
+// changes the shared/global transaction width; each lane keeps the scalar
+// double-precision tap expression and ordering.
+__device__ __forceinline__ double2 idwt_even2(double2 c0,
+                                              double2 c1,
+                                              double2 c2,
+                                              double2 c3,
+                                              double2 c4,
+                                              double2 c5,
+                                              double2 c6) {
+    return make_double2(
+        double(IL0) * (c0.x + c6.x) + double(IL1) * (c1.x + c5.x) +
+            double(IL2) * (c2.x + c4.x) + double(IL3) * c3.x,
+        double(IL0) * (c0.y + c6.y) + double(IL1) * (c1.y + c5.y) +
+            double(IL2) * (c2.y + c4.y) + double(IL3) * c3.y);
+}
+
+__device__ __forceinline__ double2 idwt_odd2(double2 c0,
+                                             double2 c1,
+                                             double2 c2,
+                                             double2 c3,
+                                             double2 c4,
+                                             double2 c5,
+                                             double2 c6,
+                                             double2 c7,
+                                             double2 c8) {
+    return make_double2(
+        double(IH0) * (c0.x + c8.x) + double(IH1) * (c1.x + c7.x) +
+            double(IH2) * (c2.x + c6.x) + double(IH3) * (c3.x + c5.x) + double(IH4) * c4.x,
+        double(IH0) * (c0.y + c8.y) + double(IH1) * (c1.y + c7.y) +
+            double(IH2) * (c2.y + c6.y) + double(IH3) * (c3.y + c5.y) + double(IH4) * c4.y);
+}
+
 // Four-column version of the four-pair register block used by the plane XY
 // inverse.  Each lane follows the scalar synth_quad expression independently;
 // the vector form only changes the memory transaction granularity.
@@ -218,7 +256,7 @@ __device__ void idwt_z_pass(const T* __restrict__ src,
                 p2y ? static_cast<uint32_t>(r) & (ly - 1U) : static_cast<uint32_t>(r % ly);
             const uint32_t i = 2u * static_cast<uint32_t>(p2y ? (r >> sy) : (r / ly));
             const size_t xy = x + static_cast<size_t>(y) * nx;
-            if (i >= 2U && 2U * i + 5U < lz) {
+            if (i >= 2U && 2U * i + 7U < lz) {
                 auto Ci = [&](int idx) -> T {
                     const uint32_t u = static_cast<uint32_t>(idx);
                     const uint32_t row = (u & 1U) ? (low_lz + (u >> 1U)) : (u >> 1U);
@@ -310,7 +348,7 @@ __device__ void idwt_y_pass(const T* __restrict__ src,
             const uint32_t i = 2u * static_cast<uint32_t>(p2dp ? (r & (dp - 1U)) : (r % dp));
             const uint32_t z = static_cast<uint32_t>(p2dp ? (r >> sdp) : (r / dp));
             const size_t xz = x + static_cast<size_t>(z) * leap_z;
-            if (i >= 2U && 2U * i + 5U < ly) {
+            if (i >= 2U && 2U * i + 7U < ly) {
                 // Interior synthesis has no reflected taps.  Keep the exact
                 // synth_quad arithmetic while replacing ten sym_idx calls with
                 // direct deinterleaved low/high row addresses.
@@ -381,7 +419,7 @@ __device__ void idwt_y_pass(const T* __restrict__ src,
 // read never hits L1 latency.  One global load + one global store per element (NO extra
 // pass), the reorder is absorbed into shared.  Same s_data the X pass already needs, so
 // no extra shared / occupancy cost.  TX>=1 required (lz<=cap); caller falls back if not.
-template <typename T, bool Vec4 = false>
+template <typename T, bool Vectorize = false>
 __device__ void idwt_z_level_shared(const T* src,
                                     T* dst,
                                     T* s_data,
@@ -395,7 +433,6 @@ __device__ void idwt_z_level_shared(const T* src,
         return;
     const size_t leap_z = static_cast<size_t>(nx) * ny;
     const uint32_t low_lz = lz - (lz >> 1);
-    const long long last = static_cast<long long>(lz) - 1;
     const uint32_t TX = cap / lz;
     if (TX == 0)
         return;
@@ -413,12 +450,18 @@ __device__ void idwt_z_level_shared(const T* src,
             s_data[z * txn + tx] = src[base + tx + static_cast<size_t>(z) * leap_z];
         }
         __syncthreads();
-        // Optional vector synthesis: four adjacent x-columns share the same
-        // z-window, so float4 shared loads/stores remove the scalar transaction
-        // overhead.  Keep it explicitly gated because some older GPUs trade the
-        // lower instruction count for higher register pressure.
-        const bool vector_tile =
-            Vec4 && std::is_same_v<T, float> && txn >= 4U && (txn & 3U) == 0U;
+        // Optional vector synthesis: adjacent x-columns share the same z-window,
+        // so float4/double2 shared loads and global stores remove scalar transaction
+        // overhead.  Keep the original float4 gate; double2 additionally requires
+        // even shared rows and alignment of every global output row.
+        bool vector_tile = false;
+        if constexpr (std::is_same_v<T, float>) {
+            vector_tile = Vectorize && txn >= 4U && (txn & 3U) == 0U;
+        } else if constexpr (std::is_same_v<T, double>) {
+            vector_tile = Vectorize && txn >= 2U && (txn & 1U) == 0U && (nx & 1U) == 0U &&
+                          (x0 & 1U) == 0U &&
+                          (reinterpret_cast<uintptr_t>(dst + base) & 15U) == 0U;
+        }
         if (vector_tile) {
             if constexpr (std::is_same_v<T, float>) {
                 const int last32 = static_cast<int>(lz) - 1;
@@ -479,6 +522,65 @@ __device__ void idwt_z_level_shared(const T* src,
                         *reinterpret_cast<float4*>(
                             dst + base + tx + static_cast<size_t>(2U * i + 1U) * leap_z) = oo;
                 }
+            } else if constexpr (std::is_same_v<T, double>) {
+                const uint32_t nv = txn >> 1U;
+                for (uint32_t e = threadIdx.x; e < low_lz * nv; e += TPB) {
+                    const uint32_t i = e / nv, vc = e - i * nv;
+                    const uint32_t tx = vc << 1U;
+                    double2 oe, oo;
+                    // Shared-capacity-limited Z indices fit in int; avoid the sm120 64-bit reflection anomaly.
+                    auto C2 = [&](int idx) -> double2 {
+                        const uint32_t pos = sym_idx32(idx, static_cast<int>(lz) - 1);
+                        const uint32_t k = (pos & 1u) ? (low_lz + (pos >> 1)) : (pos >> 1);
+                        return *reinterpret_cast<const double2*>(
+                            s_data + static_cast<size_t>(k) * txn + tx);
+                    };
+                    if (i >= 2u && i <= hi_i) {
+                        const double2 c0 = *reinterpret_cast<const double2*>(
+                            s_data + static_cast<size_t>(low_lz + i - 2U) * txn + tx);
+                        const double2 c1 = *reinterpret_cast<const double2*>(
+                            s_data + static_cast<size_t>(i - 1U) * txn + tx);
+                        const double2 c2 = *reinterpret_cast<const double2*>(
+                            s_data + static_cast<size_t>(low_lz + i - 1U) * txn + tx);
+                        const double2 c3 = *reinterpret_cast<const double2*>(
+                            s_data + static_cast<size_t>(i) * txn + tx);
+                        const double2 c4 = *reinterpret_cast<const double2*>(
+                            s_data + static_cast<size_t>(low_lz + i) * txn + tx);
+                        const double2 c5 = *reinterpret_cast<const double2*>(
+                            s_data + static_cast<size_t>(i + 1U) * txn + tx);
+                        const double2 c6 = *reinterpret_cast<const double2*>(
+                            s_data + static_cast<size_t>(low_lz + i + 1U) * txn + tx);
+                        const double2 c7 = *reinterpret_cast<const double2*>(
+                            s_data + static_cast<size_t>(i + 2U) * txn + tx);
+                        const double2 c8 = *reinterpret_cast<const double2*>(
+                            s_data + static_cast<size_t>(low_lz + i + 2U) * txn + tx);
+                        oe = idwt_even2(c0, c1, c2, c3, c4, c5, c6);
+                        oo = idwt_odd2(c0, c1, c2, c3, c4, c5, c6, c7, c8);
+                    } else {
+                        const int b = 2 * static_cast<int>(i) - 3;
+                        oe = idwt_even2(C2(b + 0),
+                                        C2(b + 1),
+                                        C2(b + 2),
+                                        C2(b + 3),
+                                        C2(b + 4),
+                                        C2(b + 5),
+                                        C2(b + 6));
+                        oo = idwt_odd2(C2(b + 0),
+                                       C2(b + 1),
+                                       C2(b + 2),
+                                       C2(b + 3),
+                                       C2(b + 4),
+                                       C2(b + 5),
+                                       C2(b + 6),
+                                       C2(b + 7),
+                                       C2(b + 8));
+                    }
+                    *reinterpret_cast<double2*>(dst + base + tx +
+                                                static_cast<size_t>(2U * i) * leap_z) = oe;
+                    if (2U * i + 1U < lz)
+                        *reinterpret_cast<double2*>(
+                            dst + base + tx + static_cast<size_t>(2U * i + 1U) * leap_z) = oo;
+                }
             }
         }
         if (!vector_tile)
@@ -499,8 +601,10 @@ __device__ void idwt_z_level_shared(const T* src,
                     oo = T(IH0) * (h_m2 + h_p2) + T(IH1) * (l_m1 + l_p2) + T(IH2) * (h_m1 + h_p1) +
                          T(IH3) * (l_0 + l_p1) + T(IH4) * h_0;
                 } else {
-                    auto C = [&](long long idx) -> T {
-                        const uint32_t pos = sym_idx(idx, last);
+                    // Shared-capacity-bounded indices use the same 32-bit
+                    // reflection as the vector branch (including odd tiles).
+                    auto C = [&](int idx) -> T {
+                        const uint32_t pos = sym_idx32(idx, static_cast<int>(lz) - 1);
                         return col[static_cast<size_t>((pos & 1u) ? (low_lz + (pos >> 1))
                                                                   : (pos >> 1)) *
                                    txn];
@@ -772,11 +876,21 @@ __global__ __launch_bounds__(TPB, 2) void idwt_3d_z_single_global(
     idwt_z_pass<T>(src, dst, data_dims.x, data_dims.y, chunk_dims.x, chunk_dims.y, chunk_dims.z);
 }
 
-template <typename T, bool Vec4 = false>
-__global__ __launch_bounds__(TPB, (Vec4 ? 3 : CDF97_MIN_BLOCKS(T))) void idwt_3d_z_single_static(
+template <typename T, bool Vectorize = false>
+__global__ __launch_bounds__(TPB,
+                             (Vectorize && std::is_same_v<T, float> ? 3 : CDF97_MIN_BLOCKS(T)))
+    void idwt_3d_z_single_static(
     const T* src, T* dst, dim3 data_dims, dim3 chunk_dims) {
     __shared__ alignas(128) T s_data[WALTZ::IDWT_SHARED_BYTES / sizeof(T)];
-    idwt_z_level_shared<T, Vec4>(src, dst, s_data, WALTZ::IDWT_SHARED_BYTES / sizeof(T), data_dims.x, data_dims.y, chunk_dims.x, chunk_dims.y, chunk_dims.z);
+    idwt_z_level_shared<T, Vectorize>(src,
+                                      dst,
+                                      s_data,
+                                      WALTZ::IDWT_SHARED_BYTES / sizeof(T),
+                                      data_dims.x,
+                                      data_dims.y,
+                                      chunk_dims.x,
+                                      chunk_dims.y,
+                                      chunk_dims.z);
 }
 
 template <typename T>
@@ -803,10 +917,7 @@ __global__ __launch_bounds__(TPB, CDF97_MIN_BLOCKS(T)) void idwt_x_axis(T* vol,
         vol, vol, s_data, WALTZ::IDWT_SHARED_BYTES / sizeof(T), nx, ny, lx, ly, lz, orig, bound, ocnt, oidx, oerr, ocap);
 }
 
-// Finest-level float Y+X fusion.  Y synthesizes 10 adjacent pairs (up to 20 rows)
-// directly into the existing 32-KB shared tile; X consumes those rows without the
-// former full-volume Y store + X reload and writes the final reconstruction.
-__global__ __launch_bounds__(TPB, 3) void idwt_yx_axis_fused_float(const float* __restrict__ src,
+__global__ __launch_bounds__(TPB, 3) void idwt_yx_float(const float* __restrict__ src,
                                                                    float* __restrict__ dst,
                                                                    uint32_t nx,
                                                                    uint32_t ny,
@@ -933,11 +1044,148 @@ __global__ __launch_bounds__(TPB, 3) void idwt_yx_axis_fused_float(const float* 
     }
 }
 
-// Double-precision counterpart of the float Y+X fused axis kernel.  A dynamic
-// shared tile lets the launcher retain enough adjacent Y pairs to amortize the
-// two block barriers without imposing the float path's fixed 512-column limit.
-// The device helper is shared with the double inverse launchers, so the
-// arithmetic and boundary treatment remain identical to the established path.
+// Wide-X variant of idwt_yx_float.  This is intentionally the same whole-row
+// Y->X algorithm, pair fusion, boundary reflection, and scalar tap expression
+// as the original kernel; only the row-pair count is runtime-sized so active X
+// lines wider than 512 can use it.  The host passes a pair count that fits the
+// fixed 48-KiB allocation.
+__global__ __launch_bounds__(TPB, 3) void idwt_yx_float_wide(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    uint32_t nx,
+    uint32_t ny,
+    uint32_t lx,
+    uint32_t ly,
+    uint32_t lz,
+    uint32_t pairs,
+    const float* orig,
+    double bound,
+    unsigned int* ocnt,
+    uint32_t* oidx,
+    float* oerr,
+    uint32_t ocap) {
+    __shared__ alignas(128) float rows[IDWT_YX_FLOAT_WIDE_SHARED_BYTES / sizeof(float)];
+    if (lx <= 512U || lx < 2U || ly < 2U || pairs == 0U)
+        return;
+
+    const size_t leap_z = static_cast<size_t>(nx) * ny;
+    const uint32_t low_ly = ly - (ly >> 1U);
+    const uint32_t low_lx = lx - (lx >> 1U);
+    const long long last_y = static_cast<long long>(ly) - 1;
+    const long long last_x = static_cast<long long>(lx) - 1;
+    const uint32_t nty = (low_ly + pairs - 1U) / pairs;
+    const uint32_t ntiles = nty * lz;
+
+    for (uint32_t tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
+        const uint32_t z = tile / nty;
+        const uint32_t pt = tile - z * nty;
+        const uint32_t pair0 = pt * pairs;
+        const uint32_t pairn = min(pairs, low_ly - pair0);
+        const uint32_t out_rows = min(2U * pairn, ly - 2U * pair0);
+        const uint32_t groups = (pairn + 1U) >> 1U;
+
+        // Y synthesis: two adjacent pairs per thread item, exactly as in
+        // idwt_yx_float, with the same direct interior and reflected edge paths.
+        const uint32_t ywork = groups * lx;
+        for (uint32_t e = threadIdx.x; e < ywork; e += TPB) {
+            const uint32_t x = e % lx;
+            const uint32_t group = e / lx;
+            const uint32_t i = pair0 + (group << 1U);
+            const size_t xz = x + static_cast<size_t>(z) * leap_z;
+            auto C = [&](long long idx) -> float {
+                const uint32_t pos = sym_idx(idx, last_y);
+                return src[xz +
+                           static_cast<size_t>((pos & 1U) ? (low_ly + (pos >> 1U)) : (pos >> 1U)) *
+                               nx];
+            };
+            const uint32_t local = (i - pair0) << 1U;
+            if (i + 1U < pair0 + pairn) {
+                float e0, o0, e1, o1;
+                synth_quad<float>(i, C, e0, o0, e1, o1);
+                rows[(local + 0U) * lx + x] = e0;
+                if (local + 1U < out_rows)
+                    rows[(local + 1U) * lx + x] = o0;
+                rows[(local + 2U) * lx + x] = e1;
+                if (local + 3U < out_rows)
+                    rows[(local + 3U) * lx + x] = o1;
+            } else {
+                float ev, ov;
+                synth_pair<float>(i, C, ev, ov);
+                rows[local * lx + x] = ev;
+                if (local + 1U < out_rows)
+                    rows[(local + 1U) * lx + x] = ov;
+            }
+        }
+        __syncthreads();
+
+        // X synthesis: preserve idwt_x_tiled's interior expression and its
+        // typed float PWE threshold.  PWE deliberately avoids materializing
+        // the final field, matching the baseline separate-X path.
+        const uint32_t xwork = out_rows * low_lx;
+        const uint32_t half = lx >> 1U;
+        const uint32_t hi_i = (half >= 3U) ? (half - 3U) : 0U;
+        for (uint32_t e = threadIdx.x; e < xwork; e += TPB) {
+            const uint32_t r = e / low_lx, i = e - r * low_lx;
+            const float* sh = rows + r * lx;
+            float oe, oo;
+            if (i >= 2U && i <= hi_i) {
+                const uint32_t hb = low_lx + i;
+                const float l_m1 = sh[i - 1], l_0 = sh[i], l_p1 = sh[i + 1], l_p2 = sh[i + 2];
+                const float h_m2 = sh[hb - 2], h_m1 = sh[hb - 1], h_0 = sh[hb], h_p1 = sh[hb + 1],
+                            h_p2 = sh[hb + 2];
+                oe = float(IL0) * (h_m2 + h_p1) + float(IL1) * (l_m1 + l_p1) +
+                     float(IL2) * (h_m1 + h_0) + float(IL3) * l_0;
+                oo = float(IH0) * (h_m2 + h_p2) + float(IH1) * (l_m1 + l_p2) +
+                     float(IH2) * (h_m1 + h_p1) + float(IH3) * (l_0 + l_p1) + float(IH4) * h_0;
+            } else {
+                auto C = [&](long long idx) -> float {
+                    const uint32_t pos = sym_idx(idx, last_x);
+                    return sh[(pos & 1U) ? (low_lx + (pos >> 1U)) : (pos >> 1U)];
+                };
+                synth_pair<float>(i, C, oe, oo);
+            }
+            const uint32_t gy = 2U * pair0 + r;
+            const size_t base = static_cast<size_t>(gy) * nx + static_cast<size_t>(z) * leap_z;
+            if (orig == nullptr) {
+                dst[base + 2U * i] = oe;
+                if (2U * i + 1U < lx)
+                    dst[base + 2U * i + 1U] = oo;
+            } else {
+                const float typed_bound = static_cast<float>(bound);
+                const float e0 = oe - orig[base + 2U * i];
+                if (e0 > typed_bound || e0 < -typed_bound) {
+                    const unsigned int slot = atomicAdd(ocnt, 1U);
+                    if (oidx != nullptr && slot < ocap) {
+                        oidx[slot] = static_cast<uint32_t>(base + 2U * i);
+                        oerr[slot] = e0;
+                    }
+                }
+                if (2U * i + 1U < lx) {
+                    const float e1 = oo - orig[base + 2U * i + 1U];
+                    if (e1 > typed_bound || e1 < -typed_bound) {
+                        const unsigned int slot = atomicAdd(ocnt, 1U);
+                        if (oidx != nullptr && slot < ocap) {
+                            oidx[slot] = static_cast<uint32_t>(base + 2U * i + 1U);
+                            oerr[slot] = e1;
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+inline uint32_t idwt_yx_float_wide_pairs(uint32_t lx) {
+    constexpr size_t target_smem = IDWT_YX_FLOAT_WIDE_SHARED_BYTES;
+    constexpr uint32_t max_pairs = 12U;
+    if (lx == 0U)
+        return 0U;
+    const size_t pair_bytes = 2ULL * lx * sizeof(float);
+    const uint32_t pairs = static_cast<uint32_t>(target_smem / pair_bytes);
+    return min(max_pairs, pairs);
+}
+
 inline uint32_t idwt_double_yx_pairs(uint32_t lx) {
     constexpr size_t target_smem = 48U * 1024U;
     constexpr uint32_t max_pairs = 8U;
@@ -948,7 +1196,7 @@ inline uint32_t idwt_double_yx_pairs(uint32_t lx) {
     return max(1U, min(max_pairs, pairs));
 }
 
-__global__ __launch_bounds__(TPB, CDF97_MIN_BLOCKS_D) void idwt_yx_axis_fused_double(
+__global__ __launch_bounds__(TPB, CDF97_MIN_BLOCKS_D) void idwt_yx_double(
     const double* __restrict__ src,
     double* __restrict__ dst,
     uint32_t nx,
@@ -981,22 +1229,13 @@ __global__ __launch_bounds__(TPB, CDF97_MIN_BLOCKS_D) void idwt_yx_axis_fused_do
                          ocap);
 }
 
-// Persistent launcher state shared by the multi-kernel inverse launchers.
-// Exposed so idwt3d_prealloc can pay the one-time
-// costs (large cudaMalloc + first-touch page mapping + occupancy/device queries) up
-// front, outside any timed region.
+// Persistent temporary-buffer state shared by the multi-kernel inverse launchers.
+// Exposed so idwt3d_prealloc can pay the one-time large cudaMalloc + first-touch
+// page mapping cost up front, outside any timed region.
 template <typename T> struct IdwtScratch {
     static inline void* tmp = nullptr;
     static inline size_t cap = 0;
     static inline size_t mapped_cap = 0;
-    static inline int grid_z = 0;
-    static inline int grid_z_shared = 0;
-    static inline int grid_z_shared_vec4 = 0;
-    static inline int grid_z_columns = 0;
-    static inline int grid_y = 0;
-    static inline int grid_x = 0;
-    static inline int grid_yx = 0;
-    static inline int grid_yx_ext = 0;
 };
 
 template <typename T> inline cudaError_t idwt_ensure_tmp(size_t bytes) {
@@ -1014,18 +1253,6 @@ template <typename T> inline cudaError_t idwt_ensure_tmp(size_t bytes) {
         IdwtScratch<T>::mapped_cap = 0;
     }
     return cudaSuccess;
-}
-
-template <typename K> inline int idwt_axis_grid(K kernel, int& cache) {
-    if (cache == 0) {
-        int blocks_per_sm = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, TPB, 0);
-        const int sm_count = WALTZ::gpu_config().sm_count();
-        cache = blocks_per_sm * sm_count;
-        if (cache <= 0)
-            cache = sm_count;
-    }
-    return cache;
 }
 
 template <int KTPB = TPB>
@@ -1049,46 +1276,26 @@ __global__
                                                                  float* oerr,
                                                                  uint32_t ocap);
 
-__global__
-    __launch_bounds__(TPB,
-                      CDF97_MIN_BLOCKS_F) void idwt_z_columns_all_axis_float(const float* src,
-                                                                             float* dst,
-                                                                             uint32_t nx,
-                                                                             uint32_t ny,
-                                                                             uint32_t nz,
-                                                                             int levels_z,
-                                                                             const float* orig,
-                                                                             double bound,
-                                                                             unsigned int* ocnt,
-                                                                             uint32_t* oidx,
-                                                                             float* oerr,
-                                                                             uint32_t ocap);
-
 // One-time setup for the inverse launchers: allocate + page-map the tmp scratch and
 // cache the axis-launch occupancy grids.
+// Callers supplying their own scratch can request configuration only.
 template <typename T>
 inline cudaError_t idwt3d_prealloc(dim3 dims,
                                    bool use_dyadic,
-                                   cudaStream_t stream = 0) {
-    const size_t bytes = static_cast<size_t>(dims.x) * dims.y * dims.z * sizeof(T);
-    cudaError_t em = idwt_ensure_tmp<T>(bytes);
-    if (em != cudaSuccess)
-        return em;
-    if (IdwtScratch<T>::mapped_cap < bytes) {
-        cudaMemsetAsync(IdwtScratch<T>::tmp, 0, bytes, stream);
-        IdwtScratch<T>::mapped_cap = bytes;
+                                   cudaStream_t stream = 0,
+                                   bool allocate_scratch = true) {
+    if (allocate_scratch) {
+        const size_t bytes = static_cast<size_t>(dims.x) * dims.y * dims.z * sizeof(T);
+        cudaError_t em = idwt_ensure_tmp<T>(bytes);
+        if (em != cudaSuccess)
+            return em;
+        if (IdwtScratch<T>::mapped_cap < bytes) {
+            cudaMemsetAsync(IdwtScratch<T>::tmp, 0, bytes, stream);
+            IdwtScratch<T>::mapped_cap = bytes;
+        }
     }
     if (use_dyadic) {
         if constexpr (std::is_same_v<T, float>) {
-            idwt_axis_grid(idwt_3d_z_single_global<T>, IdwtScratch<T>::grid_z);
-            idwt_axis_grid(idwt_3d_z_single_static<T, false>, IdwtScratch<T>::grid_z_shared);
-            idwt_axis_grid(idwt_3d_z_single_static<float, true>,
-                           IdwtScratch<T>::grid_z_shared_vec4);
-            if (std::getenv("WALTZ_IDWT_Z_COLUMNS") != nullptr)
-                idwt_axis_grid(idwt_z_columns_all_axis_float, IdwtScratch<T>::grid_z_columns);
-            idwt_axis_grid(idwt_y_axis<T>, IdwtScratch<T>::grid_y);
-            idwt_axis_grid(idwt_x_axis<T>, IdwtScratch<T>::grid_x);
-            idwt_axis_grid(idwt_yx_axis_fused_float, IdwtScratch<T>::grid_yx);
             // Use fewer row pairs for wider active X lines to reduce shared
             // footprint; this resource rule applies to every volume.
             const uint32_t ext_pairs = dims.x >= 512U ? 6U : 8U;
@@ -1096,286 +1303,183 @@ inline cudaError_t idwt3d_prealloc(dim3 dims,
             cudaFuncSetAttribute(idwt_yx_axis_fused_plane_float_ext<TPB>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  static_cast<int>(ext_smem));
-            idwt_axis_grid(idwt_yx_axis_fused_plane_float_ext<TPB>,
-                           IdwtScratch<T>::grid_yx_ext);
         } else {
-            idwt_axis_grid(idwt_3d_z_single_global<T>, IdwtScratch<T>::grid_z);
-            idwt_axis_grid(idwt_3d_z_single_static<T, false>, IdwtScratch<T>::grid_z_shared);
-            idwt_axis_grid(idwt_y_axis<T>, IdwtScratch<T>::grid_y);
-            idwt_axis_grid(idwt_x_axis<T>, IdwtScratch<T>::grid_x);
             const uint32_t pairs = idwt_double_yx_pairs(dims.x);
             const size_t yx_smem = 2ULL * pairs * dims.x * sizeof(double);
-            cudaError_t ea = cudaFuncSetAttribute(idwt_yx_axis_fused_double,
+            cudaError_t ea = cudaFuncSetAttribute(idwt_yx_double,
                                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                   static_cast<int>(yx_smem));
             if (ea != cudaSuccess)
                 return ea;
-            idwt_axis_grid(idwt_yx_axis_fused_double, IdwtScratch<T>::grid_yx);
+        }
+        // Cache the occupancy grids used by the dyadic inverse launchers once per type.
+        // Keep the global-Z result local until every query has completed so the guard cannot
+        // expose a partially initialized set of caches.
+        if (IDWTConfig<T>::z_global_blocks == 0) {
+            const int sm_count = WALTZ::gpu_config().sm_count();
+            int blocks_per_sm = 0;
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &blocks_per_sm, idwt_3d_z_single_global<T>, TPB, 0);
+            const int z_global_blocks = max(blocks_per_sm, 1) * sm_count;
+
+            blocks_per_sm = 0;
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &blocks_per_sm, idwt_3d_z_single_static<T, false>, TPB, 0);
+            IDWTConfig<T>::z_static_blocks = max(blocks_per_sm, 1) * sm_count;
+
+            if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
+                blocks_per_sm = 0;
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks_per_sm, idwt_3d_z_single_static<T, true>, TPB, 0);
+                IDWTConfig<T>::z_vec_blocks = max(blocks_per_sm, 1) * sm_count;
+            }
+
+            if constexpr (std::is_same_v<T, float>) {
+                blocks_per_sm = 0;
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, idwt_y_axis<T>, TPB, 0);
+                IDWTConfig<T>::y_blocks = max(blocks_per_sm, 1) * sm_count;
+
+                blocks_per_sm = 0;
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, idwt_x_axis<T>, TPB, 0);
+                IDWTConfig<T>::x_blocks = max(blocks_per_sm, 1) * sm_count;
+
+                blocks_per_sm = 0;
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks_per_sm, idwt_yx_float, TPB, 0);
+                IDWTConfig<T>::yx_blocks = max(blocks_per_sm, 1) * sm_count;
+
+                blocks_per_sm = 0;
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks_per_sm, idwt_yx_float_wide, TPB, 0);
+                IDWTConfig<T>::yx_wide_blocks = max(blocks_per_sm, 1) * sm_count;
+
+                blocks_per_sm = 0;
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks_per_sm, idwt_yx_axis_fused_plane_float_ext<TPB>, TPB, 0);
+                IDWTConfig<T>::yx_ext_blocks = max(blocks_per_sm, 1) * sm_count;
+            } else if constexpr (std::is_same_v<T, double>) {
+                blocks_per_sm = 0;
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks_per_sm, idwt_yx_double, TPB, 0);
+                IDWTConfig<T>::yx_blocks = max(blocks_per_sm, 1) * sm_count;
+            }
+
+            IDWTConfig<T>::z_global_blocks = z_global_blocks;
         }
     }
     return cudaGetLastError();
 }
 
-// Host launcher: axis-specialized launches + persistent tmp scratch (grown on demand).
-// If out_kernel_ms != nullptr, the complete Z/Y/X launch sequence is timed.
-// Optional fused outlier detect+record: pass d_orig/bound/d_ocnt (pre-zeroed) and the
-// finest-level X pass counts |x_hat - orig| > bound while writing the reconstruction;
-// With d_oidx/d_oerr it also records the row-major uint32_t index and the exact
-// reconstruction error in the original scalar type for the decoder.
+// Host launcher: axis-specialized launches using the caller-provided persistent tmp scratch.
+// Requires idwt3d_prealloc<T>() before launch to prepare IDWTConfig<T>.
+// Optional PWE recording at the finest level: d_orig/bound/d_ocnt (pre-zeroed)
+// enable detection; d_oidx/d_oerr receive the index and original-precision error.
 template <typename T>
-inline cudaError_t idwt3d_dyadic(T* d_vol,
-                                 dim3 dims,
-                                 int levels,
-                                 cudaStream_t stream = 0,
-                                 float* out_kernel_ms = nullptr,
-                                 const T* d_orig = nullptr,
-                                 double bound = 0.0,
-                                 unsigned int* d_ocnt = nullptr,
-                                 uint32_t* d_oidx = nullptr,
-                                 T* d_oerr = nullptr,
-                                 uint32_t ocap = 0,
-                                 T* d_tmp_override = nullptr) {
-    if (levels <= 0)
-        return cudaSuccess;
-    T* d_tmp = d_tmp_override;
-    if (d_tmp == nullptr) {
-        const size_t bytes = static_cast<size_t>(dims.x) * dims.y * dims.z * sizeof(T);
-        cudaError_t em = idwt_ensure_tmp<T>(bytes);
-        if (em != cudaSuccess)
-            return em;
-        d_tmp = static_cast<T*>(IdwtScratch<T>::tmp);
-    }
-    // time only GPU work; occupancy/property setup was already paid by prealloc.
-    static cudaEvent_t k0 = nullptr, k1 = nullptr;
-    if (out_kernel_ms != nullptr) {
-        if (k0 == nullptr) {
-            cudaEventCreate(&k0);
-            cudaEventCreate(&k1);
-        }
-        cudaEventRecord(k0, stream);
-    }
-    // Axis kernels are ordinary stream-ordered launches (no grid-wide barrier),
-    // and each one already uses a grid-stride loop.  At coarse dyadic levels the
-    // active cube is much smaller than the cached occupancy grid, so launching
-    // every resident CTA only to execute an empty loop adds a measurable fixed
-    // cost.  Cap the grid to the actual number of producer items while retaining
-    // the caller's explicit grid limit.  The cap is purely scheduling; all
-    // arithmetic and coefficient order stay in the device kernels unchanged.
-    auto work_grid = [&](int full, size_t work_items) {
-        const size_t need = std::max<size_t>(
-            1U, (work_items + static_cast<size_t>(TPB) - 1U) / static_cast<size_t>(TPB));
-        const int capped = need < static_cast<size_t>(full) ? static_cast<int>(need) : full;
-        return max(1, capped);
-    };
-    auto x_work_items = [&](uint32_t lx, uint32_t ly, uint32_t lz) {
-        if (lx == 0U)
-            return static_cast<size_t>(0);
-        const uint32_t rpt = WALTZ::IDWT_SHARED_BYTES / sizeof(T) / lx;
-        if (rpt == 0U)
-            return static_cast<size_t>(0);
-        const size_t tiles = (static_cast<size_t>(ly) * lz + rpt - 1U) / rpt;
-        // idwt_x_tiled assigns one logical tile to a CTA; a CTA's internal
-        // threads then walk all rows/elements, so one item per tile is exact.
-        return tiles * static_cast<size_t>(TPB);
-    };
+inline cudaError_t idwt3d_xy_halo_z(T* d_vol, T* d_tmp, dim3 data_dims, int levels,
+                                 cudaStream_t stream = 0, const T* d_orig = nullptr,
+                                 double bound = 0.0, unsigned int* d_ocnt = nullptr,
+                                 uint32_t* d_oidx = nullptr, T* d_oerr = nullptr,
+                                 uint32_t ocap = 0) {
+    constexpr uint32_t capacity = WALTZ::IDWT_SHARED_BYTES / sizeof(T);
     for (int lev = levels - 1; lev >= 0; --lev) {
-        const uint32_t lx = [&] {
-            uint32_t v = dims.x;
-            for (int i = 0; i < lev; ++i)
-                v -= v >> 1;
-            return v;
-        }();
-        const uint32_t ly = [&] {
-            uint32_t v = dims.y;
-            for (int i = 0; i < lev; ++i)
-                v -= v >> 1;
-            return v;
-        }();
-        const uint32_t lz = [&] {
-            uint32_t v = dims.z;
-            for (int i = 0; i < lev; ++i)
-                v -= v >> 1;
-            return v;
-        }();
-        const dim3 chunk_dims(lx, ly, lz);
-        if constexpr (std::is_same_v<T, float>) {
-            const bool use_z_columns = lev == 0 &&
-                                       std::getenv("WALTZ_IDWT_Z_COLUMNS") != nullptr &&
-                                       d_orig == nullptr && lz * 2U <= WALTZ::IDWT_SHARED_BYTES / sizeof(T);
-            const bool use_z_vec4 = lev == 0 && (lx & 3U) == 0U &&
-                                    lz * 16U <= WALTZ::IDWT_SHARED_BYTES / sizeof(T);
-            if (use_z_columns) {
-                const int full =
-                    idwt_axis_grid(idwt_z_columns_all_axis_float, IdwtScratch<T>::grid_z_columns);
-                const size_t cols = WALTZ::IDWT_SHARED_BYTES / sizeof(T) / (2U * lz);
-                const size_t nt = (static_cast<size_t>(lx) * ly + cols - 1U) / cols;
-                const int g = work_grid(full, nt * static_cast<size_t>(TPB));
-                idwt_z_columns_all_axis_float<<<g, TPB, 0, stream>>>(d_vol,
-                                                                     d_tmp,
-                                                                     dims.x,
-                                                                     dims.y,
-                                                                     lz,
-                                                                     1,
-                                                                     nullptr,
-                                                                     0.0,
-                                                                     nullptr,
-                                                                     nullptr,
-                                                                     nullptr,
-                                                                     0);
-            } else if (use_z_vec4) {
-                const int full =
-                    idwt_axis_grid(idwt_3d_z_single_static<float, true>,
-                                   IdwtScratch<T>::grid_z_shared_vec4);
-                const uint32_t tx = WALTZ::IDWT_SHARED_BYTES / sizeof(T) / lz;
-                const size_t nt =
-                    static_cast<size_t>(ly) * ((static_cast<size_t>(lx) + tx - 1U) / tx);
-                const int g = work_grid(full, nt * static_cast<size_t>(TPB));
-                idwt_3d_z_single_static<float, true><<<g, TPB, 0, stream>>>(d_vol, d_tmp, dims, chunk_dims);
-            } else if (lev == 0 && lz * 16u <= WALTZ::IDWT_SHARED_BYTES / sizeof(T)) {
-                const int full =
-                    idwt_axis_grid(idwt_3d_z_single_static<T, false>,
-                                   IdwtScratch<T>::grid_z_shared);
-                const uint32_t tx = WALTZ::IDWT_SHARED_BYTES / sizeof(T) / lz;
-                const size_t nt =
-                    static_cast<size_t>(ly) * ((static_cast<size_t>(lx) + tx - 1U) / tx);
-                const int g = work_grid(full, nt * static_cast<size_t>(TPB));
-                idwt_3d_z_single_static<T, false><<<g, TPB, 0, stream>>>(d_vol, d_tmp, dims, chunk_dims);
-            } else {
-                const int full = idwt_axis_grid(idwt_3d_z_single_global<T>, IdwtScratch<T>::grid_z);
-                const size_t dp = (std::is_same_v<T, float>)
-                                      ? static_cast<size_t>((lz - (lz >> 1U) + 1U) >> 1U)
-                                      : static_cast<size_t>(lz - (lz >> 1U));
-                const int g = work_grid(full, static_cast<size_t>(lx) * ly * dp);
-                idwt_3d_z_single_global<T><<<g, TPB, 0, stream>>>(d_vol, d_tmp, dims, chunk_dims);
-            }
-        } else {
-            if (lev == 0 && lz * 16U <= WALTZ::IDWT_SHARED_BYTES / sizeof(T)) {
-                const int full =
-                    idwt_axis_grid(idwt_3d_z_single_static<T, false>,
-                                   IdwtScratch<T>::grid_z_shared);
-                const uint32_t tx = WALTZ::IDWT_SHARED_BYTES / sizeof(T) / lz;
-                const size_t nt =
-                    static_cast<size_t>(ly) * ((static_cast<size_t>(lx) + tx - 1U) / tx);
-                const int g = work_grid(full, nt * static_cast<size_t>(TPB));
-                idwt_3d_z_single_static<T, false><<<g, TPB, 0, stream>>>(d_vol, d_tmp, dims, chunk_dims);
-            } else {
-                const int full = idwt_axis_grid(idwt_3d_z_single_global<T>, IdwtScratch<T>::grid_z);
-                const size_t dp = static_cast<size_t>(lz - (lz >> 1U));
-                const int g = work_grid(full, static_cast<size_t>(lx) * ly * dp);
-                idwt_3d_z_single_global<T><<<g, TPB, 0, stream>>>(d_vol, d_tmp, dims, chunk_dims);
-            }
+        // Recompute from the full dimensions: doubling a coarse odd size is not exact.
+        dim3 chunk_dims = data_dims;
+        for (int i = 0; i < lev; ++i) {
+            chunk_dims.x -= chunk_dims.x >> 1U;
+            chunk_dims.y -= chunk_dims.y >> 1U;
+            chunk_dims.z -= chunk_dims.z >> 1U;
         }
-        // The fused Y+X kernel is valid for every active dyadic level whose
-        // x-line fits the fixed 16-row shared tile.  Historically it was
-        // restricted to the finest level because that was the first path
-        // benchmarked; at coarser levels the same tensor-product operation
-        // applies and eliminating the intermediate Y global write/read saves
-        // another full active-cube pass.  Keep an opt-out for shape-specific
-        // A/B runs while making the safe power-of-two/<=512 case available.
-        const bool fuse_yx_all = std::is_same_v<T, float> && lx <= 512U && ly >= 2U &&
-                                 (lev == 0 || std::getenv("WALTZ_IDWT_YX_ALL_OFF") == nullptr);
-        // The generalized shared-tile implementation chains four Y pairs and
-        // uses vector stores.  It has no PWE side channel, so use it for the
-        // decode/reconstruction path (d_orig == nullptr); compression keeps
-        // the PWE-capable kernel below.
-        const bool use_yx_ext = std::is_same_v<T, float> && lev == 0 && lx <= 512U && ly >= 2U;
-        if constexpr (sizeof(T) == 8U) {
+        const uint32_t lx = chunk_dims.x, ly = chunk_dims.y, lz = chunk_dims.z;
+        const T* const original = lev == 0 ? d_orig : nullptr;
+
+        // Z: data -> tmp. Limit the grid to useful tiles/items at coarse levels.
+        const bool use_static = lev == 0 && lz * 16U <= capacity;
+        constexpr uint32_t align_mask = std::is_same_v<T, float> ? 3U : 1U;
+        const bool vector_z = (data_dims.x & align_mask) == 0U;
+        size_t required_blocks;
+        int full;
+        if (use_static) {
+            const uint32_t columns_per_tile = capacity / lz;
+            const size_t tiles = static_cast<size_t>(ly) * ((static_cast<size_t>(lx) + columns_per_tile - 1U) / columns_per_tile);
+            required_blocks = tiles;
+            full = vector_z ? IDWTConfig<T>::z_vec_blocks : IDWTConfig<T>::z_static_blocks;
+        } else {
+            size_t items_per_column = lz - (lz >> 1U);
+            if constexpr (std::is_same_v<T, float>)
+                items_per_column = (items_per_column + 1U) >> 1U; // Float synthesizes two pairs per item.
+            required_blocks = (static_cast<size_t>(lx) * ly * items_per_column + TPB - 1U) / TPB;
+            full = IDWTConfig<T>::z_global_blocks;
+        }
+        const int grid = required_blocks < static_cast<size_t>(full) ? static_cast<int>(required_blocks) : full;
+        if (use_static) {
+            if (vector_z)
+                idwt_3d_z_single_static<T, true><<<grid, TPB, 0, stream>>>(
+                    d_vol, d_tmp, data_dims, chunk_dims);
+            else
+                idwt_3d_z_single_static<T, false><<<grid, TPB, 0, stream>>>(
+                    d_vol, d_tmp, data_dims, chunk_dims);
+        } else {
+            idwt_3d_z_single_global<T><<<grid, TPB, 0, stream>>>(
+                d_vol, d_tmp, data_dims, chunk_dims);
+        }
+
+        // YX: tmp -> data. The finest level can also record PWE outliers.
+        const size_t low_y = ly - (ly >> 1U);
+        if constexpr (std::is_same_v<T, double>) {
             const uint32_t pairs = idwt_double_yx_pairs(lx);
-            const size_t nt =
-                ((static_cast<size_t>(ly - (ly >> 1U)) + pairs - 1U) / pairs) * lz;
-            const int full =
-                idwt_axis_grid(idwt_yx_axis_fused_double, IdwtScratch<T>::grid_yx);
-            const int g = work_grid(full, nt * static_cast<size_t>(TPB));
-            const size_t smem = 2ULL * pairs * lx * sizeof(double);
-            idwt_yx_axis_fused_double<<<g, TPB, smem, stream>>>(
-                reinterpret_cast<const double*>(d_tmp),
-                reinterpret_cast<double*>(d_vol),
-                dims.x,
-                dims.y,
-                lx,
-                ly,
-                lz,
-                pairs,
-                reinterpret_cast<const double*>(lev == 0 ? d_orig : nullptr),
-                bound,
-                d_ocnt,
-                d_oidx,
-                reinterpret_cast<double*>(d_oerr),
-                ocap);
-        } else if (use_yx_ext) {
-            const uint32_t pairs = lx >= 512U ? 6U : 8U;
-            const int full = idwt_axis_grid(idwt_yx_axis_fused_plane_float_ext<TPB>,
-                                            IdwtScratch<T>::grid_yx_ext);
-            const size_t low = static_cast<size_t>(ly - (ly >> 1U));
-            const size_t nt = ((low + pairs - 1U) / pairs) * static_cast<size_t>(lz);
-            const int g = work_grid(full, nt * static_cast<size_t>(TPB));
-            const size_t smem = 2ULL * pairs * lx * sizeof(float);
-            idwt_yx_axis_fused_plane_float_ext<<<g, TPB, smem, stream>>>(
-                reinterpret_cast<const float*>(d_tmp),
-                reinterpret_cast<float*>(d_vol),
-                dims.x,
-                dims.y,
-                dims.z,
-                lx,
-                ly,
-                pairs,
-                0U,
-                0U,
-                0,
-                reinterpret_cast<const float*>(lev == 0 ? d_orig : nullptr),
-                bound,
-                d_ocnt,
-                d_oidx,
-                reinterpret_cast<float*>(d_oerr),
-                ocap);
-        } else if (fuse_yx_all) {
-            const int full = idwt_axis_grid(idwt_yx_axis_fused_float, IdwtScratch<T>::grid_yx);
-            const size_t low = static_cast<size_t>(ly - (ly >> 1U));
-            const size_t nt = ((low + 11U) / 12U) * static_cast<size_t>(lz);
-            const int g = work_grid(full, nt * static_cast<size_t>(TPB));
-            idwt_yx_axis_fused_float<<<g, TPB, 0, stream>>>(
-                reinterpret_cast<const float*>(d_tmp),
-                reinterpret_cast<float*>(d_vol),
-                dims.x,
-                dims.y,
-                lx,
-                ly,
-                lz,
-                reinterpret_cast<const float*>(lev == 0 ? d_orig : nullptr),
-                bound,
-                d_ocnt,
-                d_oidx,
-                reinterpret_cast<float*>(d_oerr),
-                ocap);
-        } else {
-            const int full_y = idwt_axis_grid(idwt_y_axis<T>, IdwtScratch<T>::grid_y);
-            const size_t low_y = static_cast<size_t>(ly - (ly >> 1U));
-            const size_t dp_y = (std::is_same_v<T, float>) ? ((low_y + 1U) >> 1U) : low_y;
-            const int gy = work_grid(full_y, static_cast<size_t>(lx) * dp_y * lz);
-            idwt_y_axis<T><<<gy, TPB, 0, stream>>>(d_tmp, d_vol, dims.x, dims.y, lx, ly, lz);
-            const int full_x = idwt_axis_grid(idwt_x_axis<T>, IdwtScratch<T>::grid_x);
-            const int gx = work_grid(full_x, x_work_items(lx, ly, lz));
-            idwt_x_axis<T><<<gx, TPB, 0, stream>>>(d_vol,
-                                                   dims.x,
-                                                   dims.y,
-                                                   lx,
-                                                   ly,
-                                                   lz,
-                                                   lev == 0 ? d_orig : nullptr,
-                                                   bound,
-                                                   d_ocnt,
-                                                   d_oidx,
-                                                   d_oerr,
-                                                   ocap);
+            const size_t tiles = ((low_y + pairs - 1U) / pairs) * lz;
+            const int full = IDWTConfig<T>::yx_blocks;
+            const int grid = tiles < static_cast<size_t>(full) ? static_cast<int>(tiles) : full;
+            const size_t shared_bytes = 2ULL * pairs * lx * sizeof(double);
+            idwt_yx_double<<<grid, TPB, shared_bytes, stream>>>(
+                d_tmp, d_vol, data_dims.x, data_dims.y, lx, ly, lz, pairs,
+                original, bound, d_ocnt, d_oidx, d_oerr, ocap);
+        } else if constexpr (std::is_same_v<T, float>) {
+            if (lx <= 512U && ly >= 2U) {
+                if (lev == 0) {
+                    const uint32_t pairs = lx >= 512U ? 6U : 8U;
+                    const size_t tiles = ((low_y + pairs - 1U) / pairs) * lz;
+                    const int full = IDWTConfig<T>::yx_ext_blocks;
+                    const int grid = tiles < static_cast<size_t>(full) ? static_cast<int>(tiles) : full;
+                    const size_t shared_bytes = 2ULL * pairs * lx * sizeof(float);
+                    idwt_yx_axis_fused_plane_float_ext<TPB><<<grid, TPB, shared_bytes, stream>>>(
+                        d_tmp, d_vol, data_dims.x, data_dims.y, data_dims.z, lx, ly,
+                        pairs, 0U, 0U, 0, original, bound, d_ocnt, d_oidx, d_oerr, ocap);
+                } else {
+                    const size_t tiles = ((low_y + 11U) / 12U) * lz;
+                    const int full = IDWTConfig<T>::yx_blocks;
+                    const int grid = tiles < static_cast<size_t>(full) ? static_cast<int>(tiles) : full;
+                    idwt_yx_float<<<grid, TPB, 0, stream>>>(
+                        d_tmp, d_vol, data_dims.x, data_dims.y, lx, ly, lz,
+                        original, bound, d_ocnt, d_oidx, d_oerr, ocap);
+                }
+            } else if (lx > 512U && ly >= 2U && idwt_yx_float_wide_pairs(lx) != 0U) {
+                const uint32_t pairs = idwt_yx_float_wide_pairs(lx);
+                const size_t tiles = ((low_y + pairs - 1U) / pairs) * lz;
+                const int full = IDWTConfig<T>::yx_wide_blocks;
+                const int grid = tiles < static_cast<size_t>(full) ? static_cast<int>(tiles) : full;
+                idwt_yx_float_wide<<<grid, TPB, 0, stream>>>(
+                    d_tmp, d_vol, data_dims.x, data_dims.y, lx, ly, lz, pairs,
+                    original, bound, d_ocnt, d_oidx, d_oerr, ocap);
+            } else {
+                const int full_y = IDWTConfig<T>::y_blocks;
+                const size_t y_items = static_cast<size_t>(lx) * ((low_y + 1U) >> 1U) * lz;
+                const size_t y_blocks = (y_items + TPB - 1U) / TPB;
+                const int grid_y = max(1, y_blocks < static_cast<size_t>(full_y) ? static_cast<int>(y_blocks) : full_y);
+                idwt_y_axis<T><<<grid_y, TPB, 0, stream>>>(
+                    d_tmp, d_vol, data_dims.x, data_dims.y, lx, ly, lz);
+                const int full_x = IDWTConfig<T>::x_blocks;
+                const uint32_t rows_per_tile = lx == 0U ? 0U : capacity / lx;
+                const size_t x_tiles = rows_per_tile == 0U ? 0U :
+                    (static_cast<size_t>(ly) * lz + rows_per_tile - 1U) / rows_per_tile;
+                const int grid_x = max(1, x_tiles < static_cast<size_t>(full_x) ? static_cast<int>(x_tiles) : full_x);
+                idwt_x_axis<T><<<grid_x, TPB, 0, stream>>>(
+                    d_vol, data_dims.x, data_dims.y, lx, ly, lz,
+                    original, bound, d_ocnt, d_oidx, d_oerr, ocap);
+            }
         }
     }
-    cudaError_t e = cudaGetLastError();
-    if (out_kernel_ms != nullptr) {
-        cudaEventRecord(k1, stream);
-        cudaEventSynchronize(k1);
-        cudaEventElapsedTime(out_kernel_ms, k0, k1);
-    }
-    return e;
+    return cudaGetLastError();
 }
 
 
@@ -1772,7 +1876,7 @@ __global__ __launch_bounds__(TPB, CDF97_MIN_BLOCKS_D) void idwt_z_columns_all_ax
                                ocap);
 }
 
-inline cudaError_t idwt3d_plane_hybrid_double(double* d_vol,
+inline cudaError_t idwt3d_plane_xy_halo_z_double(double* d_vol,
                                                double* d_tmp,
                                                dim3 dims,
                                                int levels_xy,
@@ -1813,7 +1917,7 @@ inline cudaError_t idwt3d_plane_hybrid_double(double* d_vol,
         const uint32_t next_ly = lev > 0 ? active_len(dims.y, lev - 1) : ly;
         const bool carry = lev > 0 && dst == d_tmp;
         const size_t smem = 2ULL * pairs * lx * sizeof(double);
-        idwt_yx_axis_fused_plane_double<<<IDWTConfig<double>::yx_blocks, TPB, smem, stream>>>(
+        idwt_yx_axis_fused_plane_double<<<IDWTConfig<double>::plane_yx_blocks, TPB, smem, stream>>>(
             src, dst, dims.x, dims.y, dims.z, lx, ly, pairs, next_lx, next_ly, carry);
         double* swap = src;
         src = dst;
@@ -1824,7 +1928,7 @@ inline cudaError_t idwt3d_plane_hybrid_double(double* d_vol,
         return e;
 
     const size_t z_smem = static_cast<size_t>(IDWTConfig<double>::z_capacity) * sizeof(double);
-    idwt_z_columns_all_axis_double<<<IDWTConfig<double>::z_blocks, TPB, z_smem, stream>>>(
+    idwt_z_columns_all_axis_double<<<IDWTConfig<double>::plane_z_blocks, TPB, z_smem, stream>>>(
         src,
         d_vol,
         dims.x,
@@ -2498,36 +2602,6 @@ __global__ __launch_bounds__(KTPB, 3) void idwt_yx_axis_fused_plane_float_ext(
                                                   gridDim.x);
 }
 
-__global__
-__launch_bounds__(TPB, CDF97_MIN_BLOCKS_F) void idwt_z_columns_all_axis_float(const float* src,
-                                                                              float* dst,
-                                                                              uint32_t nx,
-                                                                              uint32_t ny,
-                                                                              uint32_t nz,
-                                                                              int levels_z,
-                                                                              const float* orig,
-                                                                              double bound,
-                                                                              unsigned int* ocnt,
-                                                                              uint32_t* oidx,
-                                                                              float* oerr,
-                                                                              uint32_t ocap) {
-    __shared__ alignas(128) float s_data[WALTZ::IDWT_SHARED_BYTES / sizeof(float)];
-    idwt_z_columns_all<float>(src,
-                              dst,
-                              nx,
-                              ny,
-                              nz,
-                              levels_z,
-                              s_data,
-                              WALTZ::IDWT_SHARED_BYTES / sizeof(float),
-                              orig,
-                              bound,
-                              ocnt,
-                              oidx,
-                              oerr,
-                              ocap);
-}
-
 // Dynamically sized shared-memory Z inverse.
 __global__ __launch_bounds__(TPB, 3) void idwt_z_columns_all_axis_float_dynamic(const float* src,
                                                                                 float* dst,
@@ -2591,17 +2665,17 @@ template <typename T> inline cudaError_t idwt3d_plane_prealloc(dim3 dims) {
         int blocks_per_sm = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &blocks_per_sm, idwt_yx_axis_fused_plane_double, TPB, yx_smem);
-        IDWTConfig<T>::yx_blocks = max(1, blocks_per_sm) * prop.multiProcessorCount;
+        IDWTConfig<T>::plane_yx_blocks = max(blocks_per_sm, 1) * prop.multiProcessorCount;
+        blocks_per_sm = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &blocks_per_sm, idwt_z_columns_all_axis_double, TPB, z_smem);
-        IDWTConfig<T>::z_blocks = max(1, blocks_per_sm) * prop.multiProcessorCount;
+        IDWTConfig<T>::plane_z_blocks = max(blocks_per_sm, 1) * prop.multiProcessorCount;
         IDWTConfig<T>::configured_nx = dims.x;
         IDWTConfig<T>::configured_nz = dims.z;
         IDWTConfig<T>::z_capacity = z_cap;
         return cudaGetLastError();
     } else {
-        int blocks_per_sm = 0;
-        if (IDWTConfig<T>::yx_blocks == 0 || IDWTConfig<T>::configured_nx != dims.x) {
+        if (IDWTConfig<T>::plane_yx_blocks == 0 || IDWTConfig<T>::configured_nx != dims.x) {
             uint32_t chosen_pairs = WALTZ::IDWT_SHARED_BYTES / sizeof(T) / (2U * dims.x);
             size_t chosen_smem = static_cast<size_t>(2U * chosen_pairs) * dims.x * sizeof(T);
             const bool xy_tpb256 = dims.x >= 1024U;
@@ -2612,23 +2686,26 @@ template <typename T> inline cudaError_t idwt3d_plane_prealloc(dim3 dims) {
                                              static_cast<int>(chosen_smem));
                 if (error != cudaSuccess)
                     return error;
+                int blocks_per_sm = 0;
                 cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                     &blocks_per_sm, idwt_yx_axis_fused_plane_float_ext<256>, 256, chosen_smem);
+                IDWTConfig<T>::plane_yx_blocks = max(blocks_per_sm, 1) * prop.multiProcessorCount;
             } else {
                 error = cudaFuncSetAttribute(idwt_yx_axis_fused_plane_float_ext<TPB>,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                                              static_cast<int>(chosen_smem));
                 if (error != cudaSuccess)
                     return error;
+                int blocks_per_sm = 0;
                 cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                     &blocks_per_sm, idwt_yx_axis_fused_plane_float_ext<TPB>, TPB, chosen_smem);
+                IDWTConfig<T>::plane_yx_blocks = max(blocks_per_sm, 1) * prop.multiProcessorCount;
             }
-            IDWTConfig<T>::yx_blocks = max(1, blocks_per_sm) * prop.multiProcessorCount;
             IDWTConfig<T>::yx_smem_bytes = chosen_smem;
             IDWTConfig<T>::yx_capacity = 2U * chosen_pairs * dims.x;
             IDWTConfig<T>::configured_nx = dims.x;
         }
-        if (IDWTConfig<T>::z_blocks == 0 || IDWTConfig<T>::configured_nz != dims.z) {
+        if (IDWTConfig<T>::plane_z_blocks == 0 || IDWTConfig<T>::configured_nz != dims.z) {
             int target_blocks_per_sm = 0;
             constexpr size_t BASELINE_Z_SMEM = 11000U * sizeof(T);
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -2643,37 +2720,15 @@ template <typename T> inline cudaError_t idwt3d_plane_prealloc(dim3 dims) {
             const uint32_t chosen_cap = 2U * dims.z * try_cols;
             const size_t chosen_smem = static_cast<size_t>(chosen_cap) * sizeof(T);
 
-            /*
-            // Disabled after SCALE/Hurricane A/B testing showed that the first
-            // occupancy-budgeted candidate is already accepted on the target GPU.
-            uint32_t chosen_cap = 11000U;
-            size_t chosen_smem = static_cast<size_t>(chosen_cap) * sizeof(T);
-            for (; try_cols >= 4U; try_cols -= 4U) {
-                const uint32_t try_cap = 2U * dims.z * try_cols;
-                const size_t try_smem = static_cast<size_t>(try_cap) * sizeof(T);
-                cudaError_t error = cudaFuncSetAttribute(idwt_z_columns_all_axis_float_dynamic,
-                                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                          static_cast<int>(try_smem));
-                if (error != cudaSuccess)
-                    continue;
-                int try_blocks_per_sm = 0;
-                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                    &try_blocks_per_sm, idwt_z_columns_all_axis_float_dynamic, TPB, try_smem);
-                if (try_blocks_per_sm >= target_blocks_per_sm) {
-                    chosen_cap = try_cap;
-                    chosen_smem = try_smem;
-                    break;
-                }
-            }
-            */
             cudaError_t error = cudaFuncSetAttribute(idwt_z_columns_all_axis_float_dynamic,
                                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                       static_cast<int>(chosen_smem));
             if (error != cudaSuccess)
                 return error;
+            int blocks_per_sm = 0;
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &blocks_per_sm, idwt_z_columns_all_axis_float_dynamic, TPB, chosen_smem);
-            IDWTConfig<T>::z_blocks = max(1, blocks_per_sm) * prop.multiProcessorCount;
+            IDWTConfig<T>::plane_z_blocks = max(blocks_per_sm, 1) * prop.multiProcessorCount;
             IDWTConfig<T>::z_smem_bytes = chosen_smem;
             IDWTConfig<T>::z_capacity = chosen_cap;
             IDWTConfig<T>::configured_nz = dims.z;
@@ -2682,7 +2737,7 @@ template <typename T> inline cudaError_t idwt3d_plane_prealloc(dim3 dims) {
     }
 }
 
-inline cudaError_t idwt3d_plane_hybrid_float(float* d_vol,
+inline cudaError_t idwt3d_plane_xy_halo_z_float(float* d_vol,
                                              float* d_tmp,
                                              dim3 dims,
                                              int levels_xy,
@@ -2708,7 +2763,7 @@ inline cudaError_t idwt3d_plane_hybrid_float(float* d_vol,
     if (e != cudaSuccess)
         return e;
 
-    const int z_grid = IDWTConfig<float>::z_blocks;
+    const int z_grid = IDWTConfig<float>::plane_z_blocks;
     const size_t z_smem = IDWTConfig<float>::z_smem_bytes;
     const uint32_t z_cap = IDWTConfig<float>::z_capacity;
     const bool xy_tpb256 = dims.x >= 1024U;
@@ -2742,7 +2797,7 @@ inline cudaError_t idwt3d_plane_hybrid_float(float* d_vol,
         // smaller: the same kernel also grid-strides over the carried annulus.
         if (xy_tpb256)
             idwt_yx_axis_fused_plane_float_ext<256>
-                <<<IDWTConfig<float>::yx_blocks, 256, smem, stream>>>(src,
+                <<<IDWTConfig<float>::plane_yx_blocks, 256, smem, stream>>>(src,
                                                                  dst,
                                                                  dims.x,
                                                                  dims.y,
@@ -2760,7 +2815,7 @@ inline cudaError_t idwt3d_plane_hybrid_float(float* d_vol,
                                                                  nullptr,
                                                                  0U);
         else
-            idwt_yx_axis_fused_plane_float_ext<<<IDWTConfig<float>::yx_blocks,
+            idwt_yx_axis_fused_plane_float_ext<<<IDWTConfig<float>::plane_yx_blocks,
                                                   TPB,
                                                   smem,
                                                   stream>>>(src,
@@ -2797,7 +2852,7 @@ inline cudaError_t idwt3d_plane_hybrid_float(float* d_vol,
     const size_t smem = static_cast<size_t>(2U * pairs) * dims.x * sizeof(float);
     if (xy_tpb256)
         idwt_yx_axis_fused_plane_float_ext<256>
-            <<<IDWTConfig<float>::yx_blocks, 256, smem, stream>>>(src,
+            <<<IDWTConfig<float>::plane_yx_blocks, 256, smem, stream>>>(src,
                                                                  dst,
                                                                  dims.x,
                                                                  dims.y,
@@ -2816,7 +2871,7 @@ inline cudaError_t idwt3d_plane_hybrid_float(float* d_vol,
                                                                  0U);
     else
         idwt_yx_axis_fused_plane_float_ext
-            <<<IDWTConfig<float>::yx_blocks, TPB, smem, stream>>>(
+            <<<IDWTConfig<float>::plane_yx_blocks, TPB, smem, stream>>>(
                 src,
                 dst,
                 dims.x,

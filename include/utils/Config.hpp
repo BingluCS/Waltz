@@ -64,13 +64,21 @@ template <typename T> struct DWTConfig {
     static inline int x_blocks = 0;
     static inline int y_blocks = 0;
     static inline int z_blocks = 0;
-    static inline size_t z_smem_bytes = 0;
-    static inline uint32_t z_configured_nz = 0;
 };
 
 template <typename T> struct IDWTConfig {
+    // Single-level dyadic launch grids. z_global_blocks is the one-time init guard.
+    static inline int z_global_blocks = 0;
+    static inline int z_static_blocks = 0;
+    static inline int z_vec_blocks = 0;
+    static inline int x_blocks = 0;
+    static inline int y_blocks = 0;
     static inline int yx_blocks = 0;
-    static inline int z_blocks = 0;
+    static inline int yx_wide_blocks = 0;
+    static inline int yx_ext_blocks = 0;
+    // All-level plane launch grids, keyed by configured dimensions below.
+    static inline int plane_yx_blocks = 0;
+    static inline int plane_z_blocks = 0;
     static inline size_t yx_smem_bytes = 0;
     static inline size_t z_smem_bytes = 0;
     static inline uint32_t yx_capacity = 0;

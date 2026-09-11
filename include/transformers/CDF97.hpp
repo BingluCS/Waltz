@@ -613,10 +613,6 @@ __device__ __forceinline__ int dwt_halo_reflect(int i, int n) {
     return i;
 }
 
-template <typename T, bool Quantize, bool FullColumns = false>
-__global__ void dwt_3d_z_s(const T* src, T* dst, dim3 data_dims, dim3 chunk_dims,
-                           uint32_t counter_index, uint32_t levels_to_run,
-                           uint32_t shared_capacity, QuantMode quant_mode);
 // Fused XY analysis for the non-dyadic (plane) path.  The plane transform first
 // runs Z to the requested depth, then recursively analyzes every XY plane.  The
 // regular implementation materialises an X volume and a Y volume at every
@@ -1093,9 +1089,15 @@ template <typename T>
 __global__ void dwt_3d_z_single_global(
     const T* src, T* dst, dim3 data_dims, dim3 chunk_dims, QuantMode quant_mode);
 
+// The plane path's full-Z pass always uses this fixed shared-memory footprint.
+// The capacity is expressed in elements inside the kernel so float and double
+// use the same 45 KiB allocation and the same host-side fit check.
+constexpr uint32_t DWT_Z_STATIC_BYTES = 45U * 1024U;
+
 template <typename T>
-inline cudaError_t dwt_z_active_staged_levels_launch(
-    const T* src, T* dst, dim3 dims, int levels_z, cudaStream_t stream);
+__global__ __launch_bounds__(TPB, std::is_same_v<T, float> ? 3 : 2)
+void dwt_3d_z_all_static(const T* src, T* dst, dim3 data_dims,
+                         uint8_t levels_to_run);
 
 // At coarse plane levels the number of row tiles quickly drops below the
 // occupancy-sized persistent grid.  Launching hundreds of CTAs that immediately
@@ -1165,132 +1167,48 @@ inline cudaError_t dwt3d_plane_xy_quant_launch(
 }
 
 
-inline cudaError_t dwt3d_plane_xy_halo_float(
-    float*& data, float*& tmp, dim3 dims, int levels_xy, int levels_z, const float* z_src,
-    uint32_t q_bz, cudaStream_t stream) {
-    if (levels_z > 0) {
-        const cudaError_t z_error = dwt_z_active_staged_levels_launch<float>(
-            z_src != nullptr ? z_src : data, data, dims, levels_z, stream);
-        if (z_error != cudaSuccess)
-            return z_error;
-    } else if (z_src != nullptr && z_src != data) {
-        const size_t bytes = static_cast<size_t>(dims.x) * dims.y * dims.z * sizeof(float);
-        const cudaError_t copy_error =
-            cudaMemcpyAsync(data, z_src, bytes, cudaMemcpyDeviceToDevice, stream);
-        if (copy_error != cudaSuccess)
-            return copy_error;
-    }
-    if (levels_xy <= 0)
-        return cudaGetLastError();
-
-    const bool quant_blocks_regular = q_bz != 0U && (q_bz & (q_bz - 1U)) == 0U &&
-                                      (dims.x & 15U) == 0U &&
-                                      (dims.y & 15U) == 0U && dims.z % q_bz == 0U;
-    float* current = data;
-    float* scratch = tmp;
-    dim3 chunk_dims = dims;
-    for (int lev = 0; lev < levels_xy; ++lev) {
-        cudaError_t error;
-        if (lev + 1 == levels_xy) {
-            error = dwt3d_plane_xy_quant_launch<float, QuantMode::All>(
-                current, scratch, dims, chunk_dims, quant_blocks_regular, stream);
-        } else {
-            error = dwt3d_plane_xy_quant_launch<float, QuantMode::High>(
-                current, scratch, dims, chunk_dims, quant_blocks_regular, stream);
-        }
-        if (error != cudaSuccess)
-            return error;
-        std::swap(current, scratch);
-        chunk_dims.x -= chunk_dims.x >> 1U;
-        chunk_dims.y -= chunk_dims.y >> 1U;
-    }
-    data = current;
-    tmp = scratch;
-    return cudaGetLastError();
-}
-
-// Double-precision entry point for the same Z-all + per-level fused XY path.
-template <typename T, QuantMode Quant>
-inline cudaError_t dwt3d_plane_xy_halo_generic(
+template <typename T>
+inline cudaError_t dwt3d_plane_xy_halo_z(
     T*& data, T*& tmp, dim3 dims, int levels_xy, int levels_z, const T* z_src,
     uint32_t q_bz, cudaStream_t stream) {
-    if (data == nullptr || tmp == nullptr || dims.x == 0U || dims.y == 0U || dims.z == 0U)
-        return cudaErrorInvalidValue;
+    const T* input = z_src != nullptr ? z_src : data;
     if (levels_z > 0) {
-        const cudaError_t z_error = dwt_z_active_staged_levels_launch<T>(
-            z_src != nullptr ? z_src : data, data, dims, levels_z, stream);
-        if (z_error != cudaSuccess)
-            return z_error;
-    } else if (z_src != nullptr && z_src != data) {
-        const size_t bytes = static_cast<size_t>(dims.x) * dims.y * dims.z * sizeof(T);
-        const cudaError_t copy_error =
-            cudaMemcpyAsync(data, z_src, bytes, cudaMemcpyDeviceToDevice, stream);
-        if (copy_error != cudaSuccess)
-            return copy_error;
+        constexpr uint32_t shared_capacity = DWT_Z_STATIC_BYTES / sizeof(T);
+        // dwt_z_float/double use two ping-pong buffers for every full-Z column.
+        // Reject a shape that cannot fit before launching: the device kernel
+        // cannot report an error, and allowing zero columns would divide by 0.
+        if (dims.z > shared_capacity / 2U)
+            return cudaErrorInvalidConfiguration;
+        dwt_3d_z_all_static<T><<<DWTConfig<T>::z_blocks, TPB, 0, stream>>>(
+            input, data, dims, static_cast<uint8_t>(levels_z));
+        input = data;
     }
-    const cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess || levels_xy <= 0)
-        return error;
-
-    if constexpr (Quant == QuantMode::None) {
-        const dim3 grid((dims.x + DWT_TILE_BX64 - 1U) / DWT_TILE_BX64,
-                        (dims.y + DWT_TILE_BY16 - 1U) / DWT_TILE_BY16,
-                        dims.z);
-        dwt3d_xy_double<DWT_TILE_BX64, DWT_TILE_BY16, QuantMode::None>
-            <<<grid, 256, 0, stream>>>(data, tmp, dims, dims);
-        cudaError_t level_error = cudaGetLastError();
-        if (level_error != cudaSuccess)
-            return level_error;
-
-        T* current = tmp;
-        T* scratch = data;
-        uint32_t lx = dims.x - (dims.x >> 1U);
-        uint32_t ly = dims.y - (dims.y >> 1U);
-        for (int lev = 1; lev < levels_xy; ++lev) {
-            const int gx = dwt_plane_x_launch_grid<T>(lx, ly, dims.z);
-            dwt_x_axis<T><<<gx, TPB, 0, stream>>>(
-                current, scratch, dims.x, dims.y, lx, ly, dims.z,
-                static_cast<uint32_t>(lev));
-            level_error = cudaGetLastError();
-            if (level_error != cudaSuccess)
-                return level_error;
-            dwt_plane_y_coarse_launch<T>(scratch, current, dims.x, dims.y, lx, ly, dims.z,
-                                         static_cast<uint32_t>(lev), stream);
-            level_error = cudaGetLastError();
-            if (level_error != cudaSuccess)
-                return level_error;
-            lx -= lx >> 1U;
-            ly -= ly >> 1U;
-        }
-        data = current;
-        tmp = scratch;
-        return cudaGetLastError();
-    }
-
     const bool quant_blocks_regular = q_bz != 0U && (q_bz & (q_bz - 1U)) == 0U &&
                                       (dims.x & 15U) == 0U &&
                                       (dims.y & 15U) == 0U && dims.z % q_bz == 0U;
     T* current = data;
     T* scratch = tmp;
+    if (input == scratch) {
+        T* const temp = current;
+        current = scratch;
+        scratch = temp;
+    }
     dim3 chunk_dims = dims;
     for (int lev = 0; lev < levels_xy; ++lev) {
-        cudaError_t level_error;
+        cudaError_t error;
         if (lev + 1 == levels_xy) {
-            if constexpr (Quant == QuantMode::All)
-                level_error = dwt3d_plane_xy_quant_launch<T, QuantMode::All>(
-                    current, scratch, dims, chunk_dims, quant_blocks_regular, stream);
-            else
-                level_error = dwt3d_plane_xy_quant_launch<T, QuantMode::High>(
-                    current, scratch, dims, chunk_dims, quant_blocks_regular, stream);
+            error = dwt3d_plane_xy_quant_launch<T, QuantMode::All>(
+                input, scratch, dims, chunk_dims, quant_blocks_regular, stream);
         } else {
-            level_error = dwt3d_plane_xy_quant_launch<T, QuantMode::High>(
-                current, scratch, dims, chunk_dims, quant_blocks_regular, stream);
+            error = dwt3d_plane_xy_quant_launch<T, QuantMode::High>(
+                input, scratch, dims, chunk_dims, quant_blocks_regular, stream);
         }
-        if (level_error != cudaSuccess)
-            return level_error;
-        T* const swap = current;
+        if (error != cudaSuccess)
+            return error;
+        T* const temp = current;
         current = scratch;
-        scratch = swap;
+        scratch = temp;
+        input = current;
         chunk_dims.x -= chunk_dims.x >> 1U;
         chunk_dims.y -= chunk_dims.y >> 1U;
     }
@@ -1309,7 +1227,7 @@ __global__ void dwt_3d_z_single_static(
 // level. Ordinary kernel-launch ordering supplies the required global barrier;
 // no grid-wide synchronization is needed.
 template <typename T>
-inline void dwt3d_xy_halo_zstage(T* data, T* tmp, dim3 dims, int levels, uint32_t q_bz, cudaStream_t stream) {
+inline void dwt3d_xy_halo_z(T* data, T* tmp, dim3 dims, int levels, uint32_t q_bz, cudaStream_t stream) {
     constexpr uint32_t static_capacity = 32768U / sizeof(T);
     const bool quant_blocks_regular = (q_bz & (q_bz - 1U)) == 0U &&
         (dims.x & 15U) == 0U && (dims.y & 15U) == 0U && dims.z % q_bz == 0U;
@@ -1853,6 +1771,30 @@ __device__ __forceinline__ void dwt_z_double(const double* input,
     } while (true);
 }
 
+// Full-column, all-level Z pass for the non-dyadic plane path.  The kernel
+// deliberately has no runtime QuantMode/quantization argument: plane Z is
+// always an unquantized staging pass, while the XY launcher emits quantized
+// subbands.  The existing typed dwt_z_*<false> bodies retain the baseline math
+// and ping-pong data flow.
+template <typename T>
+__global__ __launch_bounds__(TPB, std::is_same_v<T, float> ? 3 : 2)
+void dwt_3d_z_all_static(const T* src, T* dst, dim3 data_dims,
+                         uint8_t levels_to_run) {
+    constexpr uint32_t capacity = DWT_Z_STATIC_BYTES / sizeof(T);
+    __shared__ alignas(128) T s_data[capacity];
+    __shared__ int s_chunkID;
+    const dim3 storage_leaps(1U, data_dims.x, data_dims.x * data_dims.y);
+    if constexpr (std::is_same_v<T, float>) {
+        dwt_z_float<false>(src, dst, data_dims, storage_leaps, levels_to_run,
+                           s_data, capacity, &z_count[0], &s_chunkID,
+                           QuantMode::None);
+    } else if constexpr (std::is_same_v<T, double>) {
+        dwt_z_double<false>(src, dst, data_dims, storage_leaps, levels_to_run,
+                            s_data, capacity, &z_count[0], &s_chunkID,
+                            QuantMode::None);
+    }
+}
+
 
 __device__ __forceinline__ int dwt_reflect(int i, int n) {
     if (n <= 1)
@@ -1937,8 +1879,8 @@ __device__ __forceinline__ void dwt_z_active_transform_pair(
     }
 }
 
-// Double-precision one-level Z body shared by the static and dynamic entry
-// kernels. It stages one or more active columns in one buffer and writes the
+// Double-precision one-level Z body inlined into dwt_3d_z_single_static<double>.
+// It stages one or more active columns in one buffer and writes the
 // low/high coefficients directly to global memory; no all-level ping-pong
 // state is carried into this specialized path.
 template <bool ZTilesStayInRow, bool QuantBlocksRegular>
@@ -2081,232 +2023,8 @@ __global__ __launch_bounds__(TPB, 2) void dwt_3d_z_single_global(const T* src, T
     }
 }
 
-// Shared-memory Z kernel. `data_dims` describes physical storage strides;
-// `chunk_dims` describes only the current active region.
-template <typename T, bool Quantize, bool FullColumns>
-__global__ __launch_bounds__(
-    TPB, std::is_same_v<T, float> && (!Quantize || FullColumns) ? 3 : 2) void
-dwt_3d_z_s(const T* src, T* dst, dim3 data_dims, dim3 chunk_dims, uint32_t counter_index,
-           uint32_t levels_to_run, uint32_t shared_capacity, QuantMode quant_mode) {
-    const uint32_t nx = data_dims.x;
-    const uint32_t ny = data_dims.y;
-    const uint32_t lx = chunk_dims.x;
-    const uint32_t ly = chunk_dims.y;
-    const uint32_t lz = chunk_dims.z;
-    extern __shared__ __align__(128) unsigned char dwt_z_active_smem[];
-    T* const s_data = reinterpret_cast<T*>(dwt_z_active_smem);
-    __shared__ int chunk_id;
-
-    if (lx == 0U || ly == 0U || lz == 0U || levels_to_run == 0U || shared_capacity < lz)
-        return;
-
-    if constexpr (FullColumns) {
-        const dim3 active_dims(nx, ny, lz);
-        const dim3 storage_leaps(1U, nx, nx * ny);
-        if constexpr (std::is_same_v<T, float> && Quantize) {
-            dwt_z_float<true, false>(
-                src, dst, active_dims, storage_leaps, static_cast<uint8_t>(levels_to_run), s_data,
-                shared_capacity, &z_count[0], &chunk_id, quant_mode);
-        } else if constexpr (std::is_same_v<T, double> && Quantize) {
-            constexpr uint32_t fixed_capacity = 32768U / sizeof(T);
-            __shared__ alignas(128) T fixed_s_data[fixed_capacity];
-            dwt_z_double<true, false>(
-                src, dst, active_dims, storage_leaps, static_cast<uint8_t>(levels_to_run),
-                fixed_s_data, fixed_capacity, &z_count[0], &chunk_id, quant_mode);
-        } else {
-            if constexpr (std::is_same_v<T, float>)
-                dwt_z_float<false>(src, dst, active_dims, storage_leaps,
-                            static_cast<uint8_t>(levels_to_run), s_data, shared_capacity,
-                            &z_count[0], &chunk_id, quant_mode);
-            else if constexpr (std::is_same_v<T, double>)
-                dwt_z_double<false>(src, dst, active_dims, storage_leaps,
-                             static_cast<uint8_t>(levels_to_run), s_data, shared_capacity,
-                             &z_count[0], &chunk_id, quant_mode);
-        }
-        return;
-    } else {
-    const size_t leap_z = static_cast<size_t>(nx) * ny;
-    const uint32_t total_columns = lx * ly;
-    uint32_t columns_per_chunk = min(shared_capacity / lz, total_columns);
-    if constexpr (sizeof(T) == sizeof(float)) {
-        if (columns_per_chunk >= 4U)
-            columns_per_chunk &= ~3U;
-    } else {
-        if (columns_per_chunk >= 2U)
-            columns_per_chunk &= ~1U;
-    }
-    columns_per_chunk = max(columns_per_chunk, 1U);
-    const uint32_t chunks = (total_columns + columns_per_chunk - 1U) / columns_per_chunk;
-    const uint32_t even_z = lz - (lz >> 1U);
-    const uint32_t low_x = lx - (lx >> 1U);
-    const uint32_t low_y = ly - (ly >> 1U);
-
-    while (true) {
-        if (threadIdx.x == 0)
-            chunk_id = static_cast<int>(atomicAdd(&z_count[counter_index], 1U));
-        __syncthreads();
-        const uint32_t chunk = static_cast<uint32_t>(chunk_id);
-        if (chunk >= chunks)
-            break;
-
-        const uint32_t column0 = chunk * columns_per_chunk;
-        const uint32_t ncol = min(columns_per_chunk, total_columns - column0);
-        const uint32_t tile_elements = ncol * lz;
-        const bool contiguous_columns = lx == nx;
-
-        if constexpr (sizeof(T) == sizeof(float)) {
-            const bool vector_load = contiguous_columns && ncol == columns_per_chunk &&
-                                     (ncol & 3U) == 0U && (column0 & 3U) == 0U &&
-                                     (leap_z & 3U) == 0U &&
-                                     (reinterpret_cast<uintptr_t>(src) & 15U) == 0U;
-            if (vector_load) {
-                const uint32_t vector_columns = ncol >> 2U;
-                const uint32_t vector_elements = lz * vector_columns;
-                float4* const shared4 = reinterpret_cast<float4*>(s_data);
-                for (uint32_t i = threadIdx.x; i < vector_elements; i += TPB) {
-                    const uint32_t z = i / vector_columns;
-                    const uint32_t vc = i - z * vector_columns;
-                    shared4[i] = *reinterpret_cast<const float4*>(
-                        src + column0 + (vc << 2U) + static_cast<size_t>(z) * leap_z);
-                }
-            } else {
-                for (uint32_t i = threadIdx.x; i < tile_elements; i += TPB) {
-                    const uint32_t z = i / ncol;
-                    const uint32_t local_column = i - z * ncol;
-                    const uint32_t active_column = column0 + local_column;
-                    const uint32_t x = active_column % lx;
-                    const uint32_t y = active_column / lx;
-                    s_data[i] = src[x + static_cast<size_t>(y) * nx +
-                                    static_cast<size_t>(z) * leap_z];
-                }
-            }
-        } else {
-            const bool vector_load = contiguous_columns && ncol == columns_per_chunk &&
-                                     (ncol & 1U) == 0U && (column0 & 1U) == 0U &&
-                                     (leap_z & 1U) == 0U &&
-                                     (reinterpret_cast<uintptr_t>(src) & 15U) == 0U;
-            if (vector_load) {
-                const uint32_t vector_columns = ncol >> 1U;
-                const uint32_t vector_elements = lz * vector_columns;
-                double2* const shared2 = reinterpret_cast<double2*>(s_data);
-                for (uint32_t i = threadIdx.x; i < vector_elements; i += TPB) {
-                    const uint32_t z = i / vector_columns;
-                    const uint32_t vc = i - z * vector_columns;
-                    shared2[i] = *reinterpret_cast<const double2*>(
-                        src + column0 + (vc << 1U) + static_cast<size_t>(z) * leap_z);
-                }
-            } else {
-                for (uint32_t i = threadIdx.x; i < tile_elements; i += TPB) {
-                    const uint32_t z = i / ncol;
-                    const uint32_t local_column = i - z * ncol;
-                    const uint32_t active_column = column0 + local_column;
-                    const uint32_t x = active_column % lx;
-                    const uint32_t y = active_column / lx;
-                    s_data[i] = src[x + static_cast<size_t>(y) * nx +
-                                    static_cast<size_t>(z) * leap_z];
-                }
-            }
-        }
-        __syncthreads();
-
-        if constexpr (sizeof(T) == sizeof(float)) {
-            const uint32_t groups = (even_z + 1U) >> 1U;
-            const uint32_t work = groups * ncol;
-            for (uint32_t i = threadIdx.x; i < work; i += TPB) {
-                const uint32_t group = i / ncol;
-                const uint32_t local_column = i - group * ncol;
-                const uint32_t pair = group << 1U;
-                const int z = static_cast<int>(pair << 1U);
-                if (pair + 1U < even_z && z >= 4 && z + 6 < static_cast<int>(lz)) {
-                    const float c0 = s_data[static_cast<uint32_t>(z - 4) * ncol + local_column];
-                    const float c1 = s_data[static_cast<uint32_t>(z - 3) * ncol + local_column];
-                    const float c2 = s_data[static_cast<uint32_t>(z - 2) * ncol + local_column];
-                    const float c3 = s_data[static_cast<uint32_t>(z - 1) * ncol + local_column];
-                    const float c4 = s_data[static_cast<uint32_t>(z) * ncol + local_column];
-                    const float c5 = s_data[static_cast<uint32_t>(z + 1) * ncol + local_column];
-                    const float c6 = s_data[static_cast<uint32_t>(z + 2) * ncol + local_column];
-                    const float c7 = s_data[static_cast<uint32_t>(z + 3) * ncol + local_column];
-                    const float c8 = s_data[static_cast<uint32_t>(z + 4) * ncol + local_column];
-                    const float c9 = s_data[static_cast<uint32_t>(z + 5) * ncol + local_column];
-                    const float c10 = s_data[static_cast<uint32_t>(z + 6) * ncol + local_column];
-                    const uint32_t active_column = column0 + local_column;
-                    const uint32_t x = active_column % lx;
-                    const uint32_t y = active_column / lx;
-                    const size_t xy = x + static_cast<size_t>(y) * nx;
-                    const float low0 = plane_z_low_filter<float>(c4,
-                                                                 add_rn<float>(c3, c5),
-                                                                 add_rn<float>(c2, c6),
-                                                                 add_rn<float>(c1, c7),
-                                                                 add_rn<float>(c0, c8));
-                    const float high0 = plane_z_high_filter<float>(
-                        c5, add_rn<float>(c4, c6), add_rn<float>(c3, c7),
-                        add_rn<float>(c2, c8));
-                    const float low1 = plane_z_low_filter<float>(c6,
-                                                                 add_rn<float>(c5, c7),
-                                                                 add_rn<float>(c4, c8),
-                                                                 add_rn<float>(c3, c9),
-                                                                 add_rn<float>(c2, c10));
-                    dwt_z_active_store<T, Quantize>(
-                        low0, dst, xy + static_cast<size_t>(pair) * leap_z, x, y, pair, low_x,
-                        low_y, true, data_dims, quant_mode);
-                    dwt_z_active_store<T, Quantize>(
-                        high0, dst, xy + static_cast<size_t>(even_z + pair) * leap_z, x, y,
-                        even_z + pair, low_x, low_y, false, data_dims, quant_mode);
-                    dwt_z_active_store<T, Quantize>(
-                        low1, dst, xy + static_cast<size_t>(pair + 1U) * leap_z, x, y, pair + 1U,
-                        low_x, low_y, true, data_dims, quant_mode);
-                    if (z + 3 < static_cast<int>(lz)) {
-                        const float high1 = plane_z_high_filter<float>(
-                            c7, add_rn<float>(c6, c8), add_rn<float>(c5, c9),
-                            add_rn<float>(c4, c10));
-                        dwt_z_active_store<T, Quantize>(
-                            high1, dst, xy + static_cast<size_t>(even_z + pair + 1U) * leap_z, x,
-                            y, even_z + pair + 1U, low_x, low_y, false, data_dims,
-                            quant_mode);
-                    }
-                } else {
-                    dwt_z_active_transform_pair<T, Quantize>(
-                        s_data, dst, ncol, data_dims, lx, lz, column0, pair, local_column, leap_z,
-                        even_z, low_x, low_y, quant_mode);
-                    if (pair + 1U < even_z)
-                        dwt_z_active_transform_pair<T, Quantize>(
-                            s_data, dst, ncol, data_dims, lx, lz, column0, pair + 1U, local_column,
-                            leap_z, even_z, low_x, low_y, quant_mode);
-                }
-            }
-        } else {
-            const uint32_t work = even_z * ncol;
-            for (uint32_t i = threadIdx.x; i < work; i += TPB) {
-                const uint32_t pair = i / ncol;
-                const uint32_t local_column = i - pair * ncol;
-                dwt_z_active_transform_pair<T, Quantize>(
-                    s_data, dst, ncol, data_dims, lx, lz, column0, pair, local_column, leap_z,
-                    even_z, low_x, low_y, quant_mode);
-            }
-        }
-        __syncthreads();
-    }
-    }
-}
-
-template <typename T>
-inline cudaError_t dwt_z_active_staged_levels_launch(
-    const T* src, T* dst, dim3 dims, int levels_z, cudaStream_t stream) {
-    if (levels_z < 0 || levels_z > CDF97_MAX_LEVELS)
-        return cudaErrorInvalidValue;
-    if (levels_z == 0)
-        return cudaSuccess;
-
-    const size_t shared_bytes = DWTConfig<T>::z_smem_bytes;
-    const uint32_t shared_capacity = static_cast<uint32_t>(shared_bytes / sizeof(T));
-    dwt_3d_z_s<T, false, true><<<DWTConfig<T>::z_blocks, TPB, shared_bytes, stream>>>(
-        src, dst, dims, dims, 0U, static_cast<uint32_t>(levels_z), shared_capacity,
-        QuantMode::None);
-    return cudaGetLastError();
-}
-
-// One-level float implementation used by both the static- and dynamic-shared
-// kernels. It deliberately keeps the original two-buffer data flow: stage the
+// One-level float body inlined into dwt_3d_z_single_static<float>.
+// It deliberately keeps the original two-buffer data flow: stage the
 // input, form a complete transformed tile, then quantize that tile in linear
 // order. __forceinline__ makes this body part of each kernel's generated SASS;
 // it does not call the multi-level Z-all implementation.
@@ -2495,59 +2213,7 @@ inline void dwt3d_split_prealloc(dim3 dims, bool use_dyadic) {
 
     initialize_grid_blocks(dwt_x_axis<T>, DWTConfig<T>::x_blocks);
     initialize_grid_blocks(dwt_y_axis<T>, DWTConfig<T>::y_blocks);
-
-    if (DWTConfig<T>::z_configured_nz == dims.z && DWTConfig<T>::z_blocks != 0)
-        return;
-
-    DWTConfig<T>::z_blocks = 0;
-    DWTConfig<T>::z_smem_bytes = 0;
-    DWTConfig<T>::z_configured_nz = 0;
-    constexpr uint32_t column_step = 16 / sizeof(T);
-    const size_t minimum_bytes = static_cast<size_t>(dims.z) * column_step * sizeof(T);
-    const size_t baseline_bytes = max(static_cast<size_t>(32768U), minimum_bytes);
-    if (baseline_bytes > static_cast<size_t>(prop.sharedMemPerBlockOptin))
-        return;
-    // Shared-memory Z variants: Quantize, FullColumns.
-    if (baseline_bytes >= static_cast<size_t>(prop.sharedMemPerBlock))
-        cudaFuncSetAttribute(dwt_3d_z_s<T, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(baseline_bytes));
-    int target_blocks_per_sm = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &target_blocks_per_sm, dwt_3d_z_s<T, false, true>,
-        TPB, baseline_bytes);
-    target_blocks_per_sm = max(1, target_blocks_per_sm);
-
-    const size_t shared_budget = min(static_cast<size_t>(prop.sharedMemPerBlockOptin), 
-        static_cast<size_t>(prop.sharedMemPerMultiprocessor) / static_cast<size_t>(target_blocks_per_sm));
-    uint32_t try_columns = static_cast<uint32_t>(shared_budget / (dims.z * sizeof(T)));
-    if constexpr (std::is_same_v<T, float>) 
-        try_columns &= ~3U;
-    else if constexpr (std::is_same_v<T, double>) 
-        try_columns &= ~1U;
-
-
-    const uint32_t try_capacity = dims.z * try_columns;
-    const size_t try_bytes = static_cast<size_t>(try_capacity) * sizeof(T);
-
-    if (try_bytes >= static_cast<size_t>(prop.sharedMemPerBlock)) {
-        cudaFuncSetAttribute(dwt_3d_z_s<T, false, false>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(try_bytes));
-        cudaFuncSetAttribute(dwt_3d_z_s<T, true, false>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(try_bytes));
-        cudaFuncSetAttribute(dwt_3d_z_s<T, false, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(try_bytes));
-        if constexpr (std::is_same_v<T, float>) {
-            cudaFuncSetAttribute(dwt_3d_z_s<T, true, true>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(try_bytes));
-        }
-    }
-
-    int blocks_per_sm = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm,
-        dwt_3d_z_s<T, false, true>, TPB, try_bytes);
-    DWTConfig<T>::z_blocks = max(1, blocks_per_sm) * prop.multiProcessorCount;
-    DWTConfig<T>::z_smem_bytes = try_bytes;
-    DWTConfig<T>::z_configured_nz = dims.z;
+    initialize_grid_blocks(dwt_3d_z_all_static<T>, DWTConfig<T>::z_blocks);
 }
 
 // ---------------------------------------------------------------------------

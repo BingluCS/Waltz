@@ -28,26 +28,23 @@ int main(int argc, char** argv) {
     if ((bytes & 1u) != 0 || bytes / 2 > UINT32_MAX)
         return 2;
     std::vector<uint16_t> input(bytes / 2), decoded(bytes / 2);
-    const bool with_sign = std::getenv("WZP_SIGN") != nullptr;
     std::vector<uint32_t> sign((input.size() + 31u) / 32u, 0), decoded_sign(sign.size(), 0);
     file.seekg(0);
     file.read(reinterpret_cast<char*>(input.data()), bytes);
-    if (with_sign)
-        for (size_t i = 0; i < input.size(); ++i)
-            if (input[i] != 0 && (i % 3u) == 1u)
-                sign[i >> 5u] |= 1u << (i & 31u);
+    // The encoder always stores signs; use deterministic synthetic signs.
+    for (size_t i = 0; i < input.size(); ++i)
+        if (input[i] != 0 && (i % 3u) == 1u)
+            sign[i >> 5u] |= 1u << (i & 31u);
     uint16_t *device_input = nullptr, *device_decoded = nullptr;
     uint32_t *device_sign = nullptr, *device_decoded_sign = nullptr;
     check(cudaMalloc(&device_input, bytes), "allocate input");
     check(cudaMalloc(&device_decoded, bytes), "allocate output");
-    if (with_sign) {
-        check(cudaMalloc(&device_sign, sign.size() * sizeof(uint32_t)), "allocate sign");
-        check(cudaMalloc(&device_decoded_sign, sign.size() * sizeof(uint32_t)),
-              "allocate decoded sign");
-        check(cudaMemcpy(
-                  device_sign, sign.data(), sign.size() * sizeof(uint32_t), cudaMemcpyHostToDevice),
-              "copy sign");
-    }
+    check(cudaMalloc(&device_sign, sign.size() * sizeof(uint32_t)), "allocate sign");
+    check(cudaMalloc(&device_decoded_sign, sign.size() * sizeof(uint32_t)),
+          "allocate decoded sign");
+    check(cudaMemcpy(
+              device_sign, sign.data(), sign.size() * sizeof(uint32_t), cudaMemcpyHostToDevice),
+          "copy sign");
     check(cudaMemcpy(device_input, input.data(), bytes, cudaMemcpyHostToDevice), "copy input");
     cudaStream_t stream{};
     check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create stream");
@@ -55,10 +52,8 @@ int main(int argc, char** argv) {
     WALTZ::lossless::wzp_prealloc(n, stream);
     double encode_ms = 0, decode_ms = 0;
     uint32_t nnz = 0;
-    const size_t compressed =
-        with_sign ? WALTZ::lossless::wzp_encode_with_sign(
-                        device_input, device_sign, n, &nnz, &encode_ms, stream)
-                  : WALTZ::lossless::wzp_encode(device_input, n, &encode_ms, stream);
+    const size_t compressed = WALTZ::lossless::wzp_encode_with_sign(
+        device_input, device_sign, n, &nnz, &encode_ms, stream);
     if (const char* dump = std::getenv("WZP_DUMP")) {
         std::vector<unsigned char> archive(compressed);
         check(cudaMemcpy(archive.data(),
@@ -69,31 +64,20 @@ int main(int argc, char** argv) {
         std::ofstream out(dump, std::ios::binary);
         out.write(reinterpret_cast<const char*>(archive.data()), archive.size());
     }
-    if (with_sign)
-        WALTZ::lossless::wzp_decode_with_sign(WALTZ::lossless::wzp_encoded_buf(),
-                                              n,
-                                              device_decoded,
-                                              device_decoded_sign,
-                                              &decode_ms,
-                                              stream);
-    else
-        WALTZ::lossless::wzp_decode(
-            WALTZ::lossless::wzp_encoded_buf(), n, device_decoded, &decode_ms, stream);
+    WALTZ::lossless::wzp_decode_with_sign(WALTZ::lossless::wzp_encoded_buf(),
+                                        n, device_decoded, device_decoded_sign, &decode_ms, stream);
     check(cudaMemcpy(decoded.data(), device_decoded, bytes, cudaMemcpyDeviceToHost),
           "copy decoded");
-    if (with_sign)
-        check(cudaMemcpy(decoded_sign.data(),
-                         device_decoded_sign,
-                         sign.size() * sizeof(uint32_t),
-                         cudaMemcpyDeviceToHost),
-              "copy decoded sign");
+    check(cudaMemcpy(decoded_sign.data(), device_decoded_sign,
+                     sign.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost),
+          "copy decoded sign");
     size_t mismatch = 0;
     while (mismatch < input.size() && input[mismatch] == decoded[mismatch])
         ++mismatch;
     size_t sign_mismatch = 0;
     while (sign_mismatch < sign.size() && sign[sign_mismatch] == decoded_sign[sign_mismatch])
         ++sign_mismatch;
-    const bool same = mismatch == input.size() && (!with_sign || sign_mismatch == sign.size());
+    const bool same = mismatch == input.size() && sign_mismatch == sign.size();
     std::printf("input=%zu compressed=%zu ratio=%.6f encode=%.6fms %.3fGB/s "
                 "decode=%.6fms %.3fGB/s verify=%s mismatch=%zu sign_mismatch=%zu nnz=%u\n",
                 bytes,
@@ -105,7 +89,7 @@ int main(int argc, char** argv) {
                 bytes / (decode_ms * 1.0e6),
                 same ? "OK" : "FAIL",
                 mismatch == input.size() ? 0 : mismatch,
-                !with_sign || sign_mismatch == sign.size() ? 0 : sign_mismatch,
+                sign_mismatch == sign.size() ? 0 : sign_mismatch,
                 nnz);
     cudaStreamDestroy(stream);
     cudaFree(device_decoded);

@@ -76,10 +76,6 @@ __device__ __forceinline__ size_t zorder_rank(size_t src_idx,
     return static_cast<size_t>(rank);
 }
 
-__device__ __forceinline__ bool is_pow2(uint32_t v) {
-    return v >= 8u && (v & (v - 1u)) == 0u;
-}
-
 // Fast path for a power-of-two CUBE of edge D: each block stages one 8x8x8 tile in
 // shared memory and writes it out in Morton order, so global accesses are coalesced
 // and the reorder happens entirely in shared (no random global scatter).  Reads a
@@ -143,7 +139,7 @@ inline int reorder_grid(size_t total, int block, int max_grid = 4096) {
     return static_cast<int>(g);
 }
 
-// Returns true if `v` is a power of two and >= 8 (host-side mirror of is_pow2).
+// Returns true if `v` is a power of two and >= 8.
 inline bool host_pow2(uint32_t v) {
     return v >= 8u && (v & (v - 1u)) == 0u;
 }

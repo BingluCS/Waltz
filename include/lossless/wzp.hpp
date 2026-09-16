@@ -11,18 +11,18 @@ namespace WALTZ::lossless {
 // hierarchy.  All metadata and payload remain device resident.
 void wzp_prealloc(uint32_t n, cudaStream_t stream = 0);
 size_t wzp_maxsize(uint32_t n);
-size_t wzp_encode(const uint16_t* input, uint32_t n, double* ms, cudaStream_t stream = 0);
 size_t wzp_encode_with_sign(const uint16_t* input,
                             const uint32_t* sign_bitmap,
                             uint32_t n,
                             uint32_t* nnz,
                             double* ms,
                             cudaStream_t stream = 0);
+// Call finish before another WZP operation reuses the workspace/timing events.
 void wzp_encode_with_sign_launch(const uint16_t* input,
                                  const uint32_t* sign_bitmap,
                                  uint32_t n,
                                  cudaStream_t stream = 0);
-size_t wzp_encode_with_sign_finish(uint32_t* nnz, double* ms, cudaStream_t stream = 0);
+size_t wzp_encode_with_sign_finish(uint32_t* nnz, double* ms);
 const void* wzp_encoded_buf();
 void wzp_decode(
     const void* blob, uint32_t n, uint16_t* output, double* ms, cudaStream_t stream = 0);

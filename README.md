@@ -14,7 +14,7 @@ transform topologies. Forward Z/axis kernels use `DWT_TPB=512`, inverse kernels
 use `IDWT_TPB=384`, and fused forward XY kernels launch with 256 threads.
 One-time prewarming is disabled by default.
 
-The source update dated 2026-09-11 includes:
+The source update dated 2026-09-16 includes:
 
 - Dyadic DWT: fused XY followed by a single-level Z kernel, with static shared
   memory or direct global loads selected for each level. Float and double use
@@ -24,18 +24,29 @@ The source update dated 2026-09-11 includes:
   allocation; float and double share the `dwt3d_plane_xy_halo_z<T>` launcher.
 - `QuantMode::None`, `High`, and `All` name the quantization modes. Z tile
   alignment and quantization-block regularity are handled independently.
-- Updated single-level IDWT Z kernels, with float4 and aligned double2 paths,
-  bounded 32-bit shared-memory reflection, and corrected four-output Y/Z
-  interior bounds. Launch grids are cached in `IDWTConfig<T>` during
-  preallocation rather than queried inside each transform level.
-- Wide float dyadic IDWT uses whole-row Y-then-X fusion when a row pair fits
-  in its 48 KiB shared allocation. The row-pair count adapts to the active
-  width. Compression-side PWE reconstruction and decompression share this
-  path; narrow float, double and plane paths keep their existing algorithms.
-  Oversized or degenerate cases retain the separate-axis fallback.
+- Single-level IDWT Z uses a runtime vectorization flag for float4/aligned
+  double2 loads. Launch grids and scratch buffers live in `IDWTConfig<T>`;
+  active dimensions are computed once before the inverse level loop.
+- Dyadic float IDWT uses whole-row Y-then-X fusion with a 128x16 halo fallback.
+  `PWE::T` / `PWE::F` select error recording versus reconstruction writes at
+  compile time. The double path retains its type-specific implementation.
+- Plane float/double IDWT share `idwt_yx_plane<T>` with 256-thread launches and
+  `idwt_z_all_dynamic<T>`. XY uses static shared memory (32 KiB float, 48 KiB
+  double); inverse Z-all retains dynamically sized shared memory. Intermediate
+  XY launches preserve the outer coefficients needed by the next level.
+- Signed WZP encoding and group packing run in one kernel with a fixed grid of
+  512 blocks and dynamic chunk scheduling. Workspace allocation and timing
+  events are reused through `WZPConfig`. The unsigned-only encoder and the
+  experimental prefix-encoding switch were removed; legacy decoding remains.
+- `Waltz_gather` / `Waltz_scatter` centralize compressed-blob assembly and
+  section views. The existing section order and alignment are preserved.
 - Removal of cooperative launch paths, unused Y-chain code, and disabled
   shared-memory search code. Compression overlaps lossless coding with IDWT;
   supported WZP decode layouts fuse reordering and dequantization.
+
+Unadopted P4/dual-transform, reconstruction-shift, adaptive WZP and auxiliary
+side-stream codec experiments are not enabled in this release. Benchmark
+snapshots, generated binaries and local datasets are not part of the repository.
 
 ## Status
 
@@ -54,7 +65,8 @@ before publishing or redistributing the repository.
 - Linux
 - CMake 3.21 or newer
 - A C++17 compiler supported by the installed CUDA toolkit
-- NVIDIA CUDA Toolkit 11.8 or newer
+- NVIDIA CUDA Toolkit (this snapshot is validated with 13.1; older toolkits
+  have not been revalidated)
 - An NVIDIA GPU with compute capability 7.0 or newer
 
 Earlier revisions were validated on NVIDIA H100, H200, and RTX 4090 GPUs.
@@ -115,6 +127,16 @@ Optional targets:
 cmake -S . -B build-tools -DWALTZ_BUILD_TOOLS=ON \
   -DCMAKE_CUDA_ARCHITECTURES=90
 cmake --build build-tools -j
+```
+
+The optional WZP regression checks zero/sparse/raw chunks, partial chunks,
+unaligned inputs, workspace growth and repeated split/convenience API calls:
+
+```bash
+cmake -S . -B build-tests -DWALTZ_BUILD_TESTS=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=90
+cmake --build build-tests -j
+CUDA_VISIBLE_DEVICES=0 ctest --test-dir build-tests --output-on-failure
 ```
 
 ## Command-line use
@@ -215,18 +237,24 @@ Throughput labels currently say GB/s, but the calculations use GiB/s.
 
 ## Validation snapshot
 
-The synchronized 2026-09-11 repository was freshly built and installed with
-CUDA 13.1 for H100 (`sm_90`). An external CMake consumer using
+The synchronized 2026-09-16 repository was freshly built and installed with
+CUDA 13.1 for H100 (`sm_90`), including the CLI, tuner, benchmark and optional
+regression target. An external CMake consumer using
 `find_package(Waltz CONFIG REQUIRED)` also compiled and ran successfully.
 
-On H100 CUDA0, API regression against the current production source passed
-12 processes / 36 compression-decompression repetitions with WZP and
-`WALTZ_ASYNC_ALLOC=1`. Mode and compressed size were checked each repetition;
-CR, PSNR, Max_RE and decoded-data hashes matched at each process's final
-repetition. Tests covered the four fields below, SCALE PRES, and a synthetic
-1024 x 512 x 256 reshape of NYX to exercise the new wide float dyadic branch.
-The reshape is a branch-coverage test, not a physical NYX field or a
-performance result. Normal SCALE and Hurricane retained plane mode.
+On H100 CUDA1, regression against a fresh build of the current production
+source passed 8 configurations, each run in both builds with 3 complete
+compression/decompression calls (48 round trips in total). These cover the
+four fields below with WZP, plus synthetic 65x67x33 float and double fields
+with both WZP and LC. Transform-mode sequences matched; final compressed size,
+CR, PSNR, Max_RE and decoded-data hashes matched exactly for every
+configuration. Normal SCALE and Hurricane retained plane mode. This is a
+correctness/synchronization check, not a fresh cross-GPU performance benchmark.
+
+The signed-WZP regression also passed 54 cases with 9 encode/decode calls each,
+covering counter reuse, allocation growth, zero/sparse/raw chunks and unaligned
+inputs. Detailed synchronization notes are in
+[docs/SYNC_20260916.md](docs/SYNC_20260916.md).
 
 The following fields retain the same compressed sizes and reconstruction
 quality as the production source:
@@ -250,6 +278,7 @@ src/lossless/            LC and WZP GPU backends
 examples/waltz.cu        command-line driver
 examples/tune_demo.cu    transform-topology tuner harness
 tools/wzp_gpu_bench.cu   optional WZP round-trip benchmark
+tools/wzp_single_kernel_test.cu  optional signed-WZP regression
 ```
 
 ## Known limitations
@@ -262,6 +291,9 @@ tools/wzp_gpu_bench.cu   optional WZP round-trip benchmark
 - The command-line tool does not yet implement standalone reopening of a saved
   `.waltz` archive.
 - The blob header currently follows the native host ABI and endianness.
+- Cached workspaces and timing events are shared mutable state. The API is
+  not a general concurrent multi-stream or multi-device interface; complete a
+  split signed encode with `wzp_encode_with_sign_finish` before reusing WZP.
 - Internal workspaces and a few bounded outlier side channels use fixed
   capacities; production deployments should expose capacity planning and error
   reporting at the API boundary.

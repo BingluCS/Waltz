@@ -12,6 +12,7 @@ include(CMakePackageConfigHelpers)
 option(BUILD_SHARED_LIBS "Build Waltz as a shared library" ON)
 option(WALTZ_BUILD_EXAMPLES "Build the command-line driver and tuner" ON)
 option(WALTZ_BUILD_TOOLS "Build optional research/diagnostic tools" OFF)
+option(WALTZ_BUILD_TESTS "Build CUDA regression tests (requires a GPU to run)" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -55,6 +56,14 @@ endif()
 if(WALTZ_BUILD_TOOLS)
     add_executable(wzp_gpu_bench tools/wzp_gpu_bench.cu)
     target_link_libraries(wzp_gpu_bench PRIVATE Waltz::waltz CUDA::cudart)
+endif()
+
+if(WALTZ_BUILD_TESTS)
+    enable_testing()
+    add_executable(wzp_single_kernel_test tools/wzp_single_kernel_test.cu)
+    target_link_libraries(wzp_single_kernel_test PRIVATE Waltz::waltz CUDA::cudart)
+    add_test(NAME wzp_roundtrip COMMAND wzp_single_kernel_test)
+    set_tests_properties(wzp_roundtrip PROPERTIES TIMEOUT 180)
 endif()
 
 install(

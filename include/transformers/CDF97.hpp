@@ -39,8 +39,6 @@
 #define TPB DWT_TPB
 
 #define CS 8192
-#define CS_LARGE_X 12000
-#define CS_PLANE 10000
 #define CDF97_MAX_LEVELS 5
 
 // Min resident blocks/SM cap inverse-kernel register use so enough warps remain
@@ -631,10 +629,11 @@ __device__ __forceinline__ int dwt_halo_reflect(int i, int n) {
 // Wide planes can use the optional 64x32 specialization (about 22 KiB), which
 // lowers the halo/owner ratio; the launcher below keeps both variants available
 // for shape A/B tests without changing the default path.
-constexpr int DWT_TILE_BX32 = 32;
-constexpr int DWT_TILE_BY16 = 16;
-constexpr int DWT_TILE_BX64 = 64;
-constexpr int DWT_TILE_BY32 = 32;
+constexpr int BX_32 = 32;
+constexpr int BY_16 = 16;
+constexpr int BX_64 = 64;
+constexpr int BY_32 = 32;
+constexpr int BX_128 = 128;
 
 // Kept in one device-side record so the optional DWT->quant path does not keep
 // ten independent pointers/scalars live in every halo thread.  The default
@@ -774,7 +773,7 @@ __device__ __forceinline__ void dwt_quant_emit_float(float value, size_t s, uint
 // The dimensions remain runtime values; only the absence of edge blocks is a
 // compile-time property of this kernel variant.  Irregular volumes continue to
 // use the generic emitter above.
-__device__ __forceinline__ void dwt_quant_emit_regular_float(float value, size_t s, 
+__device__ __forceinline__ void dwt_quant_emit_regular_float(float value, size_t s,
     uint32_t x, uint32_t y, uint32_t z, const DwtFuseQuantParams* __restrict__ p) {
     constexpr uint32_t BX = 16U, BY = 16U;
     const uint32_t bz = p->q_bz;
@@ -785,7 +784,7 @@ __device__ __forceinline__ void dwt_quant_emit_regular_float(float value, size_t
     const bool neg = rll < 0;
     const int32_t mag = WALTZ::quantizer::saturate_q<int32_t>(neg ? -rll : rll);
     p->qint_z[outpos] = static_cast<uint16_t>(mag > 65535 ? 65535 : mag);
-    
+
     if (neg && mag != 0)
         atomicOr(p->sign_bm + (outpos >> 5U), 1U << (outpos & 31U));
     
@@ -835,6 +834,15 @@ template <int BX, int BY, QuantMode Quant = QuantMode::None, bool QuantBlocksReg
 __global__ void dwt3d_xy_float(
     const float* __restrict__ src, float* __restrict__ dst, dim3 data_dims, dim3 chunk_dims) {
     constexpr int R = DWT_HALO_R;
+#if defined(__CUDA_ARCH__)
+    // Keep the measured Hopper float improvement; other targets retain one pair.
+    constexpr bool pair2_x = (__CUDA_ARCH__ == 900) && ((BX & 3) == 0);
+    constexpr bool pair2_y =
+        (__CUDA_ARCH__ == 900 && Quant == QuantMode::None) && ((BY & 3) == 0);
+#else
+    constexpr bool pair2_x = false;
+    constexpr bool pair2_y = false;
+#endif
     constexpr int EX = BX + 2 * R;
     constexpr int EY = BY + 2 * R;
 
@@ -883,78 +891,214 @@ __global__ void dwt3d_xy_float(
     }
     __syncthreads();
 
-    // BX and x0 are even.  One owner evaluates an adjacent even/odd pair:
-    // their 9/7 windows have a nine-value union, versus 9+7 independent
-    // shared loads in the scalar-owner form.
-    constexpr int XPAIRS = (BX + 1) / 2;
-    for (int i = threadIdx.x; i < XPAIRS * EY; i += blockDim.x) {
-        const int px = i % XPAIRS;
-        const int ey = i / XPAIRS;
-        const int lx = px << 1;
-        const int gx = x0 + lx;
-        const int xo = ey * BX + lx;
-        if (gx >= nx)
-            continue;
-        const int c = ey * EX + lx + R;
-        xbuf[xo] = low_filter<float>(raw[c],
-                                     raw[c - 1] + raw[c + 1],
-                                     raw[c - 2] + raw[c + 2],
-                                     raw[c - 3] + raw[c + 3],
-                                     raw[c - 4] + raw[c + 4]);
-        if (gx + 1 < nx) {
-            xbuf[xo + 1] = high_filter<float>(raw[c + 1],
-                                              raw[c] + raw[c + 2],
-                                              raw[c - 1] + raw[c + 3],
-                                              raw[c - 2] + raw[c + 4]);
+    if constexpr (pair2_x) {
+        // BX and x0 are even.  One owner evaluates two adjacent even/odd
+        // pairs.  Their windows have an eleven-value union (c-4..c+6), so
+        // the seven values shared by both pairs are loaded only once.
+        constexpr int XPAIR_GROUPS = (BX + 3) / 4;
+        for (int i = threadIdx.x; i < XPAIR_GROUPS * EY; i += blockDim.x) {
+            const int px = i % XPAIR_GROUPS;
+            const int ey = i / XPAIR_GROUPS;
+            const int lx = px << 2;
+            const int gx = x0 + lx;
+            const int xo = ey * BX + lx;
+            if (gx >= nx)
+                continue;
+            const int c = ey * EX + lx + R;
+
+            // c-4..c+6 are exactly the union of the two pair windows.  Keep
+            // the filter argument order identical to the one-pair path.
+            const float r0 = raw[c - 4];
+            const float r1 = raw[c - 3];
+            const float r2 = raw[c - 2];
+            const float r3 = raw[c - 1];
+            const float r4 = raw[c];
+            const float r5 = raw[c + 1];
+            const float r6 = raw[c + 2];
+            const float r7 = raw[c + 3];
+            const float r8 = raw[c + 4];
+            const float r9 = raw[c + 5];
+            const float r10 = raw[c + 6];
+
+            xbuf[xo] = low_filter<float>(r4, r3 + r5, r2 + r6, r1 + r7, r0 + r8);
+            if (gx + 1 < nx) {
+                xbuf[xo + 1] = high_filter<float>(r5, r4 + r6, r3 + r7, r2 + r8);
+            }
+            if (gx + 2 < nx) {
+                xbuf[xo + 2] = low_filter<float>(r6, r5 + r7, r4 + r8, r3 + r9, r2 + r10);
+                if (gx + 3 < nx) {
+                    xbuf[xo + 3] = high_filter<float>(r7, r6 + r8, r5 + r9, r4 + r10);
+                }
+            }
+        }
+    } else {
+        // Generic one-pair owner for architectures/quantization modes not
+        // selected by the controlled pair-grouping experiment.
+        // BX and x0 are even.  One owner evaluates an adjacent even/odd pair:
+        // their 9/7 windows have a nine-value union, versus 9+7 independent
+        // shared loads in the scalar-owner form.
+        constexpr int XPAIRS = (BX + 1) / 2;
+        for (int i = threadIdx.x; i < XPAIRS * EY; i += blockDim.x) {
+            const int px = i % XPAIRS;
+            const int ey = i / XPAIRS;
+            const int lx = px << 1;
+            const int gx = x0 + lx;
+            const int xo = ey * BX + lx;
+            if (gx >= nx)
+                continue;
+            const int c = ey * EX + lx + R;
+            xbuf[xo] = low_filter<float>(raw[c],
+                                         raw[c - 1] + raw[c + 1],
+                                         raw[c - 2] + raw[c + 2],
+                                         raw[c - 3] + raw[c + 3],
+                                         raw[c - 4] + raw[c + 4]);
+            if (gx + 1 < nx) {
+                xbuf[xo + 1] = high_filter<float>(raw[c + 1],
+                                                  raw[c] + raw[c + 2],
+                                                  raw[c - 1] + raw[c + 3],
+                                                  raw[c - 2] + raw[c + 4]);
+            }
         }
     }
     __syncthreads();
 
-    constexpr int YPAIRS = (BY + 1) / 2;
-    for (int i = threadIdx.x; i < BX * YPAIRS; i += blockDim.x) {
-        const int lx = i % BX;
-        const int py = i / BX;
-        const int ly = py << 1;
-        const int gx = x0 + lx;
-        const int gy = y0 + ly;
-        if (gx >= nx || gy >= ny)
-            continue;
+    if constexpr (pair2_y) {
+        // One owner evaluates two adjacent even/odd row pairs.  Their 9/7
+        // windows have an eleven-row union (c-4*BX..c+6*BX), so the seven
+        // rows shared by the pair windows are loaded into locals once.
+        constexpr int YPAIR_GROUPS = (BY + 3) / 4;
+        for (int i = threadIdx.x; i < BX * YPAIR_GROUPS; i += blockDim.x) {
+            const int lx = i % BX;
+            const int py = i / BX;
+            const int ly = py << 2;
+            const int gx = x0 + lx;
+            const int gy = y0 + ly;
+            if (gx >= nx || gy >= ny)
+                continue;
 
-        const int c = (ly + DWT_HALO_R) * BX + lx;
-        const int output_x = (gx & 1) ? even_x + (gx >> 1) : (gx >> 1);
-        const int low_y = gy >> 1;
-        const size_t zoff = static_cast<size_t>(z) * leap_z;
-        const float low_value = low_filter<float>(xbuf[c],
-                                                  xbuf[c - BX] + xbuf[c + BX],
-                                                  xbuf[c - 2 * BX] + xbuf[c + 2 * BX],
-                                                  xbuf[c - 3 * BX] + xbuf[c + 3 * BX],
-                                                  xbuf[c - 4 * BX] + xbuf[c + 4 * BX]);
-        const size_t low_index = output_x + static_cast<size_t>(low_y) * sx + zoff;
-        if constexpr (Quant == QuantMode::None)
-            dst[low_index] = low_value;
-        else if constexpr (Quant == QuantMode::All)
-            quantization<QuantBlocksRegular>(
-                low_value, low_index, output_x, low_y, z, data_dims);
-        else if constexpr (Quant == QuantMode::High) {
-            if (gx & 1)
+            const int c = (ly + DWT_HALO_R) * BX + lx;
+            const float r0 = xbuf[c - 4 * BX];
+            const float r1 = xbuf[c - 3 * BX];
+            const float r2 = xbuf[c - 2 * BX];
+            const float r3 = xbuf[c - BX];
+            const float r4 = xbuf[c];
+            const float r5 = xbuf[c + BX];
+            const float r6 = xbuf[c + 2 * BX];
+            const float r7 = xbuf[c + 3 * BX];
+            const float r8 = xbuf[c + 4 * BX];
+            const float r9 = xbuf[c + 5 * BX];
+            const float r10 = xbuf[c + 6 * BX];
+            const int output_x = (gx & 1) ? even_x + (gx >> 1) : (gx >> 1);
+            const int low_y = gy >> 1;
+            const size_t zoff = static_cast<size_t>(z) * leap_z;
+            const float low_value =
+                low_filter<float>(r4, r3 + r5, r2 + r6, r1 + r7, r0 + r8);
+            const size_t low_index = output_x + static_cast<size_t>(low_y) * sx + zoff;
+            if constexpr (Quant == QuantMode::None)
+                dst[low_index] = low_value;
+            else if constexpr (Quant == QuantMode::All)
                 quantization<QuantBlocksRegular>(
                     low_value, low_index, output_x, low_y, z, data_dims);
-            else
-                dst[low_index] = low_value;
+            else if constexpr (Quant == QuantMode::High) {
+                if (gx & 1)
+                    quantization<QuantBlocksRegular>(
+                        low_value, low_index, output_x, low_y, z, data_dims);
+                else
+                    dst[low_index] = low_value;
+            }
+            if (gy + 1 < ny) {
+                const float high_value =
+                    high_filter<float>(r5, r4 + r6, r3 + r7, r2 + r8);
+                const uint32_t high_y = even_y + low_y;
+                const size_t high_index = output_x + static_cast<size_t>(high_y) * sx + zoff;
+                if constexpr (Quant != QuantMode::None)
+                    quantization<QuantBlocksRegular>(
+                        high_value, high_index, output_x, high_y, z, data_dims);
+                else
+                    dst[high_index] = high_value;
+            }
+            if (gy + 2 < ny) {
+                const int gy2 = gy + 2;
+                const int low_y2 = gy2 >> 1;
+                const float low_value2 =
+                    low_filter<float>(r6, r5 + r7, r4 + r8, r3 + r9, r2 + r10);
+                const size_t low_index2 =
+                    output_x + static_cast<size_t>(low_y2) * sx + zoff;
+                if constexpr (Quant == QuantMode::None)
+                    dst[low_index2] = low_value2;
+                else if constexpr (Quant == QuantMode::All)
+                    quantization<QuantBlocksRegular>(
+                        low_value2, low_index2, output_x, low_y2, z, data_dims);
+                else if constexpr (Quant == QuantMode::High) {
+                    if (gx & 1)
+                        quantization<QuantBlocksRegular>(
+                            low_value2, low_index2, output_x, low_y2, z, data_dims);
+                    else
+                        dst[low_index2] = low_value2;
+                }
+                if (gy + 3 < ny) {
+                    const float high_value2 =
+                        high_filter<float>(r7, r6 + r8, r5 + r9, r4 + r10);
+                    const uint32_t high_y2 = even_y + low_y2;
+                    const size_t high_index2 =
+                        output_x + static_cast<size_t>(high_y2) * sx + zoff;
+                    if constexpr (Quant != QuantMode::None)
+                        quantization<QuantBlocksRegular>(
+                            high_value2, high_index2, output_x, high_y2, z, data_dims);
+                    else
+                        dst[high_index2] = high_value2;
+                }
+            }
         }
-        if (gy + 1 < ny) {
-            const float high_value =
-                high_filter<float>(xbuf[c + BX],
-                                   xbuf[c] + xbuf[c + 2 * BX],
-                                   xbuf[c - BX] + xbuf[c + 3 * BX],
-                                   xbuf[c - 2 * BX] + xbuf[c + 4 * BX]);
-            const uint32_t high_y = even_y + low_y;
-            const size_t high_index = output_x + static_cast<size_t>(high_y) * sx + zoff;
-            if constexpr (Quant != QuantMode::None)
+    } else {
+        // Generic one-pair owner for architectures/quantization modes not
+        // selected by the controlled pair-grouping experiment.
+        constexpr int YPAIRS = (BY + 1) / 2;
+        for (int i = threadIdx.x; i < BX * YPAIRS; i += blockDim.x) {
+            const int lx = i % BX;
+            const int py = i / BX;
+            const int ly = py << 1;
+            const int gx = x0 + lx;
+            const int gy = y0 + ly;
+            if (gx >= nx || gy >= ny)
+                continue;
+
+            const int c = (ly + DWT_HALO_R) * BX + lx;
+            const int output_x = (gx & 1) ? even_x + (gx >> 1) : (gx >> 1);
+            const int low_y = gy >> 1;
+            const size_t zoff = static_cast<size_t>(z) * leap_z;
+            const float low_value = low_filter<float>(xbuf[c],
+                                                      xbuf[c - BX] + xbuf[c + BX],
+                                                      xbuf[c - 2 * BX] + xbuf[c + 2 * BX],
+                                                      xbuf[c - 3 * BX] + xbuf[c + 3 * BX],
+                                                      xbuf[c - 4 * BX] + xbuf[c + 4 * BX]);
+            const size_t low_index = output_x + static_cast<size_t>(low_y) * sx + zoff;
+            if constexpr (Quant == QuantMode::None)
+                dst[low_index] = low_value;
+            else if constexpr (Quant == QuantMode::All)
                 quantization<QuantBlocksRegular>(
-                    high_value, high_index, output_x, high_y, z, data_dims);
-            else
-                dst[high_index] = high_value;
+                    low_value, low_index, output_x, low_y, z, data_dims);
+            else if constexpr (Quant == QuantMode::High) {
+                if (gx & 1)
+                    quantization<QuantBlocksRegular>(
+                        low_value, low_index, output_x, low_y, z, data_dims);
+                else
+                    dst[low_index] = low_value;
+            }
+            if (gy + 1 < ny) {
+                const float high_value =
+                    high_filter<float>(xbuf[c + BX],
+                                       xbuf[c] + xbuf[c + 2 * BX],
+                                       xbuf[c - BX] + xbuf[c + 3 * BX],
+                                       xbuf[c - 2 * BX] + xbuf[c + 4 * BX]);
+                const uint32_t high_y = even_y + low_y;
+                const size_t high_index = output_x + static_cast<size_t>(high_y) * sx + zoff;
+                if constexpr (Quant != QuantMode::None)
+                    quantization<QuantBlocksRegular>(
+                        high_value, high_index, output_x, high_y, z, data_dims);
+                else
+                    dst[high_index] = high_value;
+            }
         }
     }
 }
@@ -966,6 +1110,15 @@ template <int BX, int BY, QuantMode Quant = QuantMode::None, bool QuantBlocksReg
 __global__ void dwt3d_xy_double(
     const double* __restrict__ src, double* __restrict__ dst, dim3 data_dims, dim3 chunk_dims) {
     constexpr int R = DWT_HALO_R;
+#if defined(__CUDA_ARCH__)
+    constexpr bool pair2_x =
+        (__CUDA_ARCH__ == 1200 && Quant == QuantMode::None) && ((BX & 3) == 0);
+    constexpr bool pair2_y =
+        (__CUDA_ARCH__ == 1200 && Quant == QuantMode::None) && ((BY & 3) == 0);
+#else
+    constexpr bool pair2_x = false;
+    constexpr bool pair2_y = false;
+#endif
     constexpr int EX = BX + 2 * R;
     constexpr int EY = BY + 2 * R;
     static_assert((EX & 1) == 0, "double2 loads require an even extended tile width");
@@ -1016,71 +1169,207 @@ __global__ void dwt3d_xy_double(
     }
     __syncthreads();
 
-    constexpr int XPAIRS = (BX + 1) / 2;
-    for (int i = threadIdx.x; i < XPAIRS * EY; i += blockDim.x) {
-        const int px = i % XPAIRS;
-        const int ey = i / XPAIRS;
-        const int lx = px << 1;
-        const int gx = x0 + lx;
-        const int xo = ey * BX + lx;
-        if (gx >= nx)
-            continue;
-        const int c = ey * EX + lx + R;
-        xbuf[xo] = low_filter<double>(raw[c],
-                                      raw[c - 1] + raw[c + 1],
-                                      raw[c - 2] + raw[c + 2],
-                                      raw[c - 3] + raw[c + 3],
-                                      raw[c - 4] + raw[c + 4]);
-        if (gx + 1 < nx)
-            xbuf[xo + 1] = high_filter<double>(raw[c + 1],
-                                               raw[c] + raw[c + 2],
-                                               raw[c - 1] + raw[c + 3],
-                                               raw[c - 2] + raw[c + 4]);
+    if constexpr (pair2_x) {
+        // BX and x0 are even.  One owner evaluates two adjacent even/odd
+        // pairs.  Their windows have an eleven-value union (c-4..c+6), so
+        // the seven values shared by both pairs are loaded only once.
+        constexpr int XPAIR_GROUPS = (BX + 3) / 4;
+        for (int i = threadIdx.x; i < XPAIR_GROUPS * EY; i += blockDim.x) {
+            const int px = i % XPAIR_GROUPS;
+            const int ey = i / XPAIR_GROUPS;
+            const int lx = px << 2;
+            const int gx = x0 + lx;
+            const int xo = ey * BX + lx;
+            if (gx >= nx)
+                continue;
+            const int c = ey * EX + lx + R;
+
+            // c-4..c+6 are exactly the union of the two pair windows.  Keep
+            // the filter argument order identical to the one-pair path.
+            const double r0 = raw[c - 4];
+            const double r1 = raw[c - 3];
+            const double r2 = raw[c - 2];
+            const double r3 = raw[c - 1];
+            const double r4 = raw[c];
+            const double r5 = raw[c + 1];
+            const double r6 = raw[c + 2];
+            const double r7 = raw[c + 3];
+            const double r8 = raw[c + 4];
+            const double r9 = raw[c + 5];
+            const double r10 = raw[c + 6];
+
+            xbuf[xo] = low_filter<double>(r4, r3 + r5, r2 + r6, r1 + r7, r0 + r8);
+            if (gx + 1 < nx) {
+                xbuf[xo + 1] = high_filter<double>(r5, r4 + r6, r3 + r7, r2 + r8);
+            }
+            if (gx + 2 < nx) {
+                xbuf[xo + 2] = low_filter<double>(r6, r5 + r7, r4 + r8, r3 + r9, r2 + r10);
+                if (gx + 3 < nx) {
+                    xbuf[xo + 3] = high_filter<double>(r7, r6 + r8, r5 + r9, r4 + r10);
+                }
+            }
+        }
+    } else {
+        // Generic one-pair owner for architectures/quantization modes not
+        // selected by the controlled pair-grouping experiment.
+        constexpr int XPAIRS = (BX + 1) / 2;
+        for (int i = threadIdx.x; i < XPAIRS * EY; i += blockDim.x) {
+            const int px = i % XPAIRS;
+            const int ey = i / XPAIRS;
+            const int lx = px << 1;
+            const int gx = x0 + lx;
+            const int xo = ey * BX + lx;
+            if (gx >= nx)
+                continue;
+            const int c = ey * EX + lx + R;
+            xbuf[xo] = low_filter<double>(raw[c],
+                                          raw[c - 1] + raw[c + 1],
+                                          raw[c - 2] + raw[c + 2],
+                                          raw[c - 3] + raw[c + 3],
+                                          raw[c - 4] + raw[c + 4]);
+            if (gx + 1 < nx)
+                xbuf[xo + 1] = high_filter<double>(raw[c + 1],
+                                                   raw[c] + raw[c + 2],
+                                                   raw[c - 1] + raw[c + 3],
+                                                   raw[c - 2] + raw[c + 4]);
+        }
     }
     __syncthreads();
 
-    constexpr int YPAIRS = (BY + 1) / 2;
-    for (int i = threadIdx.x; i < BX * YPAIRS; i += blockDim.x) {
-        const int lx = i % BX;
-        const int ly = (i / BX) << 1;
-        const int gx = x0 + lx;
-        const int gy = y0 + ly;
-        if (gx >= nx || gy >= ny)
-            continue;
-        const int c = (ly + R) * BX + lx;
-        const int output_x = (gx & 1) ? even_x + (gx >> 1) : (gx >> 1);
-        const int low_y = gy >> 1;
-        const size_t zoff = static_cast<size_t>(z) * leap_z;
-        const double low_value = low_filter<double>(xbuf[c],
-                                                    xbuf[c - BX] + xbuf[c + BX],
-                                                    xbuf[c - 2 * BX] + xbuf[c + 2 * BX],
-                                                    xbuf[c - 3 * BX] + xbuf[c + 3 * BX],
-                                                    xbuf[c - 4 * BX] + xbuf[c + 4 * BX]);
-        const size_t low_index = output_x + static_cast<size_t>(low_y) * sx + zoff;
-        if constexpr (Quant == QuantMode::None)
-            dst[low_index] = low_value;
-        else if constexpr (Quant == QuantMode::All)
-            quantization<QuantBlocksRegular>(
-                low_value, low_index, output_x, low_y, z, data_dims);
-        else if constexpr (Quant == QuantMode::High) {
-            if (gx & 1)
+    if constexpr (pair2_y) {
+        // One owner evaluates two adjacent even/odd row pairs.  Their 9/7
+        // windows have an eleven-row union (c-4*BX..c+6*BX), so the seven
+        // rows shared by the pair windows are loaded into locals once.
+        constexpr int YPAIR_GROUPS = (BY + 3) / 4;
+        for (int i = threadIdx.x; i < BX * YPAIR_GROUPS; i += blockDim.x) {
+            const int lx = i % BX;
+            const int py = i / BX;
+            const int ly = py << 2;
+            const int gx = x0 + lx;
+            const int gy = y0 + ly;
+            if (gx >= nx || gy >= ny)
+                continue;
+
+            const int c = (ly + R) * BX + lx;
+            const double r0 = xbuf[c - 4 * BX];
+            const double r1 = xbuf[c - 3 * BX];
+            const double r2 = xbuf[c - 2 * BX];
+            const double r3 = xbuf[c - BX];
+            const double r4 = xbuf[c];
+            const double r5 = xbuf[c + BX];
+            const double r6 = xbuf[c + 2 * BX];
+            const double r7 = xbuf[c + 3 * BX];
+            const double r8 = xbuf[c + 4 * BX];
+            const double r9 = xbuf[c + 5 * BX];
+            const double r10 = xbuf[c + 6 * BX];
+            const int output_x = (gx & 1) ? even_x + (gx >> 1) : (gx >> 1);
+            const int low_y = gy >> 1;
+            const size_t zoff = static_cast<size_t>(z) * leap_z;
+            const double low_value =
+                low_filter<double>(r4, r3 + r5, r2 + r6, r1 + r7, r0 + r8);
+            const size_t low_index = output_x + static_cast<size_t>(low_y) * sx + zoff;
+            if constexpr (Quant == QuantMode::None)
+                dst[low_index] = low_value;
+            else if constexpr (Quant == QuantMode::All)
                 quantization<QuantBlocksRegular>(
                     low_value, low_index, output_x, low_y, z, data_dims);
-            else
-                dst[low_index] = low_value;
+            else if constexpr (Quant == QuantMode::High) {
+                if (gx & 1)
+                    quantization<QuantBlocksRegular>(
+                        low_value, low_index, output_x, low_y, z, data_dims);
+                else
+                    dst[low_index] = low_value;
+            }
+            if (gy + 1 < ny) {
+                const double high_value =
+                    high_filter<double>(r5, r4 + r6, r3 + r7, r2 + r8);
+                const uint32_t high_y = even_y + low_y;
+                const size_t high_index = output_x + static_cast<size_t>(high_y) * sx + zoff;
+                if constexpr (Quant != QuantMode::None)
+                    quantization<QuantBlocksRegular>(
+                        high_value, high_index, output_x, high_y, z, data_dims);
+                else
+                    dst[high_index] = high_value;
+            }
+            if (gy + 2 < ny) {
+                const int gy2 = gy + 2;
+                const int low_y2 = gy2 >> 1;
+                const double low_value2 =
+                    low_filter<double>(r6, r5 + r7, r4 + r8, r3 + r9, r2 + r10);
+                const size_t low_index2 =
+                    output_x + static_cast<size_t>(low_y2) * sx + zoff;
+                if constexpr (Quant == QuantMode::None)
+                    dst[low_index2] = low_value2;
+                else if constexpr (Quant == QuantMode::All)
+                    quantization<QuantBlocksRegular>(
+                        low_value2, low_index2, output_x, low_y2, z, data_dims);
+                else if constexpr (Quant == QuantMode::High) {
+                    if (gx & 1)
+                        quantization<QuantBlocksRegular>(
+                            low_value2, low_index2, output_x, low_y2, z, data_dims);
+                    else
+                        dst[low_index2] = low_value2;
+                }
+                if (gy + 3 < ny) {
+                    const double high_value2 =
+                        high_filter<double>(r7, r6 + r8, r5 + r9, r4 + r10);
+                    const uint32_t high_y2 = even_y + low_y2;
+                    const size_t high_index2 =
+                        output_x + static_cast<size_t>(high_y2) * sx + zoff;
+                    if constexpr (Quant != QuantMode::None)
+                        quantization<QuantBlocksRegular>(
+                            high_value2, high_index2, output_x, high_y2, z, data_dims);
+                    else
+                        dst[high_index2] = high_value2;
+                }
+            }
         }
-        if (gy + 1 < ny) {
-            const double high_value = high_filter<double>(xbuf[c + BX],
-                                                          xbuf[c] + xbuf[c + 2 * BX],
-                                                          xbuf[c - BX] + xbuf[c + 3 * BX],
-                                                          xbuf[c - 2 * BX] + xbuf[c + 4 * BX]);
-            const uint32_t high_y = even_y + low_y;
-            const size_t high_index = output_x + static_cast<size_t>(high_y) * sx + zoff;
-            if constexpr (Quant != QuantMode::None)
+    } else {
+        // Generic one-pair owner for architectures/quantization modes not
+        // selected by the controlled pair-grouping experiment.
+        constexpr int YPAIRS = (BY + 1) / 2;
+        for (int i = threadIdx.x; i < BX * YPAIRS; i += blockDim.x) {
+            const int lx = i % BX;
+            const int ly = (i / BX) << 1;
+            const int gx = x0 + lx;
+            const int gy = y0 + ly;
+            if (gx >= nx || gy >= ny)
+                continue;
+            const int c = (ly + R) * BX + lx;
+            const int output_x = (gx & 1) ? even_x + (gx >> 1) : (gx >> 1);
+            const int low_y = gy >> 1;
+            const size_t zoff = static_cast<size_t>(z) * leap_z;
+            const double low_value = low_filter<double>(xbuf[c],
+                                                        xbuf[c - BX] + xbuf[c + BX],
+                                                        xbuf[c - 2 * BX] + xbuf[c + 2 * BX],
+                                                        xbuf[c - 3 * BX] + xbuf[c + 3 * BX],
+                                                        xbuf[c - 4 * BX] + xbuf[c + 4 * BX]);
+            const size_t low_index = output_x + static_cast<size_t>(low_y) * sx + zoff;
+            if constexpr (Quant == QuantMode::None)
+                dst[low_index] = low_value;
+            else if constexpr (Quant == QuantMode::All)
                 quantization<QuantBlocksRegular>(
-                    high_value, high_index, output_x, high_y, z, data_dims);
-            else
-                dst[high_index] = high_value;
+                    low_value, low_index, output_x, low_y, z, data_dims);
+            else if constexpr (Quant == QuantMode::High) {
+                if (gx & 1)
+                    quantization<QuantBlocksRegular>(
+                        low_value, low_index, output_x, low_y, z, data_dims);
+                else
+                    dst[low_index] = low_value;
+            }
+            if (gy + 1 < ny) {
+                const double high_value = high_filter<double>(xbuf[c + BX],
+                                                              xbuf[c] + xbuf[c + 2 * BX],
+                                                              xbuf[c - BX] + xbuf[c + 3 * BX],
+                                                              xbuf[c - 2 * BX] + xbuf[c + 4 * BX]);
+                const uint32_t high_y = even_y + low_y;
+                const size_t high_index = output_x + static_cast<size_t>(high_y) * sx + zoff;
+                if constexpr (Quant != QuantMode::None)
+                    quantization<QuantBlocksRegular>(
+                        high_value, high_index, output_x, high_y, z, data_dims);
+                else
+                    dst[high_index] = high_value;
+            }
         }
     }
 }
@@ -1143,24 +1432,24 @@ inline cudaError_t dwt3d_plane_xy_quant_launch(
     const T* src, T* dst, dim3 data_dims, dim3 chunk_dims, bool quant_blocks_regular,
     cudaStream_t stream) {
     if constexpr (std::is_same_v<T, float>) {
-        const dim3 grid((chunk_dims.x + DWT_TILE_BX64 - 1U) / DWT_TILE_BX64,
-                        (chunk_dims.y + DWT_TILE_BY32 - 1U) / DWT_TILE_BY32,
+        const dim3 grid((chunk_dims.x + BX_64 - 1U) / BX_64,
+                        (chunk_dims.y + BY_32 - 1U) / BY_32,
                         chunk_dims.z);
         if (quant_blocks_regular)
-            dwt3d_xy_float<DWT_TILE_BX64, DWT_TILE_BY32, Quant, true>
+            dwt3d_xy_float<BX_64, BY_32, Quant, true>
                 <<<grid, 256, 0, stream>>>(src, dst, data_dims, chunk_dims);
         else
-            dwt3d_xy_float<DWT_TILE_BX64, DWT_TILE_BY32, Quant, false>
+            dwt3d_xy_float<BX_64, BY_32, Quant, false>
                 <<<grid, 256, 0, stream>>>(src, dst, data_dims, chunk_dims);
     } else {
-        const dim3 grid((chunk_dims.x + DWT_TILE_BX64 - 1U) / DWT_TILE_BX64,
-                        (chunk_dims.y + DWT_TILE_BY16 - 1U) / DWT_TILE_BY16,
+        const dim3 grid((chunk_dims.x + BX_64 - 1U) / BX_64,
+                        (chunk_dims.y + BY_16 - 1U) / BY_16,
                         chunk_dims.z);
         if (quant_blocks_regular)
-            dwt3d_xy_double<DWT_TILE_BX64, DWT_TILE_BY16, Quant, true>
+            dwt3d_xy_double<BX_64, BY_16, Quant, true>
                 <<<grid, 256, 0, stream>>>(src, dst, data_dims, chunk_dims);
         else
-            dwt3d_xy_double<DWT_TILE_BX64, DWT_TILE_BY16, Quant, false>
+            dwt3d_xy_double<BX_64, BY_16, Quant, false>
                 <<<grid, 256, 0, stream>>>(src, dst, data_dims, chunk_dims);
     }
     return cudaGetLastError();
@@ -1236,16 +1525,16 @@ inline void dwt3d_xy_halo_z(T* data, T* tmp, dim3 dims, int levels, uint32_t q_b
     dim3 chunk_dims = dims;
     for (int lev = 0; lev < levels; ++lev) {
         if constexpr (std::is_same_v<T, float>) {
-            const dim3 grid((chunk_dims.x + DWT_TILE_BX64 - 1U) / DWT_TILE_BX64,
-                            (chunk_dims.y + DWT_TILE_BY32 - 1U) / DWT_TILE_BY32,
+            const dim3 grid((chunk_dims.x + BX_64 - 1U) / BX_64,
+                            (chunk_dims.y + BY_32 - 1U) / BY_32,
                             chunk_dims.z);
-            dwt3d_xy_float<DWT_TILE_BX64, DWT_TILE_BY32, QuantMode::None>
+            dwt3d_xy_float<BX_64, BY_32, QuantMode::None>
                 <<<grid, 256, 0, stream>>>(data, tmp, dims, chunk_dims);
         } else if constexpr (std::is_same_v<T, double>) {
-            const dim3 grid((chunk_dims.x + DWT_TILE_BX64 - 1U) / DWT_TILE_BX64,
-                            (chunk_dims.y + DWT_TILE_BY16 - 1U) / DWT_TILE_BY16,
+            const dim3 grid((chunk_dims.x + BX_64 - 1U) / BX_64,
+                            (chunk_dims.y + BY_16 - 1U) / BY_16,
                             chunk_dims.z);
-            dwt3d_xy_double<DWT_TILE_BX64, DWT_TILE_BY16, QuantMode::None>
+            dwt3d_xy_double<BX_64, BY_16, QuantMode::None>
                 <<<grid, 256, 0, stream>>>(data, tmp, dims, chunk_dims);
         }
 

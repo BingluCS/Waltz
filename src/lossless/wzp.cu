@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include <cuda/atomic>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -39,30 +40,10 @@ constexpr uint32_t ITEMS_PER_THREAD = (ELEMS_PER_CHUNK + TPB - 1u) / TPB;
 // resident CTAs per SM once register pressure is capped below.
 constexpr uint32_t TEMP_BYTES = 3u * 1024u;
 constexpr uint32_t STORAGE_BYTES = 2u * CS + TEMP_BYTES;
+// Decode-only compatibility with archives produced by the retired prefix encoder.
 constexpr uint32_t PREFIX_FORMAT_BIT = 0x80000000u;
 constexpr uint32_t PREFIX_CHUNK_BIT = 0x2000u;
 constexpr uint32_t PREFIX_SIZE_MASK = 0x1fffu;
-
-struct State {
-    int device = -1;
-    uint32_t capacity_n = 0;
-    int persistent_blocks = 0;
-    byte* slots = nullptr;
-    byte* sign_slots = nullptr;
-    byte* blob = nullptr;
-    size_t blob_capacity = 0;
-    uint32_t* host_results = nullptr;
-    cudaEvent_t signed_begin = nullptr;
-    cudaEvent_t signed_end = nullptr;
-    cudaEvent_t timing_begin = nullptr;
-    cudaEvent_t timing_end = nullptr;
-    size_t signed_payload_offset = 0;
-};
-
-State& state() {
-    static State* s = new State;
-    return *s;
-}
 
 void check(cudaError_t error, const char* what) {
     if (error != cudaSuccess)
@@ -237,73 +218,58 @@ full_brick_origin(uint32_t bi, uint32_t nx, uint32_t ny, uint32_t block_z) {
 }
 
 // Dynamic scheduling is essential because RZE work varies substantially across
-// a field. WithSign compacts the negative bits while raw magnitudes are already
+// a field. Compact the negative bits while raw magnitudes are already
 // in shared memory, so there is no second magnitude read or global sign scan.
-template <bool WithSign, bool PrefixFormat = false>
 __global__
-__launch_bounds__(TPB, 2048 / TPB) void encode_kernel(const byte* __restrict__ input,
-                                                      uint32_t input_bytes,
-                                                      const uint32_t* __restrict__ sign_bitmap,
-                                                      byte* __restrict__ slots,
-                                                      byte* __restrict__ sign_slots,
-                                                      uint16_t* __restrict__ sizes,
-                                                      byte* __restrict__ meta,
-                                                      uint32_t chunks) {
-    __shared__ long long storage[STORAGE_BYTES / sizeof(long long)];
-    __shared__ byte prefix_rank_table[PrefixFormat ? 256 : 1];
+__launch_bounds__(TPB, 2048 / TPB)
+void encode_kernel(const byte* __restrict__ input,
+    uint32_t input_bytes, const uint32_t* __restrict__ sign_bitmap, byte* __restrict__ slots,
+    byte* __restrict__ sign_slots, byte* __restrict__ meta,
+    byte* __restrict__ blob, unsigned int* __restrict__ group_done) {
+    const uint32_t chunks = input_bytes / CS + (input_bytes % CS != 0U);
+    __shared__ __align__(16) long long storage[STORAGE_BYTES / sizeof(long long)];
     constexpr int counter_slot = STORAGE_BYTES / sizeof(long long) - 2 - WS;
     byte* const raw = reinterpret_cast<byte*>(storage);
     byte* const transformed = raw + CS;
     byte* const temp = transformed + CS;
 
-    if constexpr (PrefixFormat) {
-        if (threadIdx.x < 256)
-            prefix_rank_table[threadIdx.x] = 0xffu;
-        __syncthreads();
-        constexpr byte dictionary[16] = {0x00,
-                                         0x40,
-                                         0x02,
-                                         0x80,
-                                         0x01,
-                                         0x10,
-                                         0x08,
-                                         0x20,
-                                         0x04,
-                                         0xc0,
-                                         0xff,
-                                         0x03,
-                                         0x30,
-                                         0x0c,
-                                         0x05,
-                                         0xa0};
-        if (threadIdx.x < 16)
-            prefix_rank_table[dictionary[threadIdx.x]] = static_cast<byte>(threadIdx.x);
-        __syncthreads();
-    }
-
+    __shared__ uint32_t block_nnz;
+    __shared__ bool pack_ready;
+    if (threadIdx.x == 0) block_nnz = 0U;
     while (true) {
         if (threadIdx.x == 0)
             storage[counter_slot] = static_cast<long long>(atomicAdd(&chunk_counter, 1ull));
         __syncthreads();
         const uint32_t chunk = static_cast<uint32_t>(storage[counter_slot]);
-        if (chunk >= chunks)
+        if (chunk >= chunks) {
+            if (threadIdx.x == 0 && block_nnz != 0U)
+                atomicAdd(&nnz_counter, block_nnz);
             return;
+        }
 
         const uint32_t base = chunk * CS;
         const uint32_t raw_bytes = min(static_cast<uint32_t>(CS), input_bytes - base);
-        const auto* source64 = reinterpret_cast<const uint64_t*>(input + base);
-        auto* shared64 = reinterpret_cast<uint64_t*>(raw);
-        uint64_t any = 0;
-        for (uint32_t i = threadIdx.x; i < raw_bytes / 8u; i += blockDim.x) {
-            const uint64_t value = source64[i];
-            shared64[i] = value;
-            any |= value;
-        }
-        const uint32_t extra = raw_bytes & 7u;
-        if (threadIdx.x < extra) {
-            const byte value = input[base + raw_bytes - extra + threadIdx.x];
-            raw[raw_bytes - extra + threadIdx.x] = value;
-            any |= value;
+        uint32_t any = 0;
+        if ((reinterpret_cast<uintptr_t>(input) & 15U) == 0U) {
+            const auto* source128 = reinterpret_cast<const uint4*>(input + base);
+            auto* shared128 = reinterpret_cast<uint4*>(raw);
+            for (uint32_t i = threadIdx.x; i < raw_bytes / 16u; i += blockDim.x) {
+                const uint4 value = source128[i];
+                shared128[i] = value;
+                any |= value.x | value.y | value.z | value.w;
+            }
+            const uint32_t extra = raw_bytes & 15u;
+            if (threadIdx.x < extra) {
+                const byte value = input[base + raw_bytes - extra + threadIdx.x];
+                raw[raw_bytes - extra + threadIdx.x] = value;
+                any |= value;
+            }
+        } else {
+            for (uint32_t i = threadIdx.x; i < raw_bytes; i += blockDim.x) {
+                const byte value = input[base + i];
+                raw[i] = value;
+                any |= value;
+            }
         }
         const bool zero = __syncthreads_or(any != 0) == 0;
 
@@ -311,72 +277,53 @@ __launch_bounds__(TPB, 2048 / TPB) void encode_kernel(const byte* __restrict__ i
         uint32_t local_nnz = 0;
         uint32_t local_negative = 0;
         long long sign_exclusive = 0;
-        byte* chunk_sign_slot = nullptr;
-        if constexpr (WithSign) {
-            chunk_sign_slot = sign_slots + static_cast<size_t>(chunk) * SIGN_SLOT_BYTES;
-            // An all-zero magnitude chunk has no sign symbols.  The old path
-            // still cleared shared sign storage, scanned all 8192 elements,
-            // ran a CTA prefix sum and crossed five barriers before emitting
-            // the same zero metadata.  Skip that work after the already
-            // mandatory zero reduction; the archive bytes are unchanged.
-            if (!zero) {
-                // Compact into shared memory first.  The previous implementation
-                // zeroed a global 1-KiB slot and issued up to two global atomicOrs
-                // per thread.  `temp + 512` is beyond the prefix-scan scratch and
-                // is free until BIT/RZE starts; shared atomics plus one coalesced
-                // exact-length copy preserve the byte stream with less global
-                // traffic and contention.
-                auto* sign_stage = reinterpret_cast<uint32_t*>(temp + 512);
-                for (uint32_t i = threadIdx.x; i < SIGN_SLOT_BYTES / sizeof(uint32_t);
-                     i += blockDim.x)
-                    sign_stage[i] = 0;
-                __syncthreads();
+        byte* const chunk_sign_slot = sign_slots + static_cast<size_t>(chunk) * SIGN_SLOT_BYTES;
 
-                const auto* mag = reinterpret_cast<const uint16_t*>(raw);
-                const uint32_t elements = raw_bytes / sizeof(uint16_t);
-                const uint32_t start = threadIdx.x * ITEMS_PER_THREAD;
-#pragma unroll
-                for (uint32_t j = 0; j < ITEMS_PER_THREAD; ++j) {
-                    const uint32_t i = start + j;
-                    if (i < elements && mag[i] != 0) {
-                        const uint32_t global = base / 2u + i;
-                        if ((sign_bitmap[global >> 5u] >> (global & 31u)) & 1u)
-                            local_negative |= 1u << local_nnz;
-                        ++local_nnz;
-                    }
-                }
-                const long long inclusive = block_prefix_sum<long long>(
-                    static_cast<long long>(local_nnz), reinterpret_cast<long long*>(temp));
-                sign_exclusive = inclusive - local_nnz;
-                auto* aux = reinterpret_cast<long long*>(temp) + WS;
-                if (threadIdx.x == TPB - 1)
-                    aux[0] = inclusive;
-                __syncthreads();
-                chunk_nnz = static_cast<uint32_t>(aux[0]);
-                __syncthreads();
+        if (!zero) {
+            auto* sign_stage = reinterpret_cast<uint32_t*>(temp + 512);
+            for (uint32_t i = threadIdx.x; i < SIGN_SLOT_BYTES / sizeof(uint32_t);
+                 i += blockDim.x)
+                sign_stage[i] = 0;
+            __syncthreads();
 
-                if (local_negative != 0) {
-                    const uint32_t word = static_cast<uint32_t>(sign_exclusive) >> 5u;
-                    const uint32_t shift = static_cast<uint32_t>(sign_exclusive) & 31u;
-                    atomicOr(sign_stage + word, local_negative << shift);
-                    if (shift + local_nnz > 32u)
-                        atomicOr(sign_stage + word + 1u, local_negative >> (32u - shift));
+            const auto* mag = reinterpret_cast<const uint16_t*>(raw);
+            const uint32_t elements = raw_bytes / sizeof(uint16_t);
+            const uint32_t start = threadIdx.x * ITEMS_PER_THREAD;
+            #pragma unroll
+            for (uint32_t j = 0; j < ITEMS_PER_THREAD; ++j) {
+                const uint32_t i = start + j;
+                if (i < elements && mag[i] != 0) {
+                    const uint32_t global = base / 2u + i;
+                    if ((sign_bitmap[global >> 5u] >> (global & 31u)) & 1u)
+                        local_negative |= 1u << local_nnz;
+                    ++local_nnz;
                 }
-                __syncthreads();
-                const uint32_t sign_bytes = (chunk_nnz + 7u) / 8u;
-                const byte* sign_stage_bytes = reinterpret_cast<const byte*>(sign_stage);
-                for (uint32_t i = threadIdx.x; i < sign_bytes; i += blockDim.x)
-                    chunk_sign_slot[i] = sign_stage_bytes[i];
-                if (threadIdx.x == 0)
-                    atomicAdd(&nnz_counter, chunk_nnz);
-                __syncthreads();
             }
+            const uint32_t inclusive = block_prefix_sum<uint32_t>(local_nnz, temp);
+            sign_exclusive = inclusive - local_nnz;
+            // The scan's final barrier publishes the last warp's prefix.
+            chunk_nnz = reinterpret_cast<const uint32_t*>(temp)[TPB / WS - 1];
+
+            if (local_negative != 0) {
+                const uint32_t word = static_cast<uint32_t>(sign_exclusive) >> 5u;
+                const uint32_t shift = static_cast<uint32_t>(sign_exclusive) & 31u;
+                atomicOr(sign_stage + word, local_negative << shift);
+                if (shift + local_nnz > 32u)
+                    atomicOr(sign_stage + word + 1u, local_negative >> (32u - shift));
+            }
+            __syncthreads();
+            const uint32_t sign_bytes = (chunk_nnz + 7u) / 8u;
+            const byte* sign_stage_bytes = reinterpret_cast<const byte*>(sign_stage);
+            for (uint32_t i = threadIdx.x; i < sign_bytes; i += blockDim.x)
+                chunk_sign_slot[i] = sign_stage_bytes[i];
+            if (threadIdx.x == 0)
+                block_nnz += chunk_nnz;
+            __syncthreads();
         }
 
         uint32_t stored_bytes = 0;
         const byte* encoded = raw;
         bool stored_raw = false;
-        bool prefixed = false;
         if (!zero) {
             int compressed_bytes = static_cast<int>(raw_bytes);
             d_BIT_2(compressed_bytes, raw, transformed, temp);
@@ -392,208 +339,95 @@ __launch_bounds__(TPB, 2048 / TPB) void encode_kernel(const byte* __restrict__ i
             }
         }
 
-        if constexpr (PrefixFormat) {
-            // A fixed Top-16 byte code is applied only to the already compacted
-            // BIT_2+RZE magnitude stream.  Four/eight/sixteen independent
-            // byte-aligned lanes make decode parallel without a serial bit-state
-            // dependency.  The lane count adapts to chunk density so small chunks
-            // pay only seven header bytes while the longest serial segment stays
-            // below 114 input bytes.
-            constexpr uint32_t PREFIX_MAX_LANES = 16u;
-            constexpr uint32_t PREFIX_LANE_CAP = 128u;
-            auto* lane_sizes = reinterpret_cast<uint16_t*>(temp + 2048u);
-            auto* lane_offsets = reinterpret_cast<uint16_t*>(temp + 2080u);
-            auto* prefix_total = reinterpret_cast<uint32_t*>(temp + 2112u);
-            const uint32_t prefix_lanes =
-                stored_bytes <= 256u ? 4u : (stored_bytes <= 768u ? 8u : 16u);
-            const uint32_t span = (stored_bytes + prefix_lanes - 1u) / prefix_lanes;
-            if (!zero && !stored_raw && stored_bytes != 0u && span <= 113u) {
-                auto* lane_words = reinterpret_cast<uint32_t*>(temp);
-                for (uint32_t i = threadIdx.x;
-                     i < PREFIX_MAX_LANES * PREFIX_LANE_CAP / sizeof(uint32_t);
-                     i += blockDim.x)
-                    lane_words[i] = 0u;
-                __syncthreads();
-                const uint32_t worker = static_cast<uint32_t>(threadIdx.x);
-                const bool is_prefix_worker = worker < prefix_lanes * 4u;
-                const uint32_t worker_mask = __ballot_sync(0xffffffffu, is_prefix_worker);
-                if (is_prefix_worker) {
-                    const uint32_t lane = worker >> 2u;
-                    const uint32_t sub = worker & 3u;
-                    const uint32_t begin = min(stored_bytes, lane * span);
-                    const uint32_t end = min(stored_bytes, begin + span);
-                    const uint32_t subspan = (end - begin + 3u) / 4u;
-                    const uint32_t subbegin = min(end, begin + sub * subspan);
-                    const uint32_t subend = min(end, subbegin + subspan);
-                    uint32_t local_bits = 0;
-                    for (uint32_t i = subbegin; i < subend; ++i)
-                        local_bits += prefix_rank_table[raw[i]] < 16u ? 5u : 9u;
-                    uint32_t inclusive = local_bits;
-#pragma unroll
-                    for (uint32_t delta = 1u; delta < 4u; delta <<= 1u) {
-                        const uint32_t prior = __shfl_up_sync(worker_mask, inclusive, delta, 4);
-                        if (sub >= delta)
-                            inclusive += prior;
-                    }
-                    uint32_t bitpos = inclusive - local_bits;
-                    auto* out_words = reinterpret_cast<uint32_t*>(temp + lane * PREFIX_LANE_CAP);
-                    for (uint32_t i = subbegin; i < subend; ++i) {
-                        const uint32_t rank = prefix_rank_table[raw[i]];
-                        const uint32_t length = rank < 16u ? 5u : 9u;
-                        const uint32_t code = rank < 16u
-                                                  ? (rank << 1u)
-                                                  : ((static_cast<uint32_t>(raw[i]) << 1u) | 1u);
-                        const uint32_t wi = bitpos >> 5u;
-                        const uint32_t shift = bitpos & 31u;
-                        atomicOr(out_words + wi, code << shift);
-                        if (shift + length > 32u)
-                            atomicOr(out_words + wi + 1u, code >> (32u - shift));
-                        bitpos += length;
-                    }
-                    if (sub == 3u)
-                        lane_sizes[lane] = static_cast<uint16_t>((inclusive + 7u) / 8u);
-                }
-                __syncthreads();
-                if (threadIdx.x == 0) {
-                    const uint32_t header_bytes = 3u + prefix_lanes;
-                    uint32_t total = header_bytes;
-                    for (uint32_t lane = 0; lane < prefix_lanes; ++lane) {
-                        lane_offsets[lane] = static_cast<uint16_t>(total - header_bytes);
-                        total += lane_sizes[lane];
-                    }
-                    *prefix_total = total;
-                }
-                __syncthreads();
-                const bool use_prefix =
-                    *prefix_total < stored_bytes && *prefix_total <= PREFIX_SIZE_MASK;
-                if (use_prefix) {
-                    if (threadIdx.x == 0) {
-                        transformed[0] = static_cast<byte>(stored_bytes);
-                        transformed[1] = static_cast<byte>(stored_bytes >> 8u);
-                        transformed[2] = static_cast<byte>(prefix_lanes);
-                    }
-                    if (threadIdx.x < prefix_lanes)
-                        transformed[3u + threadIdx.x] = static_cast<byte>(lane_sizes[threadIdx.x]);
-                    __syncthreads();
-                    const uint32_t copy_lane = threadIdx.x >> 4u;
-                    const uint32_t copy_rank = threadIdx.x & 15u;
-                    if (copy_lane < prefix_lanes) {
-                        const byte* lane_in = temp + copy_lane * PREFIX_LANE_CAP;
-                        byte* lane_out = transformed + 3u + prefix_lanes + lane_offsets[copy_lane];
-                        for (uint32_t i = copy_rank; i < lane_sizes[copy_lane]; i += 16u)
-                            lane_out[i] = lane_in[i];
-                    }
-                    __syncthreads();
-                    stored_bytes = *prefix_total;
-                    encoded = transformed;
-                    prefixed = true;
-                }
-            }
-            // Bit 13 distinguishes a prefixed size from an ordinary compacted
-            // size.  Any non-prefixed stream that would collide with that range
-            // is stored raw and uses the existing all-ones sentinel.
-            if (!zero && !prefixed && stored_bytes >= PREFIX_CHUNK_BIT) {
-                stored_bytes = raw_bytes;
-                encoded = input + base;
-                stored_raw = true;
-            }
-        }
 
         byte* const destination = slots + static_cast<size_t>(chunk) * CS;
         for (uint32_t i = threadIdx.x; i < stored_bytes; i += blockDim.x)
             destination[i] = encoded[i];
         if (threadIdx.x == 0) {
-            if constexpr (WithSign) {
-                const uint32_t sign_bytes = (chunk_nnz + 7u) / 8u;
-                const uint32_t mag_code =
-                    stored_raw ? 0x3fffu
-                               : (prefixed ? (PREFIX_CHUNK_BIT | stored_bytes) : stored_bytes);
-                const uint32_t sign_code = sign_bytes == SIGN_SLOT_BYTES ? 0u : sign_bytes;
-                const uint32_t value = mag_code | (sign_code << 14u);
-                byte* m = meta + static_cast<size_t>(chunk) * 3u;
-                m[0] = static_cast<byte>(value);
-                m[1] = static_cast<byte>(value >> 8u);
-                m[2] = static_cast<byte>(value >> 16u);
-            } else {
-                sizes[chunk] = static_cast<uint16_t>(stored_bytes);
-            }
+            const uint32_t sign_bytes = (chunk_nnz + 7u) / 8u;
+            const uint32_t mag_code = stored_raw ? 0x3fffu : stored_bytes;
+            const uint32_t sign_code = sign_bytes == SIGN_SLOT_BYTES ? 0u : sign_bytes;
+            const uint32_t value = mag_code | (sign_code << 14u);
+            byte* m = meta + static_cast<size_t>(chunk) * 3u;
+            m[0] = static_cast<byte>(value);
+            m[1] = static_cast<byte>(value >> 8u);
+            m[2] = static_cast<byte>(value >> 16u);
+        }
+        if (!zero)
+            __syncthreads();
+        // Publish the slot/metadata writes. Only the last block in a group
+        // acquires the other chunks and packs that group; no block spins.
+        if (threadIdx.x == 0) {
+            const uint32_t group = chunk / GROUP_CHUNKS;
+            const uint32_t count = min(GROUP_CHUNKS, chunks - group * GROUP_CHUNKS);
+            cuda::atomic_ref<unsigned int, cuda::thread_scope_device> completed(group_done[group]);
+            pack_ready = completed.fetch_add(1U, cuda::memory_order_release) + 1U == count;
+            if (pack_ready)
+                cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_device);
         }
         __syncthreads();
-    }
-}
+        if (pack_ready) {
+            __shared__ uint32_t group_prefix[GROUP_CHUNKS + 1];
+            __shared__ uint32_t group_offset;
+            auto* const group_offsets = reinterpret_cast<uint32_t*>(blob);
+            byte* const metadata = meta;
+            const size_t metadata_bytes = static_cast<size_t>(chunks) * 3u;
+            byte* const payload = metadata + metadata_bytes;
+            const uint32_t group = chunk / GROUP_CHUNKS;
+            const uint32_t first = group * GROUP_CHUNKS;
+            const uint32_t group_count = min(GROUP_CHUNKS, chunks - first);
 
-template <bool WithSign, bool PrefixFormat = false>
-__global__ void pack_group_kernel(const byte* __restrict__ slots,
-                                  const byte* __restrict__ sign_slots,
-                                  byte* __restrict__ blob,
-                                  uint32_t chunks,
-                                  uint32_t groups) {
-    __shared__ uint32_t group_prefix[GROUP_CHUNKS + 1];
-    __shared__ uint32_t group_offset;
-    auto* const group_offsets = reinterpret_cast<uint32_t*>(blob);
-    byte* metadata = reinterpret_cast<byte*>(group_offsets + groups);
-    const size_t metadata_bytes = static_cast<size_t>(chunks) * (WithSign ? 3u : sizeof(uint16_t));
-    byte* const payload = metadata + metadata_bytes;
-    const uint32_t group = blockIdx.x;
-    if (group >= groups)
-        return;
-    const uint32_t first = group * GROUP_CHUNKS;
-    const uint32_t group_count = min(GROUP_CHUNKS, chunks - first);
-
-    // One warp loads and scans a group's metadata.  The former lane-0 loop
-    // serialized up to sixteen scattered 24-bit loads in every group.
-    if (threadIdx.x < 32) {
-        const uint32_t lane = threadIdx.x;
-        uint32_t bytes = 0;
-        if (lane < group_count) {
-            if constexpr (WithSign) {
-                const uint32_t m = load_meta24(metadata, first + lane);
-                bytes = decode_mag_bytes(m, CS, PrefixFormat) + decode_sign_bytes(m);
-            } else {
-                bytes = reinterpret_cast<const uint16_t*>(metadata)[first + lane];
-            }
-        }
-        uint32_t inclusive = bytes;
+            // One warp scans the group's lengths to obtain chunk offsets.
+            if (threadIdx.x < 32) {
+                const uint32_t lane = threadIdx.x;
+                uint32_t bytes = 0;
+                if (lane < group_count) {
+                    const uint32_t m = load_meta24(metadata, first + lane);
+                    bytes = decode_mag_bytes(m, min(static_cast<uint32_t>(CS),
+                        input_bytes - (first + lane) * CS)) + decode_sign_bytes(m);
+                }
+                uint32_t inclusive = bytes;
 #pragma unroll
-        for (uint32_t delta = 1; delta < GROUP_CHUNKS; delta <<= 1u) {
-            const uint32_t prior = __shfl_up_sync(0xffffffffu, inclusive, delta);
-            if (lane >= delta)
-                inclusive += prior;
-        }
-        if (lane == 0)
-            group_prefix[0] = 0;
-        if (lane < group_count)
-            group_prefix[lane + 1u] = inclusive;
-        if (lane + 1u == group_count) {
-            group_offset = atomicAdd(&payload_counter, inclusive);
-            group_offsets[group] = group_offset | (PrefixFormat ? PREFIX_FORMAT_BIT : 0u);
-        }
-    }
-    __syncthreads();
+                for (uint32_t delta = 1; delta < GROUP_CHUNKS; delta <<= 1u) {
+                    const uint32_t prior = __shfl_up_sync(0xffffffffu, inclusive, delta);
+                    if (lane >= delta)
+                        inclusive += prior;
+                }
+                if (lane == 0)
+                    group_prefix[0] = 0;
+                if (lane < group_count)
+                    group_prefix[lane + 1u] = inclusive;
+                if (lane + 1u == group_count) {
+                    group_offset = inclusive ? atomicAdd(&payload_counter, inclusive) : 0U;
+                    group_offsets[group] = group_offset;
+                }
+            }
+            __syncthreads();
 
-    // Sixteen warps copy the sixteen chunks concurrently. Sparse scientific
-    // chunks are usually only hundreds of bytes; assigning the full CTA to each
-    // chunk serialized 16 short, latency-bound transfers.
-    const uint32_t local = threadIdx.x >> 5u;
-    const uint32_t lane = threadIdx.x & 31u;
-    if (local < group_count) {
-        const uint32_t chunk = first + local;
-        uint32_t mag_bytes = 0, sign_bytes = 0;
-        if constexpr (WithSign) {
-            const uint32_t m = load_meta24(metadata, chunk);
-            mag_bytes = decode_mag_bytes(m, CS, PrefixFormat);
-            sign_bytes = decode_sign_bytes(m);
-        } else {
-            mag_bytes = reinterpret_cast<const uint16_t*>(metadata)[chunk];
-        }
-        byte* destination = payload + group_offset + group_prefix[local];
-        const byte* mag_source = slots + static_cast<size_t>(chunk) * CS;
-        for (uint32_t i = lane; i < mag_bytes; i += 32u)
-            destination[i] = mag_source[i];
-        if constexpr (WithSign) {
-            const byte* sign_source = sign_slots + static_cast<size_t>(chunk) * SIGN_SLOT_BYTES;
-            for (uint32_t i = lane; i < sign_bytes; i += 32u)
-                destination[mag_bytes + i] = sign_source[i];
+            // Each warp copies one chunk's magnitudes and signs.
+            const uint32_t local = threadIdx.x >> 5u;
+            const uint32_t lane = threadIdx.x & 31u;
+            if (group_prefix[group_count] != 0U && local < group_count) {
+                const uint32_t chunk = first + local;
+                const uint32_t m = load_meta24(metadata, chunk);
+                const uint32_t mag_bytes = decode_mag_bytes(m, min(static_cast<uint32_t>(CS),
+                    input_bytes - chunk * CS));
+                const uint32_t sign_bytes = decode_sign_bytes(m);
+                byte* destination = payload + group_offset + group_prefix[local];
+                const byte* mag_source = slots + static_cast<size_t>(chunk) * CS;
+                for (uint32_t i = lane; i < mag_bytes; i += 32u)
+                    destination[i] = mag_source[i];
+                const byte* sign_source = sign_slots + static_cast<size_t>(chunk) * SIGN_SLOT_BYTES;
+                for (uint32_t i = lane; i < sign_bytes; i += 32u)
+                    destination[mag_bytes + i] = sign_source[i];
+            }
+            __syncthreads();
+            // All publishers for this group have finished. Reuse the counter
+            // on the next encode without another per-call memset/launch.
+            if (threadIdx.x == 0) {
+                cuda::atomic_ref<unsigned int, cuda::thread_scope_device> completed(group_done[group]);
+                completed.store(0U, cuda::memory_order_relaxed);
+            }
         }
     }
 }
@@ -1066,164 +900,58 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
     }
 }
 
-void release(State& s) {
-    if (s.device >= 0) {
+void release() {
+    if (WZPConfig::device >= 0) {
         int previous = 0;
         cudaGetDevice(&previous);
-        cudaSetDevice(s.device);
-        cudaFree(s.slots);
-        cudaFree(s.sign_slots);
-        cudaFree(s.blob);
-        if (s.signed_begin)
-            cudaEventDestroy(s.signed_begin);
-        if (s.signed_end)
-            cudaEventDestroy(s.signed_end);
-        if (s.timing_begin)
-            cudaEventDestroy(s.timing_begin);
-        if (s.timing_end)
-            cudaEventDestroy(s.timing_end);
+        cudaSetDevice(WZPConfig::device);
+        cudaFree(WZPConfig::slots);
+        cudaFree(WZPConfig::sign_slots);
+        cudaFree(WZPConfig::blob);
+        cudaFree(WZPConfig::group_done);
+        if (WZPConfig::timing_begin)
+            cudaEventDestroy(WZPConfig::timing_begin);
+        if (WZPConfig::timing_end)
+            cudaEventDestroy(WZPConfig::timing_end);
         cudaSetDevice(previous);
     }
-    if (s.host_results)
-        cudaFreeHost(s.host_results);
-    s = State{};
+    if (WZPConfig::host_results)
+        cudaFreeHost(WZPConfig::host_results);
+    WZPConfig::device = -1;
+    WZPConfig::capacity_n = 0;
+    WZPConfig::slots = WZPConfig::sign_slots = WZPConfig::blob = nullptr;
+    WZPConfig::blob_capacity = 0;
+    WZPConfig::group_done = nullptr;
+    WZPConfig::host_results = nullptr;
+    WZPConfig::timing_begin = WZPConfig::timing_end = nullptr;
+    WZPConfig::signed_payload_offset = 0;
 }
 
 void reserve(uint32_t n, cudaStream_t stream) {
-    State& s = state();
     const WALTZ::GPUConfig& gpu = WALTZ::gpu_config();
     const int device = gpu.device;
     const uint32_t chunks = (n + ELEMS_PER_CHUNK - 1u) / ELEMS_PER_CHUNK;
-    if (s.device == device && s.capacity_n >= n)
+    if (WZPConfig::device == device && WZPConfig::capacity_n >= n)
         return;
-    release(s);
-    s.device = device;
-    s.capacity_n = n;
-    const cudaDeviceProp& properties = gpu.properties;
-    s.persistent_blocks =
-        properties.multiProcessorCount * (properties.maxThreadsPerMultiProcessor / TPB);
-    if (const char* eb = std::getenv("WALTZ_WZP_BLOCKS_PER_SM")) {
-        const int requested = std::atoi(eb);
-        if (requested > 0) {
-            const int max_bps = properties.maxThreadsPerMultiProcessor / TPB;
-            s.persistent_blocks =
-                properties.multiProcessorCount * (requested < max_bps ? requested : max_bps);
-        }
-    }
+    release();
+    WZPConfig::device = device;
+    WZPConfig::capacity_n = n;
     const uint32_t groups = (chunks + GROUP_CHUNKS - 1u) / GROUP_CHUNKS;
     const size_t input_bytes = static_cast<size_t>(n) * sizeof(uint16_t);
-    check(cudaMalloc(&s.slots, static_cast<size_t>(chunks) * CS), "allocate slots");
-    check(cudaMalloc(&s.sign_slots, static_cast<size_t>(chunks) * SIGN_SLOT_BYTES),
-          "allocate sign slots");
-    s.blob_capacity = static_cast<size_t>(groups) * sizeof(uint32_t) +
+    cudaMalloc(&WZPConfig::slots, static_cast<size_t>(chunks) * CS);
+    cudaMalloc(&WZPConfig::sign_slots, static_cast<size_t>(chunks) * SIGN_SLOT_BYTES);
+    WZPConfig::blob_capacity = static_cast<size_t>(groups) * sizeof(uint32_t) +
                       static_cast<size_t>(chunks) * 3u + input_bytes +
                       (static_cast<size_t>(n) + 7u) / 8u;
-    check(cudaMalloc(&s.blob, s.blob_capacity), "allocate blob");
-    check(cudaMallocHost(&s.host_results, 2 * sizeof(uint32_t)), "allocate pinned results");
-    check(cudaEventCreate(&s.signed_begin), "create signed encode begin");
-    check(cudaEventCreate(&s.signed_end), "create signed encode end");
-    check(cudaEventCreate(&s.timing_begin), "create timing begin");
-    check(cudaEventCreate(&s.timing_end), "create timing end");
+    cudaMalloc(&WZPConfig::blob, WZPConfig::blob_capacity);
+    cudaMalloc(&WZPConfig::group_done, static_cast<size_t>(groups) * sizeof(uint32_t));
+    cudaMallocHost(&WZPConfig::host_results, 2 * sizeof(uint32_t));
+    cudaEventCreate(&WZPConfig::timing_begin);
+    cudaEventCreate(&WZPConfig::timing_end);
 
-    cudaFuncAttributes attributes{};
-    check(cudaFuncGetAttributes(&attributes, reset_counter_kernel), "preload reset kernel");
-    check(cudaFuncGetAttributes(&attributes, encode_kernel<false>), "preload encode kernel");
-    check(cudaFuncGetAttributes(&attributes, encode_kernel<true>), "preload signed encode kernel");
-    check(cudaFuncGetAttributes(&attributes, encode_kernel<true, true>),
-          "preload prefix signed encode kernel");
-    check(cudaFuncGetAttributes(&attributes, pack_group_kernel<false>), "preload pack kernel");
-    check(cudaFuncGetAttributes(&attributes, pack_group_kernel<true>),
-          "preload signed pack kernel");
-    check(cudaFuncGetAttributes(&attributes, pack_group_kernel<true, true>),
-          "preload prefix signed pack kernel");
-    check(cudaFuncGetAttributes(&attributes, decode_kernel<false>), "preload decode kernel");
-    check(cudaFuncGetAttributes(&attributes, decode_kernel<true>), "preload signed decode kernel");
-    check(cudaFuncGetAttributes(&attributes, decode_kernel<true, 1>),
-          "preload fused reordered decode kernel");
-    check(cudaFuncGetAttributes(&attributes, decode_kernel<true, 2>),
-          "preload aligned bz2 decode kernel");
-    check(cudaFuncGetAttributes(&attributes, decode_kernel<true, 3>),
-          "preload natural-store decode kernel");
-    check(cudaFuncGetAttributes(&attributes, decode_kernel<true, 1, double>),
-          "preload fused reordered double decode kernel");
-    check(cudaFuncGetAttributes(&attributes, decode_kernel<true, 2, double>),
-          "preload aligned bz2 double decode kernel");
-    check(cudaMemsetAsync(s.slots, 0, static_cast<size_t>(chunks) * CS, stream), "touch slots");
-    check(cudaMemsetAsync(s.sign_slots, 0, static_cast<size_t>(chunks) * SIGN_SLOT_BYTES, stream),
-          "touch sign slots");
-    check(cudaMemsetAsync(s.blob, 0, s.blob_capacity, stream), "touch blob");
+    cudaMemsetAsync(WZPConfig::group_done, 0, static_cast<size_t>(groups) * sizeof(uint32_t), stream);
     reset_counter_kernel<<<1, 1, 0, stream>>>();
-    check(cudaStreamSynchronize(stream), "finish preallocation");
-}
-
-template <bool WithSign>
-size_t encode_impl(const uint16_t* input,
-                   const uint32_t* sign_bitmap,
-                   uint32_t n,
-                   uint32_t* nnz,
-                   double* ms,
-                   cudaStream_t stream) {
-    reserve(n, stream);
-    State& s = state();
-    const uint32_t input_bytes = n * sizeof(uint16_t);
-    const uint32_t chunks = (input_bytes + CS - 1u) / CS;
-    const uint32_t groups = (chunks + GROUP_CHUNKS - 1u) / GROUP_CHUNKS;
-    const size_t metadata_bytes = static_cast<size_t>(chunks) * (WithSign ? 3u : sizeof(uint16_t));
-    const size_t payload_offset = static_cast<size_t>(groups) * sizeof(uint32_t) + metadata_bytes;
-    auto* const group_offsets = reinterpret_cast<uint32_t*>(s.blob);
-    byte* const metadata = reinterpret_cast<byte*>(group_offsets + groups);
-    auto* const sizes = reinterpret_cast<uint16_t*>(metadata);
-    check(cudaEventRecord(s.timing_begin, stream), "record encode begin");
-    reset_counter_kernel<<<1, 1, 0, stream>>>();
-    const bool prefix = std::getenv("WALTZ_WZP_PREFIX") != nullptr &&
-                        std::atoi(std::getenv("WALTZ_WZP_PREFIX")) != 0;
-    if (prefix) {
-        encode_kernel<WithSign, true>
-            <<<s.persistent_blocks, TPB, 0, stream>>>(reinterpret_cast<const byte*>(input),
-                                                      input_bytes,
-                                                      sign_bitmap,
-                                                      s.slots,
-                                                      s.sign_slots,
-                                                      sizes,
-                                                      metadata,
-                                                      chunks);
-        pack_group_kernel<WithSign, true>
-            <<<groups, TPB, 0, stream>>>(s.slots, s.sign_slots, s.blob, chunks, groups);
-    } else {
-        encode_kernel<WithSign>
-            <<<s.persistent_blocks, TPB, 0, stream>>>(reinterpret_cast<const byte*>(input),
-                                                      input_bytes,
-                                                      sign_bitmap,
-                                                      s.slots,
-                                                      s.sign_slots,
-                                                      sizes,
-                                                      metadata,
-                                                      chunks);
-        pack_group_kernel<WithSign>
-            <<<groups, TPB, 0, stream>>>(s.slots, s.sign_slots, s.blob, chunks, groups);
-    }
-    check(cudaMemcpyFromSymbolAsync(
-              s.host_results, payload_counter, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream),
-          "copy payload total");
-    if constexpr (WithSign)
-        check(cudaMemcpyFromSymbolAsync(s.host_results + 1,
-                                        nnz_counter,
-                                        sizeof(uint32_t),
-                                        0,
-                                        cudaMemcpyDeviceToHost,
-                                        stream),
-              "copy nnz total");
-    check(cudaEventRecord(s.timing_end, stream), "record encode end");
-    check(cudaEventSynchronize(s.timing_end), "wait encode");
-    float elapsed = 0;
-    check(cudaEventElapsedTime(&elapsed, s.timing_begin, s.timing_end), "measure encode");
-    if (ms)
-        *ms = elapsed;
-    if constexpr (WithSign)
-        if (nnz)
-            *nnz = s.host_results[1];
-    check(cudaGetLastError(), "encode kernels");
-    return payload_offset + static_cast<size_t>(s.host_results[0]);
+    cudaStreamSynchronize(stream);
 }
 
 template <bool WithSign>
@@ -1234,21 +962,20 @@ void decode_impl(const void* blob,
                  double* ms,
                  cudaStream_t stream) {
     reserve(n, stream);
-    State& s = state();
     const uint32_t output_bytes = n * sizeof(uint16_t);
     const uint32_t chunks = (output_bytes + CS - 1u) / CS;
     const uint32_t groups = (chunks + GROUP_CHUNKS - 1u) / GROUP_CHUNKS;
-    check(cudaEventRecord(s.timing_begin, stream), "record decode begin");
+    check(cudaEventRecord(WZPConfig::timing_begin, stream), "record decode begin");
     decode_kernel<WithSign><<<chunks, TPB, 0, stream>>>(static_cast<const byte*>(blob),
                                                         chunks,
                                                         groups,
                                                         output_bytes,
                                                         reinterpret_cast<byte*>(output),
                                                         sign_bitmap);
-    check(cudaEventRecord(s.timing_end, stream), "record decode end");
-    check(cudaEventSynchronize(s.timing_end), "wait decode");
+    check(cudaEventRecord(WZPConfig::timing_end, stream), "record decode end");
+    check(cudaEventSynchronize(WZPConfig::timing_end), "wait decode");
     float elapsed = 0;
-    check(cudaEventElapsedTime(&elapsed, s.timing_begin, s.timing_end), "measure decode");
+    check(cudaEventElapsedTime(&elapsed, WZPConfig::timing_begin, WZPConfig::timing_end), "measure decode");
     if (ms)
         *ms = elapsed;
     check(cudaGetLastError(), "decode kernel");
@@ -1265,11 +992,10 @@ void decode_reordered_impl(const void* blob,
                            double* ms,
                            cudaStream_t stream) {
     reserve(n, stream);
-    State& s = state();
     const uint32_t output_bytes = n * sizeof(uint16_t);
     const uint32_t chunks = (output_bytes + CS - 1u) / CS;
     const uint32_t groups = (chunks + GROUP_CHUNKS - 1u) / GROUP_CHUNKS;
-    check(cudaEventRecord(s.timing_begin, stream), "record fused reordered decode begin");
+    check(cudaEventRecord(WZPConfig::timing_begin, stream), "record fused reordered decode begin");
     const bool aligned_bz2 = block_z == 2U && dims.x % 16U == 0U && dims.y % 16U == 0U &&
                              dims.z % 2U == 0U;
     const bool full_layout = dims.x % 16U == 0U && dims.y % 16U == 0U &&
@@ -1304,10 +1030,10 @@ void decode_reordered_impl(const void* blob,
                 static_cast<const byte*>(blob), chunks, groups, output_bytes, nullptr, nullptr,
                 output, offset_table, q, dims.x, dims.y, dims.z, block_z);
     }
-    check(cudaEventRecord(s.timing_end, stream), "record fused reordered decode end");
-    check(cudaEventSynchronize(s.timing_end), "wait fused reordered decode");
+    check(cudaEventRecord(WZPConfig::timing_end, stream), "record fused reordered decode end");
+    check(cudaEventSynchronize(WZPConfig::timing_end), "wait fused reordered decode");
     float elapsed = 0;
-    check(cudaEventElapsedTime(&elapsed, s.timing_begin, s.timing_end),
+    check(cudaEventElapsedTime(&elapsed, WZPConfig::timing_begin, WZPConfig::timing_end),
           "measure fused reordered decode");
     if (ms)
         *ms = elapsed;
@@ -1327,10 +1053,6 @@ void wzp_prealloc(uint32_t n, cudaStream_t stream) {
     reserve(n, stream);
 }
 
-size_t wzp_encode(const uint16_t* input, uint32_t n, double* ms, cudaStream_t stream) {
-    return encode_impl<false>(input, nullptr, n, nullptr, ms, stream);
-}
-
 size_t wzp_encode_with_sign(const uint16_t* input,
                             const uint32_t* sign_bitmap,
                             uint32_t n,
@@ -1338,79 +1060,43 @@ size_t wzp_encode_with_sign(const uint16_t* input,
                             double* ms,
                             cudaStream_t stream) {
     wzp_encode_with_sign_launch(input, sign_bitmap, n, stream);
-    return wzp_encode_with_sign_finish(nnz, ms, stream);
+    return wzp_encode_with_sign_finish(nnz, ms);
 }
 
-void wzp_encode_with_sign_launch(const uint16_t* input,
-                                 const uint32_t* sign_bitmap,
-                                 uint32_t n,
-                                 cudaStream_t stream) {
+void wzp_encode_with_sign_launch(const uint16_t* input, const uint32_t* sign_bitmap,
+                                 uint32_t n, cudaStream_t stream) {
     reserve(n, stream);
-    State& s = state();
     const uint32_t input_bytes = n * sizeof(uint16_t);
     const uint32_t chunks = (input_bytes + CS - 1u) / CS;
     const uint32_t groups = (chunks + GROUP_CHUNKS - 1u) / GROUP_CHUNKS;
-    s.signed_payload_offset =
-        static_cast<size_t>(groups) * sizeof(uint32_t) + static_cast<size_t>(chunks) * 3u;
-    auto* const group_offsets = reinterpret_cast<uint32_t*>(s.blob);
-    byte* const metadata = reinterpret_cast<byte*>(group_offsets + groups);
-    check(cudaEventRecord(s.signed_begin, stream), "record signed encode begin");
-    const bool prefix = std::getenv("WALTZ_WZP_PREFIX") != nullptr &&
-                        std::atoi(std::getenv("WALTZ_WZP_PREFIX")) != 0;
-    if (prefix) {
-        encode_kernel<true, true>
-            <<<s.persistent_blocks, TPB, 0, stream>>>(reinterpret_cast<const byte*>(input),
-                                                      input_bytes,
-                                                      sign_bitmap,
-                                                      s.slots,
-                                                      s.sign_slots,
-                                                      reinterpret_cast<uint16_t*>(metadata),
-                                                      metadata,
-                                                      chunks);
-        pack_group_kernel<true, true>
-            <<<groups, TPB, 0, stream>>>(s.slots, s.sign_slots, s.blob, chunks, groups);
-    } else {
-        encode_kernel<true>
-            <<<s.persistent_blocks, TPB, 0, stream>>>(reinterpret_cast<const byte*>(input),
-                                                      input_bytes,
-                                                      sign_bitmap,
-                                                      s.slots,
-                                                      s.sign_slots,
-                                                      reinterpret_cast<uint16_t*>(metadata),
-                                                      metadata,
-                                                      chunks);
-        pack_group_kernel<true>
-            <<<groups, TPB, 0, stream>>>(s.slots, s.sign_slots, s.blob, chunks, groups);
-    }
-    check(cudaMemcpyFromSymbolAsync(
-              s.host_results, payload_counter, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream),
-          "copy signed payload total");
-    check(cudaMemcpyFromSymbolAsync(
-              s.host_results + 1, nnz_counter, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream),
-          "copy signed nnz total");
-    check(cudaEventRecord(s.signed_end, stream), "record signed encode end");
-    // Prepare counters for the next call after the measured payload is complete.
-    // Keeping the tiny reset out of the front of the queue prevents a competing
-    // concurrent IDWT from occupying every SM in the gap before encode_kernel.
+    const size_t metadata_offset = static_cast<size_t>(groups) * sizeof(uint32_t);
+    WZPConfig::signed_payload_offset = metadata_offset + static_cast<size_t>(chunks) * 3u;
+    const byte* const raw = reinterpret_cast<const byte*>(input);
+    byte* const metadata = WZPConfig::blob + metadata_offset;
+    cudaEventRecord(WZPConfig::timing_begin, stream);
+    encode_kernel<<<512, TPB, 0, stream>>>(raw, input_bytes, sign_bitmap,
+        WZPConfig::slots, WZPConfig::sign_slots, metadata, WZPConfig::blob, WZPConfig::group_done);
+
+    cudaMemcpyFromSymbolAsync(WZPConfig::host_results, payload_counter, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyFromSymbolAsync(WZPConfig::host_results + 1, nnz_counter, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream);
+    cudaEventRecord(WZPConfig::timing_end, stream);
     reset_counter_kernel<<<1, 1, 0, stream>>>();
-    check(cudaGetLastError(), "launch signed encode kernels");
+    cudaGetLastError();
 }
 
-size_t wzp_encode_with_sign_finish(uint32_t* nnz, double* ms, cudaStream_t stream) {
-    (void)stream;
-    State& s = state();
-    check(cudaEventSynchronize(s.signed_end), "wait signed encode");
+size_t wzp_encode_with_sign_finish(uint32_t* nnz, double* ms) {
+    check(cudaEventSynchronize(WZPConfig::timing_end), "wait signed encode");
     float elapsed = 0;
-    check(cudaEventElapsedTime(&elapsed, s.signed_begin, s.signed_end), "measure signed encode");
+    check(cudaEventElapsedTime(&elapsed, WZPConfig::timing_begin, WZPConfig::timing_end), "measure signed encode");
     if (ms)
         *ms = elapsed;
     if (nnz)
-        *nnz = s.host_results[1];
-    return s.signed_payload_offset + static_cast<size_t>(s.host_results[0]);
+        *nnz = WZPConfig::host_results[1];
+    return WZPConfig::signed_payload_offset + static_cast<size_t>(WZPConfig::host_results[0]);
 }
 
 const void* wzp_encoded_buf() {
-    return state().blob;
+    return WZPConfig::blob;
 }
 
 void wzp_decode(const void* blob, uint32_t n, uint16_t* output, double* ms, cudaStream_t stream) {

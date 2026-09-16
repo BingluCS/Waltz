@@ -1,0 +1,5 @@
+/build*/
+/benchmark_results/
+CMakeUserPresets.json
+*.nsys-rep
+*.ncu-rep

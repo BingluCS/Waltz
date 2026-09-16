@@ -42,6 +42,12 @@ enum class QuantMode : uint8_t {
     All,
 };
 
+// T records PWE outliers without writing dst; F writes the reconstruction.
+enum class PWE : uint8_t {
+    T,
+    F,
+};
+
 struct GPUConfig {
     int device = 0;
     cudaDeviceProp properties{};
@@ -66,22 +72,36 @@ template <typename T> struct DWTConfig {
     static inline int z_blocks = 0;
 };
 
+// WZP workspace; device selection comes from GPUConfig.
+struct WZPConfig {
+    static inline int device = -1;
+    static inline uint32_t capacity_n = 0;
+    static inline unsigned char* slots = nullptr;
+    static inline unsigned char* sign_slots = nullptr;
+    static inline unsigned char* blob = nullptr;
+    static inline uint32_t* group_done = nullptr;
+    static inline size_t blob_capacity = 0;
+    static inline uint32_t* host_results = nullptr;
+    // Shared by serialized WZP operations; finish signed encode before reuse.
+    static inline cudaEvent_t timing_begin = nullptr;
+    static inline cudaEvent_t timing_end = nullptr;
+    static inline size_t signed_payload_offset = 0;
+};
+
 template <typename T> struct IDWTConfig {
+    // Persistent global-memory scratch; capacities are in bytes.
+    static inline void* tmp = nullptr;
+    static inline size_t cap = 0;
+    static inline size_t mapped_cap = 0;
     // Single-level dyadic launch grids. z_global_blocks is the one-time init guard.
     static inline int z_global_blocks = 0;
     static inline int z_static_blocks = 0;
-    static inline int z_vec_blocks = 0;
-    static inline int x_blocks = 0;
-    static inline int y_blocks = 0;
     static inline int yx_blocks = 0;
-    static inline int yx_wide_blocks = 0;
-    static inline int yx_ext_blocks = 0;
+    static inline int yx_halo_blocks = 0;
     // All-level plane launch grids, keyed by configured dimensions below.
     static inline int plane_yx_blocks = 0;
     static inline int plane_z_blocks = 0;
-    static inline size_t yx_smem_bytes = 0;
     static inline size_t z_smem_bytes = 0;
-    static inline uint32_t yx_capacity = 0;
     static inline uint32_t z_capacity = 0;
     static inline uint32_t configured_nx = 0;
     static inline uint32_t configured_nz = 0;

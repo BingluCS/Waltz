@@ -38,7 +38,9 @@ Sponsor: This code is based upon work supported by the U.S. Department of Energy
 Office of Advanced Scientific Research (ASCR), under contract DE-SC0022223.
 */
 
+#ifndef NDEBUG
 #define NDEBUG
+#endif
 
 #include <cassert>
 #include <cmath>

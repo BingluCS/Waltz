@@ -4,8 +4,6 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <cuda/atomic>
-#include <stdexcept>
-#include <string>
 #include <type_traits>
 
 using byte = unsigned char;
@@ -40,15 +38,6 @@ constexpr uint32_t ITEMS_PER_THREAD = (ELEMS_PER_CHUNK + TPB - 1u) / TPB;
 // resident CTAs per SM once register pressure is capped below.
 constexpr uint32_t TEMP_BYTES = 3u * 1024u;
 constexpr uint32_t STORAGE_BYTES = 2u * CS + TEMP_BYTES;
-// Decode-only compatibility with archives produced by the retired prefix encoder.
-constexpr uint32_t PREFIX_FORMAT_BIT = 0x80000000u;
-constexpr uint32_t PREFIX_CHUNK_BIT = 0x2000u;
-constexpr uint32_t PREFIX_SIZE_MASK = 0x1fffu;
-
-void check(cudaError_t error, const char* what) {
-    if (error != cudaSuccess)
-        throw std::runtime_error(std::string("WZP ") + what + ": " + cudaGetErrorString(error));
-}
 
 __device__ unsigned int payload_counter;
 __device__ unsigned int nnz_counter;
@@ -68,61 +57,15 @@ __device__ __forceinline__ uint32_t load_meta24(const byte* meta, uint32_t chunk
            (static_cast<uint32_t>(meta[2]) << 16u);
 }
 
-__device__ __forceinline__ uint32_t decode_mag_bytes(uint32_t meta,
-                                                     uint32_t raw_bytes,
-                                                     bool prefix_format = false) {
+__device__ __forceinline__ uint32_t decode_mag_bytes(uint32_t meta, uint32_t raw_bytes) {
     const uint32_t code = meta & 0x3fffu;
-    if (code == 0x3fffu)
-        return raw_bytes;
-    return prefix_format && (code & PREFIX_CHUNK_BIT) ? (code & PREFIX_SIZE_MASK) : code;
-}
-
-__device__ __forceinline__ bool mag_is_prefixed(uint32_t meta, bool prefix_format) {
-    const uint32_t code = meta & 0x3fffu;
-    return prefix_format && code != 0x3fffu && (code & PREFIX_CHUNK_BIT) != 0u;
+    return code == 0x3fffu ? raw_bytes : code;
 }
 
 __device__ __forceinline__ uint32_t decode_sign_bytes(uint32_t meta) {
     const uint32_t mag_code = meta & 0x3fffu;
     const uint32_t sign_code = meta >> 14u;
     return mag_code == 0 ? 0u : (sign_code == 0 ? SIGN_SLOT_BYTES : sign_code);
-}
-
-__device__ __forceinline__ uint32_t zorder_unrank_local(uint32_t rank,
-                                                        uint32_t dimx,
-                                                        uint32_t dimy,
-                                                        uint32_t dimz) {
-    const uint32_t ox = dimx, oy = dimy;
-    uint32_t x = 0, y = 0, z = 0;
-    while (dimx > 1U || dimy > 1U || dimz > 1U) {
-        const uint32_t sx0 = dimx - dimx / 2U;
-        const uint32_t sy0 = dimy - dimy / 2U;
-        const uint32_t sz0 = dimz - dimz / 2U;
-        const uint32_t z0_volume = sz0 * dimx * dimy;
-        const bool cz = rank >= z0_volume;
-        if (cz) {
-            rank -= z0_volume;
-            z += sz0;
-        }
-        const uint32_t sz = cz ? dimz / 2U : sz0;
-        const uint32_t y0_volume = sz * sy0 * dimx;
-        const bool cy = rank >= y0_volume;
-        if (cy) {
-            rank -= y0_volume;
-            y += sy0;
-        }
-        const uint32_t sy = cy ? dimy / 2U : sy0;
-        const uint32_t x0_volume = sz * sy * sx0;
-        const bool cx = rank >= x0_volume;
-        if (cx) {
-            rank -= x0_volume;
-            x += sx0;
-        }
-        dimx = cx ? dimx / 2U : sx0;
-        dimy = sy;
-        dimz = sz;
-    }
-    return x + y * ox + z * ox * oy;
 }
 
 // In a 16x16x2 brick the recursive octants put the four interleaved XY bits in
@@ -141,7 +84,7 @@ __device__ __forceinline__ uint32_t rank_16x16x2(uint32_t natural) {
 
 // Row-major local index -> recursive Morton rank for a complete 16x16xBz
 // brick, where Bz is a power of two no greater than 16.  Z participates only
-// in the coarsest log2(Bz) octree levels, matching zorder_rank() exactly.
+// in the coarsest log2(Bz) octree levels, matching the recursive ceil-half Z-order exactly.
 __device__ __forceinline__ uint32_t
 rank_16x16_power2_z(uint32_t natural, uint32_t block_z) {
     const uint32_t x = natural & 15U;
@@ -171,7 +114,11 @@ __device__ __forceinline__ ReorderRun
 reorder_run(uint32_t zpos, uint32_t nx, uint32_t ny, uint32_t nz, uint32_t block_z) {
     constexpr uint32_t BX = 16U, BY = 16U;
     const size_t nxy = static_cast<size_t>(nx) * ny;
-    const uint32_t z0 = static_cast<uint32_t>(zpos / (nxy * block_z)) * block_z;
+    const size_t band = nxy * block_z;
+    // zpos is 32-bit: a band larger than UINT32_MAX can only have quotient 0.
+    // Otherwise use a 32-bit division without narrowing the global offsets.
+    const uint32_t z0 =
+        (band > 0xffffffffULL ? 0U : zpos / static_cast<uint32_t>(band)) * block_z;
     const uint32_t bdz = min(block_z, nz - z0);
     uint32_t rem = static_cast<uint32_t>(zpos - static_cast<size_t>(z0) * nxy);
     const uint32_t max_by = (ny - 1U) / BY;
@@ -195,14 +142,10 @@ __device__ __forceinline__ size_t reordered_natural_index(
     uint32_t block_z,
     const uint32_t* __restrict__ offset_table) {
     const ReorderRun run = reorder_run(zpos, nx, ny, nz, block_z);
-    if (run.full)
-        return run.origin + offset_table[run.rank];
-    const uint32_t local = zorder_unrank_local(run.rank, run.bdx, run.bdy, run.bdz);
-    const uint32_t lx = local % run.bdx;
-    const uint32_t ly = (local / run.bdx) % run.bdy;
-    const uint32_t lz = local / (run.bdx * run.bdy);
-    return run.origin + lx + static_cast<size_t>(ly) * nx +
-           static_cast<size_t>(lz) * nx * ny;
+    const uint32_t shape = static_cast<uint32_t>(run.bdx != 16U) |
+        (static_cast<uint32_t>(run.bdy != 16U) << 1U) |
+        (static_cast<uint32_t>(run.bdz != block_z) << 2U);
+    return run.origin + offset_table[shape * 256U * block_z + run.rank];
 }
 
 __device__ __forceinline__ size_t
@@ -217,6 +160,74 @@ full_brick_origin(uint32_t bi, uint32_t nx, uint32_t ny, uint32_t block_z) {
            static_cast<size_t>(bz * block_z) * nx * ny;
 }
 
+struct ReorderWarp {
+    size_t origin;
+    uint32_t table_rank;
+    uint32_t span;
+};
+static_assert(((ELEMS_PER_CHUNK + 31U) / 32U) * sizeof(ReorderWarp) <= CS);
+static_assert((ELEMS_PER_CHUNK + 31U) / 32U <= TPB);
+
+// Decode has finished with expanded, so reuse that shared buffer for mapping
+// descriptors. One thread resolves each 32-rank run once, in parallel, instead
+// of repeatedly evaluating divisions inside each warp's store loop.
+template <bool Zero = false>
+__device__ __forceinline__ void build_reorder_warps(
+    ReorderWarp* runs, uint32_t elem_base, uint32_t elements,
+    uint32_t nx, uint32_t ny, uint32_t nz, uint32_t block_z) {
+    const uint32_t i = threadIdx.x * 32U;
+    if (i < elements) {
+        const ReorderRun run = reorder_run(elem_base + i, nx, ny, nz, block_z);
+        const uint32_t shape = static_cast<uint32_t>(run.bdx != 16U) |
+            (static_cast<uint32_t>(run.bdy != 16U) << 1U) |
+            (static_cast<uint32_t>(run.bdz != block_z) << 2U);
+        uint32_t span = run.bdx * run.bdy * run.bdz - run.rank;
+        // A whole regular brick contained in a zero chunk can be cleared in
+        // row-major order. Partial bricks at either chunk end retain Morton order.
+        if constexpr (Zero) {
+            if (shape == 0U && run.rank <= i && span <= elements - i)
+                span |= 0x80000000U;
+        }
+        runs[threadIdx.x] = {run.origin, shape * 256U * block_z + run.rank, span};
+    }
+    __syncthreads();
+}
+
+template <bool Zero = false>
+__device__ __forceinline__ size_t reordered_warp_index(
+    const ReorderWarp& run, uint32_t warp_pos, uint32_t valid,
+    uint32_t nx, uint32_t ny, uint32_t nz, uint32_t block_z,
+    const uint32_t* __restrict__ table, uint32_t chunk_base = 0U, uint32_t elements = 0U) {
+    const uint32_t lane = threadIdx.x & 31U;
+    if (lane >= valid) return 0;
+    const uint32_t span = Zero ? run.span & 0x7fffffffU : run.span;
+    if (valid <= span) {
+        if constexpr (Zero) {
+            if (run.span & 0x80000000U) {
+                const uint32_t natural = run.table_rank + lane;
+                return run.origin + (natural & 15U) +
+                    static_cast<size_t>((natural >> 4U) & 15U) * nx +
+                    static_cast<size_t>(natural >> 8U) * nx * ny;
+            }
+        }
+        return run.origin + table[run.table_rank + lane];
+    }
+    if constexpr (Zero) {
+        const uint32_t pos = warp_pos + lane;
+        const ReorderRun r = reorder_run(pos, nx, ny, nz, block_z);
+        const uint32_t i = pos - chunk_base;
+        const uint32_t shape = static_cast<uint32_t>(r.bdx != 16U) |
+            (static_cast<uint32_t>(r.bdy != 16U) << 1U) |
+            (static_cast<uint32_t>(r.bdz != block_z) << 2U);
+        if (shape == 0U && r.rank <= i && 256U * block_z - r.rank <= elements - i)
+            return r.origin + (r.rank & 15U) +
+                static_cast<size_t>((r.rank >> 4U) & 15U) * nx +
+                static_cast<size_t>(r.rank >> 8U) * nx * ny;
+        return r.origin + table[shape * 256U * block_z + r.rank];
+    }
+    return reordered_natural_index(warp_pos + lane, nx, ny, nz, block_z, table);
+}
+
 // Dynamic scheduling is essential because RZE work varies substantially across
 // a field. Compact the negative bits while raw magnitudes are already
 // in shared memory, so there is no second magnitude read or global sign scan.
@@ -225,7 +236,7 @@ __launch_bounds__(TPB, 2048 / TPB)
 void encode_kernel(const byte* __restrict__ input,
     uint32_t input_bytes, const uint32_t* __restrict__ sign_bitmap, byte* __restrict__ slots,
     byte* __restrict__ sign_slots, byte* __restrict__ meta,
-    byte* __restrict__ blob, unsigned int* __restrict__ group_done) {
+    byte* __restrict__ cmpdata, unsigned int* __restrict__ group_done) {
     const uint32_t chunks = input_bytes / CS + (input_bytes % CS != 0U);
     __shared__ __align__(16) long long storage[STORAGE_BYTES / sizeof(long long)];
     constexpr int counter_slot = STORAGE_BYTES / sizeof(long long) - 2 - WS;
@@ -369,7 +380,7 @@ void encode_kernel(const byte* __restrict__ input,
         if (pack_ready) {
             __shared__ uint32_t group_prefix[GROUP_CHUNKS + 1];
             __shared__ uint32_t group_offset;
-            auto* const group_offsets = reinterpret_cast<uint32_t*>(blob);
+            auto* const group_offsets = reinterpret_cast<uint32_t*>(cmpdata);
             byte* const metadata = meta;
             const size_t metadata_bytes = static_cast<size_t>(chunks) * 3u;
             byte* const payload = metadata + metadata_bytes;
@@ -432,9 +443,9 @@ void encode_kernel(const byte* __restrict__ input,
     }
 }
 
-template <bool WithSign, int DirectLayout = 0, typename DirectT = float>
+template <int DirectLayout = 0, typename DirectT = float>
 __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
-    const byte* __restrict__ blob,
+    const byte* __restrict__ cmpdata,
     uint32_t chunks,
     uint32_t groups,
     uint32_t output_bytes,
@@ -455,25 +466,20 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
     if (chunk >= chunks)
         return;
 
-    const auto* group_offsets = reinterpret_cast<const uint32_t*>(blob);
+    const auto* group_offsets = reinterpret_cast<const uint32_t*>(cmpdata);
     const byte* metadata = reinterpret_cast<const byte*>(group_offsets + groups);
-    const size_t metadata_bytes = static_cast<size_t>(chunks) * (WithSign ? 3u : sizeof(uint16_t));
+    const size_t metadata_bytes = static_cast<size_t>(chunks) * 3u;
     const byte* payload = metadata + metadata_bytes;
     const uint32_t group = chunk / GROUP_CHUNKS;
     const uint32_t local = chunk % GROUP_CHUNKS;
     const uint32_t base = chunk * CS;
     const uint32_t raw_bytes = min(static_cast<uint32_t>(CS), output_bytes - base);
 
-    const bool prefix_format = (group_offsets[group] & PREFIX_FORMAT_BIT) != 0u;
     uint32_t stored_bytes = 0, sign_bytes = 0;
-    bool prefixed = false;
-    if constexpr (WithSign) {
+    {
         const uint32_t m = load_meta24(metadata, chunk);
-        stored_bytes = decode_mag_bytes(m, raw_bytes, prefix_format);
-        prefixed = mag_is_prefixed(m, prefix_format);
+        stored_bytes = decode_mag_bytes(m, raw_bytes);
         sign_bytes = decode_sign_bytes(m);
-    } else {
-        stored_bytes = reinterpret_cast<const uint16_t*>(metadata)[chunk];
     }
 
     auto* const shared_begin = reinterpret_cast<uint32_t*>(storage);
@@ -486,13 +492,11 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
         const uint32_t group_count = min(GROUP_CHUNKS, chunks - first);
         uint32_t bytes = 0;
         if (lane < group_count) {
-            if constexpr (WithSign) {
+            {
                 const uint32_t prior_raw =
                     min(static_cast<uint32_t>(CS), output_bytes - (first + lane) * CS);
                 const uint32_t m = load_meta24(metadata, first + lane);
-                bytes = decode_mag_bytes(m, prior_raw, prefix_format) + decode_sign_bytes(m);
-            } else {
-                bytes = reinterpret_cast<const uint16_t*>(metadata)[first + lane];
+                bytes = decode_mag_bytes(m, prior_raw) + decode_sign_bytes(m);
             }
         }
         uint32_t inclusive = bytes;
@@ -503,7 +507,7 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
                 inclusive += prior;
         }
         if (lane == local)
-            *shared_begin = (group_offsets[group] & ~PREFIX_FORMAT_BIT) + inclusive - bytes;
+            *shared_begin = group_offsets[group] + inclusive - bytes;
     }
     __syncthreads();
     const uint32_t chunk_begin = *shared_begin;
@@ -577,13 +581,19 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
                             direct_offset[rank]] = static_cast<DirectT>(0);
                     }
                 } else {
-                    for (uint32_t i = threadIdx.x; i < elements; i += blockDim.x)
-                        direct_coeff[reordered_natural_index(elem_base + i,
-                                                            direct_nx,
-                                                            direct_ny,
-                                                            direct_nz,
-                                                            direct_block_z,
-                                                            direct_offset)] = static_cast<DirectT>(0);
+                    auto* const runs = reinterpret_cast<ReorderWarp*>(expanded);
+                    build_reorder_warps<true>(runs, elem_base, elements,
+                        direct_nx, direct_ny, direct_nz, direct_block_z);
+                    const uint32_t lane = threadIdx.x & 31U;
+                    for (uint32_t warp_i = threadIdx.x & ~31U; warp_i < elements;
+                         warp_i += blockDim.x) {
+                        const uint32_t valid = min(32U, elements - warp_i);
+                        const size_t destination = reordered_warp_index<true>(
+                            runs[warp_i >> 5U], elem_base + warp_i,
+                            valid, direct_nx, direct_ny, direct_nz, direct_block_z, direct_offset,
+                            elem_base, elements);
+                        if (lane < valid) direct_coeff[destination] = static_cast<DirectT>(0);
+                    }
                 }
             }
         } else {
@@ -592,7 +602,7 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
                 destination64[i] = 0;
             for (uint32_t i = (raw_bytes & ~7u) + threadIdx.x; i < raw_bytes; i += blockDim.x)
                 output[base + i] = 0;
-            if constexpr (WithSign) {
+            {
                 const uint32_t words = (raw_bytes / 2u + 31u) / 32u;
                 const uint32_t word_base = base / 2u / 32u;
                 for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
@@ -606,84 +616,8 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
     for (uint32_t i = threadIdx.x; i < stored_bytes; i += blockDim.x)
         encoded[i] = source[i];
     __syncthreads();
-    byte* decoded = encoded;
-    if (prefixed) {
-        __shared__ uint32_t prefix_decoded_bytes;
-        const uint32_t wanted =
-            static_cast<uint32_t>(encoded[0]) | (static_cast<uint32_t>(encoded[1]) << 8u);
-        const uint32_t prefix_lanes = encoded[2];
-        if (threadIdx.x == 0)
-            prefix_decoded_bytes = wanted;
-        if (threadIdx.x < prefix_lanes) {
-            const uint32_t lane = threadIdx.x;
-            const uint32_t span = (wanted + prefix_lanes - 1u) / prefix_lanes;
-            const uint32_t begin = min(wanted, lane * span);
-            const uint32_t end = min(wanted, begin + span);
-            uint32_t lane_offset = 0;
-            for (uint32_t i = 0; i < lane; ++i)
-                lane_offset += encoded[3u + i];
-            const uint32_t lane_bytes = encoded[3u + lane];
-            const byte* lane_src = encoded + 3u + prefix_lanes + lane_offset;
-            uint64_t bitbuf = 0;
-            uint32_t nbits = 0, pos = 0;
-            uint32_t i = begin;
-            while (i < end) {
-                const uint32_t batch_count = min(4u, end - i);
-                // Refill once per four symbols instead of re-entering the
-                // byte-at-a-time refill loop for every symbol.  Thirty-six
-                // bits cover the worst case (four 9-bit literals); at the end
-                // of a byte-aligned lane the padding bits are harmless.
-                const uint32_t wanted_bits = batch_count * 9u;
-                while (nbits < wanted_bits && pos < lane_bytes) {
-                    bitbuf |= static_cast<uint64_t>(lane_src[pos++]) << nbits;
-                    nbits += 8u;
-                }
-#pragma unroll
-                for (uint32_t batch = 0; batch < 4u; ++batch) {
-                    if (batch < batch_count) {
-                        if ((bitbuf & 1u) != 0u) {
-                            expanded[i] = static_cast<byte>((bitbuf >> 1u) & 0xffu);
-                            bitbuf >>= 9u;
-                            nbits -= 9u;
-                        } else {
-                            constexpr byte dict[16] = {0x00,
-                                                       0x40,
-                                                       0x02,
-                                                       0x80,
-                                                       0x01,
-                                                       0x10,
-                                                       0x08,
-                                                       0x20,
-                                                       0x04,
-                                                       0xc0,
-                                                       0xff,
-                                                       0x03,
-                                                       0x30,
-                                                       0x0c,
-                                                       0x05,
-                                                       0xa0};
-                            expanded[i] = dict[(bitbuf >> 1u) & 0xfu];
-                            bitbuf >>= 5u;
-                            nbits -= 5u;
-                        }
-                        ++i;
-                    }
-                }
-            }
-        }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            expanded[wanted] = static_cast<byte>(raw_bytes);
-            expanded[wanted + 1u] = static_cast<byte>(raw_bytes >> 8u);
-        }
-        __syncthreads();
-        int compressed_bytes = static_cast<int>(prefix_decoded_bytes + 2u);
-        d_iRZE_1(compressed_bytes, expanded, encoded, temp);
-        __syncthreads();
-        d_iBIT_2(compressed_bytes, encoded, expanded, temp);
-        __syncthreads();
-        decoded = expanded;
-    } else if (stored_bytes < raw_bytes) {
+    const byte* const decoded = encoded;
+    if (stored_bytes < raw_bytes) {
         if (threadIdx.x == 0) {
             encoded[stored_bytes] = static_cast<byte>(raw_bytes);
             encoded[stored_bytes + 1u] = static_cast<byte>(raw_bytes >> 8u);
@@ -705,7 +639,7 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
             output[base + i] = decoded[i];
     }
 
-    if constexpr (WithSign) {
+    {
         __syncthreads();
         // Each thread owns one contiguous 16-element half-word.  Compute one
         // block-wide nonzero prefix, consume the compact sign stream locally,
@@ -848,44 +782,29 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
                         direct_coeff[origin + direct_offset[rank]] = negative ? -value : value;
                     }
                 } else {
-                    const uint32_t valid =
-                        start < elements ? min(ITEMS_PER_THREAD, elements - start) : 0U;
-                    ReorderRun run{};
-                    bool one_brick = false;
-                    if (valid != 0U) {
-                        run = reorder_run(
-                            elem_base + start, direct_nx, direct_ny, direct_nz, direct_block_z);
-                        one_brick = run.rank + valid <= run.bdx * run.bdy * run.bdz;
-                    }
-#pragma unroll
-                    for (uint32_t j = 0; j < ITEMS_PER_THREAD; ++j) {
-                        const uint32_t i = start + j;
-                        if (i < elements) {
+                    // Unpack signs locally, then redistribute stores so adjacent
+                    // lanes own adjacent ranks, for regular and short edge bricks.
+                    auto* const negative_words = reinterpret_cast<uint16_t*>(temp);
+                    __syncthreads();
+                    negative_words[threadIdx.x] = static_cast<uint16_t>(negative_half);
+                    // build_reorder_warps also publishes the sign words: its
+                    // barrier covers both independent shared-memory writes.
+                    const uint32_t lane = threadIdx.x & 31U;
+                    auto* const runs = reinterpret_cast<ReorderWarp*>(expanded);
+                    build_reorder_warps(runs, elem_base, elements,
+                        direct_nx, direct_ny, direct_nz, direct_block_z);
+                    for (uint32_t warp_i = threadIdx.x & ~31U; warp_i < elements;
+                         warp_i += blockDim.x) {
+                        const uint32_t valid = min(32U, elements - warp_i);
+                        const size_t destination = reordered_warp_index(
+                            runs[warp_i >> 5U], elem_base + warp_i,
+                            valid, direct_nx, direct_ny, direct_nz, direct_block_z, direct_offset);
+                        if (lane < valid) {
+                            const uint32_t i = warp_i + lane;
+                            const uint32_t sign_word = negative_words[i >> 4U];
                             const DirectT value = static_cast<DirectT>(mag[i]) * direct_q;
-                            size_t destination;
-                            if (one_brick) {
-                                if (run.full) {
-                                    destination = run.origin + direct_offset[run.rank + j];
-                                } else {
-                                    const uint32_t local = zorder_unrank_local(
-                                        run.rank + j, run.bdx, run.bdy, run.bdz);
-                                    const uint32_t lx = local % run.bdx;
-                                    const uint32_t ly = (local / run.bdx) % run.bdy;
-                                    const uint32_t lz = local / (run.bdx * run.bdy);
-                                    destination =
-                                        run.origin + lx + static_cast<size_t>(ly) * direct_nx +
-                                        static_cast<size_t>(lz) * direct_nx * direct_ny;
-                                }
-                            } else {
-                                destination = reordered_natural_index(elem_base + i,
-                                                                      direct_nx,
-                                                                      direct_ny,
-                                                                      direct_nz,
-                                                                      direct_block_z,
-                                                                      direct_offset);
-                            }
                             direct_coeff[destination] =
-                                ((negative_half >> j) & 1U) ? -value : value;
+                                ((sign_word >> (i & 15U)) & 1U) ? -value : value;
                         }
                     }
                 }
@@ -907,7 +826,7 @@ void release() {
         cudaSetDevice(WZPConfig::device);
         cudaFree(WZPConfig::slots);
         cudaFree(WZPConfig::sign_slots);
-        cudaFree(WZPConfig::blob);
+        cudaFree(WZPConfig::cmpdata);
         cudaFree(WZPConfig::group_done);
         if (WZPConfig::timing_begin)
             cudaEventDestroy(WZPConfig::timing_begin);
@@ -919,7 +838,7 @@ void release() {
         cudaFreeHost(WZPConfig::host_results);
     WZPConfig::device = -1;
     WZPConfig::capacity_n = 0;
-    WZPConfig::slots = WZPConfig::sign_slots = WZPConfig::blob = nullptr;
+    WZPConfig::slots = WZPConfig::sign_slots = WZPConfig::cmpdata = nullptr;
     WZPConfig::blob_capacity = 0;
     WZPConfig::group_done = nullptr;
     WZPConfig::host_results = nullptr;
@@ -943,7 +862,7 @@ void reserve(uint32_t n, cudaStream_t stream) {
     WZPConfig::blob_capacity = static_cast<size_t>(groups) * sizeof(uint32_t) +
                       static_cast<size_t>(chunks) * 3u + input_bytes +
                       (static_cast<size_t>(n) + 7u) / 8u;
-    cudaMalloc(&WZPConfig::blob, WZPConfig::blob_capacity);
+    cudaMalloc(&WZPConfig::cmpdata, WZPConfig::blob_capacity);
     cudaMalloc(&WZPConfig::group_done, static_cast<size_t>(groups) * sizeof(uint32_t));
     cudaMallocHost(&WZPConfig::host_results, 2 * sizeof(uint32_t));
     cudaEventCreate(&WZPConfig::timing_begin);
@@ -954,8 +873,7 @@ void reserve(uint32_t n, cudaStream_t stream) {
     cudaStreamSynchronize(stream);
 }
 
-template <bool WithSign>
-void decode_impl(const void* blob,
+void decode_impl(const void* cmpdata,
                  uint32_t n,
                  uint16_t* output,
                  uint32_t* sign_bitmap,
@@ -965,24 +883,24 @@ void decode_impl(const void* blob,
     const uint32_t output_bytes = n * sizeof(uint16_t);
     const uint32_t chunks = (output_bytes + CS - 1u) / CS;
     const uint32_t groups = (chunks + GROUP_CHUNKS - 1u) / GROUP_CHUNKS;
-    check(cudaEventRecord(WZPConfig::timing_begin, stream), "record decode begin");
-    decode_kernel<WithSign><<<chunks, TPB, 0, stream>>>(static_cast<const byte*>(blob),
+    cudaEventRecord(WZPConfig::timing_begin, stream);
+    decode_kernel<><<<chunks, TPB, 0, stream>>>(static_cast<const byte*>(cmpdata),
                                                         chunks,
                                                         groups,
                                                         output_bytes,
                                                         reinterpret_cast<byte*>(output),
                                                         sign_bitmap);
-    check(cudaEventRecord(WZPConfig::timing_end, stream), "record decode end");
-    check(cudaEventSynchronize(WZPConfig::timing_end), "wait decode");
+    cudaEventRecord(WZPConfig::timing_end, stream);
+    cudaEventSynchronize(WZPConfig::timing_end);
     float elapsed = 0;
-    check(cudaEventElapsedTime(&elapsed, WZPConfig::timing_begin, WZPConfig::timing_end), "measure decode");
+    cudaEventElapsedTime(&elapsed, WZPConfig::timing_begin, WZPConfig::timing_end);
     if (ms)
         *ms = elapsed;
-    check(cudaGetLastError(), "decode kernel");
+    cudaGetLastError();
 }
 
 template <typename DirectT>
-void decode_reordered_impl(const void* blob,
+void decode_reordered_impl(const void* cmpdata,
                            uint32_t n,
                            DirectT* output,
                            const uint32_t* offset_table,
@@ -995,14 +913,14 @@ void decode_reordered_impl(const void* blob,
     const uint32_t output_bytes = n * sizeof(uint16_t);
     const uint32_t chunks = (output_bytes + CS - 1u) / CS;
     const uint32_t groups = (chunks + GROUP_CHUNKS - 1u) / GROUP_CHUNKS;
-    check(cudaEventRecord(WZPConfig::timing_begin, stream), "record fused reordered decode begin");
+    cudaEventRecord(WZPConfig::timing_begin, stream);
     const bool aligned_bz2 = block_z == 2U && dims.x % 16U == 0U && dims.y % 16U == 0U &&
                              dims.z % 2U == 0U;
     const bool full_layout = dims.x % 16U == 0U && dims.y % 16U == 0U &&
                              dims.z % block_z == 0U;
     const bool natural_store = full_layout && block_z == 16U;
     if (aligned_bz2)
-        decode_kernel<true, 2, DirectT><<<chunks, TPB, 0, stream>>>(static_cast<const byte*>(blob),
+        decode_kernel<2, DirectT><<<chunks, TPB, 0, stream>>>(static_cast<const byte*>(cmpdata),
                                                            chunks,
                                                            groups,
                                                            output_bytes,
@@ -1019,25 +937,24 @@ void decode_reordered_impl(const void* blob,
         bool launched = false;
         if constexpr (std::is_same_v<DirectT, float>) {
             if (natural_store) {
-                decode_kernel<true, 3, DirectT><<<chunks, TPB, 0, stream>>>(
-                    static_cast<const byte*>(blob), chunks, groups, output_bytes, nullptr, nullptr,
+                decode_kernel<3, DirectT><<<chunks, TPB, 0, stream>>>(
+                    static_cast<const byte*>(cmpdata), chunks, groups, output_bytes, nullptr, nullptr,
                     output, offset_table, q, dims.x, dims.y, dims.z, block_z);
                 launched = true;
             }
         }
         if (!launched)
-            decode_kernel<true, 1, DirectT><<<chunks, TPB, 0, stream>>>(
-                static_cast<const byte*>(blob), chunks, groups, output_bytes, nullptr, nullptr,
+            decode_kernel<1, DirectT><<<chunks, TPB, 0, stream>>>(
+                static_cast<const byte*>(cmpdata), chunks, groups, output_bytes, nullptr, nullptr,
                 output, offset_table, q, dims.x, dims.y, dims.z, block_z);
     }
-    check(cudaEventRecord(WZPConfig::timing_end, stream), "record fused reordered decode end");
-    check(cudaEventSynchronize(WZPConfig::timing_end), "wait fused reordered decode");
+    cudaEventRecord(WZPConfig::timing_end, stream);
+    cudaEventSynchronize(WZPConfig::timing_end);
     float elapsed = 0;
-    check(cudaEventElapsedTime(&elapsed, WZPConfig::timing_begin, WZPConfig::timing_end),
-          "measure fused reordered decode");
+    cudaEventElapsedTime(&elapsed, WZPConfig::timing_begin, WZPConfig::timing_end);
     if (ms)
         *ms = elapsed;
-    check(cudaGetLastError(), "fused reordered decode kernel");
+    cudaGetLastError();
 }
 
 } // namespace
@@ -1059,11 +976,11 @@ size_t wzp_encode_with_sign(const uint16_t* input,
                             uint32_t* nnz,
                             double* ms,
                             cudaStream_t stream) {
-    wzp_encode_with_sign_launch(input, sign_bitmap, n, stream);
+    wzp_encode(input, sign_bitmap, n, stream);
     return wzp_encode_with_sign_finish(nnz, ms);
 }
 
-void wzp_encode_with_sign_launch(const uint16_t* input, const uint32_t* sign_bitmap,
+void wzp_encode(const uint16_t* input, const uint32_t* sign_bitmap,
                                  uint32_t n, cudaStream_t stream) {
     reserve(n, stream);
     const uint32_t input_bytes = n * sizeof(uint16_t);
@@ -1072,10 +989,10 @@ void wzp_encode_with_sign_launch(const uint16_t* input, const uint32_t* sign_bit
     const size_t metadata_offset = static_cast<size_t>(groups) * sizeof(uint32_t);
     WZPConfig::signed_payload_offset = metadata_offset + static_cast<size_t>(chunks) * 3u;
     const byte* const raw = reinterpret_cast<const byte*>(input);
-    byte* const metadata = WZPConfig::blob + metadata_offset;
+    byte* const metadata = WZPConfig::cmpdata + metadata_offset;
     cudaEventRecord(WZPConfig::timing_begin, stream);
     encode_kernel<<<512, TPB, 0, stream>>>(raw, input_bytes, sign_bitmap,
-        WZPConfig::slots, WZPConfig::sign_slots, metadata, WZPConfig::blob, WZPConfig::group_done);
+        WZPConfig::slots, WZPConfig::sign_slots, metadata, WZPConfig::cmpdata, WZPConfig::group_done);
 
     cudaMemcpyFromSymbolAsync(WZPConfig::host_results, payload_counter, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream);
     cudaMemcpyFromSymbolAsync(WZPConfig::host_results + 1, nnz_counter, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream);
@@ -1085,9 +1002,9 @@ void wzp_encode_with_sign_launch(const uint16_t* input, const uint32_t* sign_bit
 }
 
 size_t wzp_encode_with_sign_finish(uint32_t* nnz, double* ms) {
-    check(cudaEventSynchronize(WZPConfig::timing_end), "wait signed encode");
+    cudaEventSynchronize(WZPConfig::timing_end);
     float elapsed = 0;
-    check(cudaEventElapsedTime(&elapsed, WZPConfig::timing_begin, WZPConfig::timing_end), "measure signed encode");
+    cudaEventElapsedTime(&elapsed, WZPConfig::timing_begin, WZPConfig::timing_end);
     if (ms)
         *ms = elapsed;
     if (nnz)
@@ -1096,23 +1013,19 @@ size_t wzp_encode_with_sign_finish(uint32_t* nnz, double* ms) {
 }
 
 const void* wzp_encoded_buf() {
-    return WZPConfig::blob;
+    return WZPConfig::cmpdata;
 }
 
-void wzp_decode(const void* blob, uint32_t n, uint16_t* output, double* ms, cudaStream_t stream) {
-    decode_impl<false>(blob, n, output, nullptr, ms, stream);
-}
-
-void wzp_decode_with_sign(const void* blob,
+void wzp_decode_with_sign(const void* cmpdata,
                           uint32_t n,
                           uint16_t* output,
                           uint32_t* sign_bitmap,
                           double* ms,
                           cudaStream_t stream) {
-    decode_impl<true>(blob, n, output, sign_bitmap, ms, stream);
+    decode_impl(cmpdata, n, output, sign_bitmap, ms, stream);
 }
 
-void wzp_decode_reordered_float(const void* blob,
+void wzp_decode_reordered_float(const void* cmpdata,
                                 uint32_t n,
                                 float* output,
                                 const uint32_t* offset_table,
@@ -1121,10 +1034,10 @@ void wzp_decode_reordered_float(const void* blob,
                                 uint32_t block_z,
                                 double* ms,
                                 cudaStream_t stream) {
-    decode_reordered_impl(blob, n, output, offset_table, q, dims, block_z, ms, stream);
+    decode_reordered_impl(cmpdata, n, output, offset_table, q, dims, block_z, ms, stream);
 }
 
-void wzp_decode_reordered_double(const void* blob,
+void wzp_decode_reordered_double(const void* cmpdata,
                                  uint32_t n,
                                  double* output,
                                  const uint32_t* offset_table,
@@ -1133,7 +1046,7 @@ void wzp_decode_reordered_double(const void* blob,
                                  uint32_t block_z,
                                  double* ms,
                                  cudaStream_t stream) {
-    decode_reordered_impl(blob, n, output, offset_table, q, dims, block_z, ms, stream);
+    decode_reordered_impl(cmpdata, n, output, offset_table, q, dims, block_z, ms, stream);
 }
 
 } // namespace WALTZ::lossless

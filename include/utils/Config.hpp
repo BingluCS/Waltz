@@ -58,17 +58,14 @@ struct GPUConfig {
 inline const GPUConfig& gpu_config() {
     static const GPUConfig config = [] {
         GPUConfig value;
-        check_cuda(cudaGetDevice(&value.device), "query current CUDA device");
-        check_cuda(cudaGetDeviceProperties(&value.properties, value.device),
-                   "query CUDA device properties");
+        cudaGetDevice(&value.device);
+        cudaGetDeviceProperties(&value.properties, value.device);
         return value;
     }();
     return config;
 }
 
 template <typename T> struct DWTConfig {
-    static inline int x_blocks = 0;
-    static inline int y_blocks = 0;
     static inline int z_blocks = 0;
 };
 
@@ -78,7 +75,7 @@ struct WZPConfig {
     static inline uint32_t capacity_n = 0;
     static inline unsigned char* slots = nullptr;
     static inline unsigned char* sign_slots = nullptr;
-    static inline unsigned char* blob = nullptr;
+    static inline unsigned char* cmpdata = nullptr;
     static inline uint32_t* group_done = nullptr;
     static inline size_t blob_capacity = 0;
     static inline uint32_t* host_results = nullptr;

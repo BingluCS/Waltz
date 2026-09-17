@@ -1,82 +1,89 @@
-#include "utils/Statistics.hpp"
+#include "utils/Blob.hpp"
 #include "waltz.hpp"
 
 #include <cstdlib>
-#include <cuda_runtime.h>
+#include <cstring>
 #include <fstream>
+#include <memory>
 #include <vector>
+#include <cuda_runtime.h>
 
-inline void usage(FILE* out) {
-    std::fprintf(out,
-                 "Usage:\n"
-                 "  waltz -f|-d -i INPUT -z ARCHIVE [-o RECONSTRUCTED] "
-                 "-3 NX NY NZ -M ABS|REL ERROR\n\n"
-                 "Options:\n"
-                 "  -f              input is float32\n"
-                 "  -d              input is float64\n"
-                 "  -i PATH         raw input field\n"
-                 "  -z PATH         write the compressed Waltz blob\n"
-                 "  -o PATH         also decompress, verify, and write reconstruction\n"
-                 "  -3 NX NY NZ     dimensions in X, Y, Z order\n"
-                 "  -M ABS VALUE    absolute point-wise error bound\n"
-                 "  -M REL VALUE    value-range-relative point-wise error bound\n"
-                 "  -h              show this help\n");
+[[noreturn]] inline void usage(int status = EXIT_FAILURE) {
+    std::printf("Usage:\n"
+                "  Compress:   waltz [-f|-d] -i input -z compressed -3 nx ny nz -M REL|ABS bound [-o output]\n"
+                "  Decompress: waltz [-f|-d] -z compressed -o output -3 nx ny nz\n"
+                "              (-i compressed -o output also works without -M)\n"
+                "  -f: float (default), -d: double; supply the original dimensions for decompression.\n");
+    std::exit(status);
+}
+
+template <typename T>
+void write_output(const char* path, const T* data, size_t count) {
+    std::ofstream file(path, std::ios::binary);
+    if (!file.write(reinterpret_cast<const char*>(data), count * sizeof(T)))
+        throw std::runtime_error(std::string("Cannot write output: ") + path);
 }
 
 template <class T>
-void compress(char* inPath, char* cmpPath, char* decPath, WALTZ::Config conf) {
-    T* oridata = WALTZ::readfile<T>(inPath, conf.num);
+void Waltz_compress(const char* inPath, const char* cmpPath, WALTZ::Config conf) {
+    std::unique_ptr<T[]> oridata(WALTZ::readfile<T>(inPath, conf.num));
 
     T* d_oridata;
     char* d_cmpdata;
-    WALTZ::check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_oridata), conf.num * sizeof(T)),
-                      "cudaMalloc input");
-    WALTZ::check_cuda(
-        cudaMemcpy(d_oridata, oridata, conf.num * sizeof(T), cudaMemcpyHostToDevice),
-        "copy input H2D");
+    cudaMalloc(reinterpret_cast<void**>(&d_oridata), conf.num * sizeof(T));
+    cudaMemcpy(d_oridata, oridata.get(), conf.num * sizeof(T), cudaMemcpyHostToDevice);
     const size_t cmp_capacity = WALTZ::compressed_buffer_capacity<T>(conf.num);
-    WALTZ::check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_cmpdata), cmp_capacity),
-                      "cudaMalloc compressed output");
+    cudaMalloc(reinterpret_cast<void**>(&d_cmpdata), cmp_capacity);
     cudaStream_t stream;
-    WALTZ::check_cuda(cudaStreamCreate(&stream), "cudaStreamCreate");
+    cudaStreamCreate(&stream);
     size_t outSize = WALTZ::d_compress<T>(conf, d_oridata, d_cmpdata, cmpPath, stream);
 
     if (outSize > 0) {
-        std::vector<unsigned char> blob(outSize);
-        WALTZ::check_cuda(cudaMemcpy(blob.data(), d_cmpdata, outSize, cudaMemcpyDeviceToHost),
-                          "copy compressed blob D2H");
-        std::ofstream output(cmpPath, std::ios::binary);
-        if (!output)
-            throw std::runtime_error(std::string("cannot open compressed output: ") + cmpPath);
-        output.write(reinterpret_cast<const char*>(blob.data()),
-                     static_cast<std::streamsize>(blob.size()));
-        if (!output)
-            throw std::runtime_error(std::string("cannot write compressed output: ") + cmpPath);
+        std::unique_ptr<char[]> h_cmpdata(new char[outSize]);
+        cudaMemcpy(h_cmpdata.get(), d_cmpdata, outSize, cudaMemcpyDeviceToHost);
+        write_output(cmpPath, h_cmpdata.get(), outSize);
     }
-
-    // ---- decompress the just-produced blob and verify the point-wise bound ----
-    if (outSize > 0 && decPath != nullptr) {
-        T* d_decdata = nullptr;
-        cudaMalloc(reinterpret_cast<void**>(&d_decdata), conf.num * sizeof(T));
-        size_t decSize = WALTZ::d_decompress<T>(conf, d_cmpdata, d_decdata, decPath, stream);
-        (void)decSize;
-        T* dec = new T[conf.num];
-        cudaMemcpy(dec, d_decdata, conf.num * sizeof(T), cudaMemcpyDeviceToHost);
-        printf("[WALTZ] DECOMPRESS verify: blob %zu B (CR=%.2fx), decompressed vs original:\n",
-               outSize,
-               conf.num * 1.0 * sizeof(T) / outSize);
-        statistic<T>(oridata, dec, conf.num);
-        delete[] dec;
-        cudaFree(d_decdata);
-    }
-
-    WALTZ::check_cuda(cudaStreamDestroy(stream), "cudaStreamDestroy");
-    WALTZ::check_cuda(cudaFree(d_cmpdata), "cudaFree compressed output");
-    WALTZ::check_cuda(cudaFree(d_oridata), "cudaFree input");
-    delete[] oridata;
+    cudaFree(d_cmpdata);
+    cudaFree(d_oridata);
+    cudaStreamDestroy(stream);
 }
 
-int main(int argc, char* argv[]) {
+template <class T>
+void Waltz_decompress(const char* cmpPath, const char* decPath, const WALTZ::Config& conf,
+                      const char* originalPath = nullptr) {
+    std::ifstream file(cmpPath, std::ios::binary | std::ios::ate);
+    if (!file || file.tellg() < static_cast<std::streamoff>(sizeof(WALTZ::WaltzBlobHeader)))
+        throw std::runtime_error("Cannot read compressed file or header is incomplete");
+    const size_t cmp_size = static_cast<size_t>(file.tellg());
+    std::unique_ptr<char[]> h_cmpdata(new char[cmp_size]);
+    file.seekg(0);
+    if (!file.read(h_cmpdata.get(), cmp_size))
+        throw std::runtime_error("Cannot read compressed file");
+
+    char* d_cmpdata = nullptr;
+    T* d_decdata = nullptr;
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    cudaMalloc(reinterpret_cast<void**>(&d_cmpdata), cmp_size);
+    cudaMalloc(reinterpret_cast<void**>(&d_decdata), conf.num * sizeof(T));
+    cudaMemcpyAsync(d_cmpdata, h_cmpdata.get(), cmp_size, cudaMemcpyHostToDevice, stream);
+    const size_t bytes = WALTZ::d_decompress<T>(conf, d_cmpdata, d_decdata, nullptr, stream);
+    if (bytes != conf.num * sizeof(T))
+        throw std::runtime_error("Unexpected decompressed size");
+    std::vector<T> output(conf.num);
+    cudaMemcpy(output.data(), d_decdata, bytes, cudaMemcpyDeviceToHost);
+    write_output(decPath, output.data(), output.size());
+    cudaFree(d_decdata);
+    cudaFree(d_cmpdata);
+    cudaStreamDestroy(stream);
+    // Optional host-side verification, outside the kernel and API e2e timers.
+    if (originalPath != nullptr) {
+        std::unique_ptr<T[]> original(WALTZ::readfile<T>(originalPath, conf.num));
+        statistic<T>(original.get(), output.data(), conf.num);
+    }
+}
+
+int main(int argc, char* argv[]) try {
     bool compression = false;
     bool decompression = false;
 
@@ -95,22 +102,19 @@ int main(int argc, char* argv[]) {
     size_t r1 = 0;
 
     int i = 0;
-    if (argc == 1) {
-        usage(stderr);
-        return 2;
-    }
+    if (argc == 1)
+        usage();
     int width = -1;
 
     for (i = 1; i < argc; i++) {
-        if (argv[i][0] != '-' || argv[i][2]) {
-            usage(stderr);
-            return 2;
+        if (std::strlen(argv[i]) != 2 || argv[i][0] != '-') {
+            usage();
         }
 
         switch (argv[i][1]) {
         case 'h':
-            usage(stdout);
-            return 0;
+            usage(EXIT_SUCCESS);
+            break;
         case 'z':
             compression = true;
             if (i + 1 < argc) {
@@ -139,94 +143,82 @@ int main(int argc, char* argv[]) {
             break;
         case 'I':
             if (++i == argc || sscanf(argv[i], "%d", &width) != 1) {
-                usage(stderr);
-                return 2;
+                usage();
             }
             if (width == 32) {
                 dataType = WALTZ_INT32;
             } else if (width == 64) {
                 dataType = WALTZ_INT64;
             } else {
-                usage(stderr);
-                return 2;
+                usage();
             }
             break;
         case 'i':
-            if (++i == argc) {
-                usage(stderr);
-                return 2;
-            }
+            if (++i == argc)
+                usage();
             inPath = argv[i];
             break;
         case '1':
-            if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1) {
-                usage(stderr);
-                return 2;
-            }
+            if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1)
+                usage();
             break;
         case '2':
             if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 || ++i == argc ||
-                sscanf(argv[i], "%zu", &r2) != 1) {
-                usage(stderr);
-                return 2;
-            }
+                sscanf(argv[i], "%zu", &r2) != 1)
+                usage();
             break;
         case '3':
             if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 || ++i == argc ||
-                sscanf(argv[i], "%zu", &r2) != 1 || ++i == argc ||
-                sscanf(argv[i], "%zu", &r3) != 1) {
-                usage(stderr);
-                return 2;
-            }
+                sscanf(argv[i], "%zu", &r2) != 1 || ++i == argc || sscanf(argv[i], "%zu", &r3) != 1)
+                usage();
             break;
         case '4':
             if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 || ++i == argc ||
                 sscanf(argv[i], "%zu", &r2) != 1 || ++i == argc ||
-                sscanf(argv[i], "%zu", &r3) != 1 || ++i == argc ||
-                sscanf(argv[i], "%zu", &r4) != 1) {
-                usage(stderr);
-                return 2;
-            }
+                sscanf(argv[i], "%zu", &r3) != 1 || ++i == argc || sscanf(argv[i], "%zu", &r4) != 1)
+                usage();
             break;
         case 'M':
-            if (++i == argc) {
-                usage(stderr);
-                return 2;
-            }
+            if (++i == argc)
+                usage();
             errBoundMode = argv[i];
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 errBound = argv[++i];
             }
             break;
         default:
-            usage(stderr);
-            return 2;
+            usage();
+            break;
         }
     }
 
     if ((inPath == nullptr) && (cmpPath == nullptr)) {
         printf("Error: you need to specify either a raw binary data file or a compressed data file "
                "as input\n");
-        usage(stderr);
-        return 2;
+        usage();
+        exit(0);
     }
 
     char cmpPathTmp[1024];
-    if (inPath != nullptr && cmpPath == nullptr && decPath != nullptr) {
+    if (inPath != nullptr && cmpPath == nullptr && decPath != nullptr && errBoundMode != nullptr) {
         compression = true;
         decompression = true;
-        snprintf(cmpPathTmp, 1024, "%s.sz.tmp", inPath);
+        snprintf(cmpPathTmp, 1024, "%s.waltz.tmp", inPath);
         cmpPath = cmpPathTmp;
     }
     if (inPath == nullptr || errBoundMode == nullptr) {
         compression = false;
     }
-    if (!compression || inPath == nullptr || cmpPath == nullptr ||
-        (decompression && decPath == nullptr) || r1 == 0 || r2 == 0 || r3 == 0 || r4 != 0 ||
-        errBound == nullptr) {
-        usage(stderr);
-        return 2;
+    if (!compression && !decompression) {
+        usage();
+        exit(0);
     }
+    if (decompression && decPath == nullptr)
+        usage();
+    if (compression && cmpPath == nullptr)
+        usage();
+    if (!compression && cmpPath == nullptr)
+        cmpPath = inPath;
 
     WALTZ::Config conf;
     if (r2 == 0) {
@@ -238,6 +230,9 @@ int main(int argc, char* argv[]) {
     } else {
         conf = WALTZ::Config(r1, r2, r3, r4);
     }
+
+    if (conf.ndims != 3)
+        throw std::invalid_argument("Specify the original 3D dimensions with -3 nx ny nz");
 
     if (errBoundMode != nullptr) {
 
@@ -256,22 +251,35 @@ int main(int argc, char* argv[]) {
             }
         } else {
             printf("Error: wrong error bound mode setting by using the option '-M'\n");
-            usage(stderr);
-            return 2;
+            usage();
+            exit(0);
         }
     }
 
     if (compression) {
         if (dataType == WALTZ_FLOAT) {
-            compress<float>(inPath, cmpPath, decPath, conf);
+            Waltz_compress<float>(inPath, cmpPath, conf);
         } else if (dataType == WALTZ_DOUBLE) {
-            compress<double>(inPath, cmpPath, decPath, conf);
+            Waltz_compress<double>(inPath, cmpPath, conf);
         } else {
             printf("Error: data type not supported \n");
-            usage(stderr);
-            return 2;
+            usage();
+            exit(0);
+        }
+    }
+    if (decompression) {
+        if (dataType == WALTZ_FLOAT) {
+            Waltz_decompress<float>(cmpPath, decPath, conf, compression ? inPath : nullptr);
+        } else if (dataType == WALTZ_DOUBLE) {
+            Waltz_decompress<double>(cmpPath, decPath, conf, compression ? inPath : nullptr);
+        } else {
+            std::fprintf(stderr, "Error: data type not supported\n");
+            usage();
         }
     }
 
     return 0;
+} catch (const std::exception& error) {
+    std::fprintf(stderr, "Error: %s\n", error.what());
+    return EXIT_FAILURE;
 }

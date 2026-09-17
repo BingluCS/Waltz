@@ -49,7 +49,7 @@ int main(int argc, char**) {
                     uint32_t nnz = 0;
                     size_t bytes;
                     if (rep % 2 == 0) {
-                        WALTZ::lossless::wzp_encode_with_sign_launch(src, sign, n, stream);
+                        WALTZ::lossless::wzp_encode(src, sign, n, stream);
                         bytes = WALTZ::lossless::wzp_encode_with_sign_finish(&nnz, nullptr);
                     } else {
                         bytes = WALTZ::lossless::wzp_encode_with_sign(src, sign, n, &nnz, nullptr, stream);

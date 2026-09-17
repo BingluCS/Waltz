@@ -3,8 +3,8 @@
 #include "utils/Config.hpp"
 #include "utils/def.hpp"
 #include "utils/io.hpp"
+#include "utils/Statistics.hpp"
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -42,12 +42,6 @@ void d_extrema(T* d_data, uint64_t n, double& out_min, double& out_max, void* st
 template <typename T>
 void d_pipeline_prealloc(const WALTZ::Config& config, void* stream);
 
-// Standalone fast-tuner entry (validation harness; same code path as the
-// pipeline's tuner).  Returns 0 = dyadic, 1 = XY+Z.
-template <typename T>
-int d_autotune_fast(T* d_data, uint32_t dimx, uint32_t dimy, uint32_t dimz, double absBound, double relHint,
-    void* stream, double* out_ms);
-
 template <typename T, int NDIMS>
 size_t d_WALTZ_decompress(
     char* d_cmpData, T* d_decData, const WALTZ::Config& config, const char* decPath, void* stream);
@@ -68,64 +62,35 @@ size_t d_compress(
         const double range = dmax - dmin;
         conf.absErrorBound = conf.relErrorBound * range;
         conf.errorBoundMode = EB_ABS;
-        // std::printf( "[WALTZ] CAL_range: REL %.3e x range(min=%.6g max=%.6g range=%.6g) -> abs error %.6g\n", conf.relErrorBound,
-        //     dmin, dmax, range, conf.absErrorBound);
     }
 
-    const bool report_ce2e = std::getenv("WALTZ_REPORT_CE2E") != nullptr;
-    const auto ce2e_begin = std::chrono::steady_clock::now();
-    size_t cmpDataLen = 0;
-    if (conf.ndims == 1) {
-        // cmpDataLen = WALTZ_compress<T, 1>(conf, data, cmpDataPos, cmpDataCap);
-    } else if (conf.ndims == 2) {
-        // cmpDataLen = WALTZ_compress<T, 2>(conf, data, cmpDataPos, cmpDataCap);
-    } else if (conf.ndims == 3) {
-        cmpDataLen = d_WALTZ_compress<T, 3>(d_oridata, d_cmpData, conf, cmpPath, stream);
-    } else if (conf.ndims == 4) {
-        // cmpDataLen = WALTZ_compress<T, 4>(conf, data, cmpDataPos, cmpDataCap);
-    } else {
-        throw std::invalid_argument("Data dimension higher than 4 is not supported.");
-    }
-    if (report_ce2e) {
-        cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream));
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ce2e_begin).count();
-        const double gib = static_cast<double>(conf.num) * sizeof(T) / (1024.0 * 1024.0 * 1024.0);
-        std::printf("[WALTZ-CE2E] compress_ms=%.6f throughput_GBs=%.6f\n", ms, gib * 1000.0 / ms);
-    }
+    // Preserve the existing CE2E scope: compression starts after the REL scan.
+    const WaltzE2ETimer ce2e_timer;
+    if (conf.ndims != 3)
+        throw std::invalid_argument("compression currently only supports 3D data.");
+    const size_t cmpDataLen = d_WALTZ_compress<T, 3>(d_oridata, d_cmpData, conf, cmpPath, stream);
+    ce2e_timer.report("compress", static_cast<size_t>(conf.num) * sizeof(T), stream);
 
-    // auto cmpConfPos = reinterpret_cast<uchar *>(d_cmpData);
-
-    // auto confSize = conf.save(cmpConfPos);
-    // if (confSize > confEstSize) {
-    //     throw std::length_error("buffer allocated for config is not large enough.");
-    // }
-
-    // return confSize + cmpDataLen;
     return cmpDataLen;
 }
 
 // Decompress a blob produced by d_compress (device->device).  d_decData must hold
-// dimx*dimy*dimz elements of T.  Returns the decompressed byte count.
+// config.dimx*config.dimy*config.dimz elements of T. Config must contain the exact
+// original dimensions: the blob does not store dimensions or element count.
+// T must match the compression type; no data-type tag is stored in the blob.
+// Returns the decompressed byte count.
 template <typename T>
 size_t d_decompress(
     const WALTZ::Config& config, char* d_cmpData, T* d_decData, const char* decPath, void* stream) {
     Config conf(config);
-    const bool report_ce2e = std::getenv("WALTZ_REPORT_CE2E") != nullptr;
-    const auto ce2e_begin = std::chrono::steady_clock::now();
+    const WaltzE2ETimer ce2e_timer;
     size_t decLen = 0;
     if (conf.ndims == 3) {
         decLen = d_WALTZ_decompress<T, 3>(d_cmpData, d_decData, conf, decPath, stream);
     } else {
         throw std::invalid_argument("decompression currently only supports 3D data.");
     }
-    if (report_ce2e) {
-        cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream));
-        const double ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ce2e_begin)
-                .count();
-        const double gib = static_cast<double>(conf.num) * sizeof(T) / (1024.0 * 1024.0 * 1024.0);
-        std::printf("[WALTZ-CE2E] decompress_ms=%.6f throughput_GBs=%.6f\n", ms, gib * 1000.0 / ms);
-    }
+    ce2e_timer.report("decompress", static_cast<size_t>(conf.num) * sizeof(T), stream);
     return decLen;
 }
 

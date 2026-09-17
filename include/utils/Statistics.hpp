@@ -4,17 +4,18 @@
 
 #pragma once
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdio>
 #include <cstdint>
-#include <iostream>
+#include <cstdlib>
+#include <cuda_runtime.h>
 #include <limits>
 #include <stdexcept>
-#include <string>
 
 #ifdef __CUDACC__
-#include <cstddef>
-#include <cuda_runtime.h>
-
 namespace waltz {
 namespace detail {
 
@@ -114,124 +115,116 @@ inline void extrema_scan(const T* d_in, uint64_t len, T* result, cudaStream_t st
 } // namespace waltz
 #endif // __CUDACC__
 
-template <typename T> void statistic(T* ori_data, T* data, size_t num_elements) {
-    size_t i = 0;
-    double psnr, nrmse, max_err, range, l2_err = 0;
-    psnr = nrmse = max_err = range = 0;
-    double Max = ori_data[0];
-    double Min = ori_data[0];
-    // float Max = ori_data[0];
-    // float Min = ori_data[0];
-    // float psnr, nrmse, max_err, range, l2_err = 0;
-    // psnr = nrmse = max_err = range = 0;
-    // max_err = fabs(data[0] - ori_data[0]);
-    double diff_sum = 0;
-    double maxpw_relerr = 0;
-    double sum1 = 0, sum2 = 0;
-    for (i = 0; i < num_elements; i++) {
-        sum1 += ori_data[i];
-        sum2 += data[i];
+// Host-side reporting shared by the compression and decompression pipelines.
+namespace WALTZ {
+
+struct CompressionTimes {
+    double autotune, block_rank, dwt, quant, wzp, idwt, outlier;
+};
+
+struct DecompressionTimes {
+    double block_offset, wzp, unquant, idwt, outlier;
+};
+
+// Preserve the existing binary-byte throughput convention and zero-time output.
+inline double Waltz_throughput(size_t bytes, double ms) {
+    return ms > 0.0 ? static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0) / ms * 1000.0 : 0.0;
+}
+
+class WaltzE2ETimer {
+    const bool enabled = std::getenv("WALTZ_REPORT_CE2E") != nullptr;
+    const std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+
+  public:
+    void report(const char* operation, size_t bytes, void* stream) const {
+        if (!enabled)
+            return;
+        cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream));
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - begin).count();
+        std::printf("[WALTZ-CE2E] %s_ms=%.6f throughput_GBs=%.6f\n",
+                    operation, ms, Waltz_throughput(bytes, ms));
     }
-    double mean1 = sum1 / num_elements;
-    double mean2 = sum2 / num_elements;
+};
+
+inline void Waltz_print_stage(const char* name, size_t bytes, double ms,
+                             const char* note = "") {
+    std::printf("  %-12s %-12.6f %-10.4f%s\n", name, ms, Waltz_throughput(bytes, ms), note);
+}
+
+inline void Waltz_print_header(bool decompress = false) {
+    std::printf("\n  \033[1m%-12s %-12s %-20s\033[0m%s\n",
+                "type", "time (ms)", "throughput (GB/s)", decompress ? "  [decompress]" : "");
+}
+
+inline void Waltz_print_total(size_t bytes, double ms) {
+    std::printf("  \033[1m%-12s %-12.6f %-10.4f\033[0m\n\n",
+                "total", ms, Waltz_throughput(bytes, ms));
+}
+
+template <typename T>
+inline void Waltz_print_compression(size_t bytes, const CompressionTimes& t,
+                                   size_t mag_bytes, uint32_t pwe_count,
+                                   uint32_t qout_count, size_t blob_bytes) {
+    Waltz_print_header();
+    Waltz_print_stage("autotune", bytes, t.autotune);
+    Waltz_print_stage("block-rank", bytes, t.block_rank);
+    Waltz_print_stage("DWT", bytes, t.dwt);
+    Waltz_print_stage("quant", bytes, t.quant);
+    Waltz_print_stage("mag+sign-WZP", bytes, t.wzp, "   (sign fused in)");
+    Waltz_print_stage("IDWT", bytes, t.idwt);
+    Waltz_print_stage("outlier", bytes, t.outlier);
+    // WZP and reconstruction overlap; this is the existing stage total, not API e2e.
+    Waltz_print_total(bytes, t.autotune + t.block_rank + t.dwt + t.quant +
+                                std::max(t.wzp, t.idwt) + t.outlier);
+
+    const size_t index_bytes = static_cast<size_t>(pwe_count) * sizeof(uint32_t);
+    const size_t error_bytes = static_cast<size_t>(pwe_count) * sizeof(T);
+    const size_t out_bytes = index_bytes + error_bytes;
+    const size_t qout_bytes = static_cast<size_t>(qout_count) * (sizeof(uint32_t) + sizeof(int32_t));
+    const size_t stored_bytes = blob_bytes != 0U ? blob_bytes : mag_bytes + out_bytes + qout_bytes;
+    std::printf("  %-17s = %.5f\n", "Compression Ratio",
+                static_cast<double>(bytes) / static_cast<double>(stored_bytes));
+}
+
+inline void Waltz_print_decompression(size_t bytes, size_t blob_bytes, const DecompressionTimes& t) {
+    Waltz_print_header(true);
+    Waltz_print_stage("block-offset", bytes, t.block_offset);
+    Waltz_print_stage("WZP+sign", bytes, t.wzp, "   (sign fused in)");
+    Waltz_print_stage("unquant", bytes, t.unquant);
+    Waltz_print_stage("IDWT", bytes, t.idwt);
+    Waltz_print_stage("outlier-fix", bytes, t.outlier);
+    Waltz_print_total(bytes, t.block_offset + t.wzp + t.unquant + t.idwt + t.outlier);
+    std::printf("  %-17s = %.5f\n", "Compression Ratio",
+                static_cast<double>(bytes) / static_cast<double>(blob_bytes));
+}
+
+} // namespace WALTZ
+
+template <typename T> void statistic(const T* ori_data, const T* data, size_t num_elements) {
+    if (num_elements == 0)
+        throw std::invalid_argument("statistic requires at least one element");
+    double max_value = ori_data[0], min_value = ori_data[0];
+    double max_err = 0.0, l2_err = 0.0;
     size_t max_err_idx = 0;
-
-    double sum3 = 0, sum4 = 0;
-    double prodSum = 0, relerr = 0;
-    double* diff = (double*)malloc(num_elements * sizeof(double));
-
-    for (i = 0; i < num_elements; i++) {
-        diff[i] = data[i] - ori_data[i];
-        diff_sum += data[i] - ori_data[i];
-        if (Max < ori_data[i])
-            Max = ori_data[i];
-        if (Min > ori_data[i])
-            Min = ori_data[i];
-        double err = fabs(data[i] - ori_data[i]);
-        if (ori_data[i] != 0) {
-            relerr = err / fabs(ori_data[i]);
-            if (maxpw_relerr < relerr)
-                maxpw_relerr = relerr;
-        }
-
+    for (size_t i = 0; i < num_elements; ++i) {
+        if (max_value < ori_data[i])
+            max_value = ori_data[i];
+        if (min_value > ori_data[i])
+            min_value = ori_data[i];
+        // Preserve the previous T-precision subtraction and accumulation order.
+        const double err = std::fabs(data[i] - ori_data[i]);
         if (max_err < err) {
             max_err = err;
             max_err_idx = i;
         }
-        prodSum += (ori_data[i] - mean1) * (data[i] - mean2);
-        sum3 += (ori_data[i] - mean1) * (ori_data[i] - mean1);
-        sum4 += (data[i] - mean2) * (data[i] - mean2);
         l2_err += err * err;
     }
-    double std1 = sqrt(sum3 / num_elements);
-    double std2 = sqrt(sum4 / num_elements);
-    double ee = prodSum / num_elements;
-    double acEff = ee / std1 / std2;
-
-    double mse = l2_err / num_elements;
-    range = Max - Min;
-    psnr = 20 * log10(range) - 10 * log10(mse);
-    nrmse = sqrt(mse) / range;
-
-    // printf("[Verify]L2 error = %.10G\n", l2_err);
-    // printf("[Verify]Min=%.20G, Max=%.20G, range=%.20G\n", Min, Max, range);
-    printf("  Max_E  = %.15lf, idx = %d\n", max_err, (int)max_err_idx);
-    printf("  Max_RE = %G\n", max_err / (Max - Min));
-    //        printf("Max pw relative error = %.2G\n", maxpw_relerr);
-    printf("  PSNR = %.7lf, NRMSE = %.10G\n", psnr, nrmse);
-    //        printf("PSNR = %f, NRMSE= %.10G L2Error= %.10G\n", psnr, nrmse, l2_err);
-    //        printf("acEff=%f\n", acEff);
-    //        printf("errAutoCorr=%.10f\n", autocorrelation1DLag1<double>(diff, num_elements,
-    //        diff_sum / num_elements));
-    free(diff);
-}
-
-template <typename T, int decmp = 1, int progressive = 1>
-void print_result(size_t size,
-                  size_t total_compressed_size,
-                  double targeteb,
-                  double targetreb,
-                  double time_enum,
-                  double time_pred,
-                  double time_bitplane,
-                  double time_lossless) {
-    printf("\n  \e[1m%-12s %-12s %-20s\e[0m\n",    //
-           const_cast<char*>("type"),              //
-           const_cast<char*>("time (ms)"),         //
-           const_cast<char*>("throughtput (GB/s)") //
-    );
-    size_t total_bytes = size * sizeof(T);
-    auto th = [total_bytes](auto time) {
-        return 1.0 * total_bytes / 1024 / 1024 / 1024 / time * 1000;
-    };
-    if constexpr (decmp == 1) {
-        if constexpr (progressive == 1) {
-            printf("  %-12s %'-12f %'-10.4f\n", "loadStrategy", time_enum, th(time_enum));
-        }
-        printf("  %-12s %'-12f %'-10.4f\n", "ipredict", time_pred, th(time_pred));
-        printf("  %-12s %'-12f %'-10.4f\n", "ibitplane", time_bitplane, th(time_bitplane));
-        printf("  %-12s %'-12f %'-10.4f\n", "ilossless", time_lossless, th(time_lossless));
-        double total_time = time_pred + time_bitplane + time_lossless;
-        if constexpr (progressive == 1) {
-        }
-        total_time += time_enum;
-        printf("  \e[1m%-12s\e[0m %'-12f %'-10.4f\n\n", "itotal", total_time, th(total_time));
-        // printf("  target Error: %G\n", targeteb);
-        // printf("  target RError: %G\n",  targetreb);
-        // if constexpr (progressive == 0)
-        //     printf("--------------------------------------\n");
-    }
-    if constexpr (decmp == 0) {
-        printf("  %-12s %'-12f %'-10.4f\n", "predict", time_pred, th(time_pred));
-        printf("  %-12s %'-12f %'-10.4f\n", "bitplane", time_bitplane, th(time_bitplane));
-        printf("  %-12s %'-12f %'-10.4f\n", "lossless", time_lossless, th(time_lossless));
-        double total_time = time_lossless + time_bitplane + time_pred;
-        printf("  \e[1m%-12s\e[0m %'-12f %'-10.4f\n\n", "total", total_time, th(total_time));
-        double cr = 1.0 * total_bytes / total_compressed_size;
-        printf("  compression ratio: %lf\n", cr);
-        printf("--------------------------------------\n");
-    }
-    // printf("  target Error: %G\n", config->target_ebs[i] * input->range);
-    // printf("  target RError: %G\n",  config->target_ebs[i]);
-    //
+    const double mse = l2_err / num_elements;
+    const double range = max_value - min_value;
+    const double psnr = 20 * std::log10(range) - 10 * std::log10(mse);
+    const double nrmse = std::sqrt(mse) / range;
+    std::printf("  Max_E  = %.15lf, idx = %zu\n", max_err, max_err_idx);
+    std::printf("  Max_RE = %G\n", max_err / range);
+    std::printf("  PSNR = %.7lf, NRMSE = %.10G\n", psnr, nrmse);
 }

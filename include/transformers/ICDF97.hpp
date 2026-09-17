@@ -3,7 +3,7 @@
 // Multi-kernel GPU inverse CDF97 9/7 DWT -- the perfect-reconstruction inverse of the
 // forward CDF97::dwt3d, done with the POLYPHASE convolution synthesis (no upsample
 // zeros) so it is as cheap as the forward.  Operates entirely in NATURAL order (the
-// z-order permutation is only the LC magnitude's business; the inverse reads the
+// z-order permutation is only the WZP magnitude's business; the inverse reads the
 // dequantised coeffs and writes the reconstruction, both natural).
 //
 // Filter derivation.  The full synthesis filters are
@@ -36,31 +36,18 @@ inline constexpr size_t IDWT_YX_HALO_SHARED_BYTES =
     (static_cast<size_t>(CDF97::BX_128) + 8U) * sizeof(float);
 
 // even-output (low-phase) polyphase filter, symmetric: {IL0,IL1,IL2,IL3,IL2,IL1,IL0}
-#ifdef WALTZ_P4_TRANSFORM
-#define IL0 0.0
-#define IL1 0.0
-#define IL2 -0.24748737341529164
-#define IL3 0.70710678118654746
-#else
 #define IL0 -0.0238494650195568
 #define IL1 -0.0406894176097634
 #define IL2 0.3774028556128310
 #define IL3 0.7884856164052130
-#endif
+
 // odd-output (high-phase) polyphase filter, symmetric: {IH0,IH1,IH2,IH3,IH4,IH3,IH2,IH1,IH0}
-#ifdef WALTZ_P4_TRANSFORM
-#define IH0 0.016581654018824540
-#define IH1 -0.047376154339498683
-#define IH2 -0.12374368670764582
-#define IH3 0.40092954493277239
-#define IH4 1.1335628809201543
-#else
 #define IH0 -0.0378284555072640
 #define IH1 -0.0645388826292432
 #define IH2 0.1106244044184370
 #define IH3 0.4180922732229480
 #define IH4 -0.8526986790088940
-#endif
+
 
 namespace CDF97 {
 

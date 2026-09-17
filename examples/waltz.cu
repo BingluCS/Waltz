@@ -1,11 +1,11 @@
 #include "utils/Blob.hpp"
+#include "utils/io.hpp"
 #include "waltz.hpp"
 
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
-#include <vector>
 #include <cuda_runtime.h>
 
 [[noreturn]] inline void usage(int status = EXIT_FAILURE) {
@@ -13,15 +13,22 @@
                 "  Compress:   waltz [-f|-d] -i input -z compressed -3 nx ny nz -M REL|ABS bound [-o output]\n"
                 "  Decompress: waltz [-f|-d] -z compressed -o output -3 nx ny nz\n"
                 "              (-i compressed -o output also works without -M)\n"
-                "  -f: float (default), -d: double; supply the original dimensions for decompression.\n");
+                "\nOptions:\n"
+                "  -h                  Print this help and exit.\n"
+                "  -f / -d             float32 (default) / float64; -d selects the type, not decompression.\n"
+                "  -i input            Raw input when compressing; compressed input when decoding without -M.\n"
+                "  -z compressed       Compressed output when compressing; compressed input when decoding.\n"
+                "  -o output           Write reconstruction; with compression, also verify against the input.\n"
+                "  -3 nx ny nz         Original dimensions; required for both compression and decompression.\n"
+                "  -M REL|ABS bound    Compress with REL * (max - min), or an absolute error bound.\n"
+                "  Compressed files do not store dimensions or data type; supply the same values on decode.\n"
+                "\nTiming:\n"
+                "  WALTZ_WARMUP=1: run each requested API once before the measured call.\n"
+                "  WALTZ_REPORT_CE2E=1: print API wall time (excluding REL scan, file I/O and external transfers).\n"
+                "\nExamples:\n"
+                "  waltz -f -i field.f32 -z field.waltz -3 512 512 512 -M REL 1e-3\n"
+                "  waltz -f -z field.waltz -o field.out.f32 -3 512 512 512\n");
     std::exit(status);
-}
-
-template <typename T>
-void write_output(const char* path, const T* data, size_t count) {
-    std::ofstream file(path, std::ios::binary);
-    if (!file.write(reinterpret_cast<const char*>(data), count * sizeof(T)))
-        throw std::runtime_error(std::string("Cannot write output: ") + path);
 }
 
 template <class T>
@@ -36,12 +43,28 @@ void Waltz_compress(const char* inPath, const char* cmpPath, WALTZ::Config conf)
     cudaMalloc(reinterpret_cast<void**>(&d_cmpdata), cmp_capacity);
     cudaStream_t stream;
     cudaStreamCreate(&stream);
+    // Resolve REL once, outside both warm-up and compression API timing.
+    if (conf.errorBoundMode == WALTZ::EB_REL) {
+        double dmin = 0.0, dmax = 0.0;
+        WALTZ::d_extrema<T>(d_oridata, static_cast<uint64_t>(conf.num), dmin, dmax, stream);
+        conf.absErrorBound = conf.relErrorBound * (dmax - dmin);
+        conf.errorBoundMode = WALTZ::EB_ABS;
+    }
+    const char* warmup = std::getenv("WALTZ_WARMUP");
+    if (warmup != nullptr && std::atoi(warmup) != 0) {
+        WALTZ::Waltz_report_enabled = false;
+        WALTZ::d_compress<T>(conf, d_oridata, d_cmpdata, cmpPath, stream);
+        WALTZ::Waltz_report_enabled = true;
+    }
+    cudaStreamSynchronize(stream);
+    const WALTZ::WaltzE2ETimer ce2e_timer;
     size_t outSize = WALTZ::d_compress<T>(conf, d_oridata, d_cmpdata, cmpPath, stream);
+    ce2e_timer.report("compress", conf.num * sizeof(T), stream);
 
     if (outSize > 0) {
         std::unique_ptr<char[]> h_cmpdata(new char[outSize]);
         cudaMemcpy(h_cmpdata.get(), d_cmpdata, outSize, cudaMemcpyDeviceToHost);
-        write_output(cmpPath, h_cmpdata.get(), outSize);
+        WALTZ::writefile(cmpPath, h_cmpdata.get(), outSize);
     }
     cudaFree(d_cmpdata);
     cudaFree(d_oridata);
@@ -67,19 +90,28 @@ void Waltz_decompress(const char* cmpPath, const char* decPath, const WALTZ::Con
     cudaMalloc(reinterpret_cast<void**>(&d_cmpdata), cmp_size);
     cudaMalloc(reinterpret_cast<void**>(&d_decdata), conf.num * sizeof(T));
     cudaMemcpyAsync(d_cmpdata, h_cmpdata.get(), cmp_size, cudaMemcpyHostToDevice, stream);
+    const char* warmup = std::getenv("WALTZ_WARMUP");
+    if (warmup != nullptr && std::atoi(warmup) != 0) {
+        WALTZ::Waltz_report_enabled = false;
+        WALTZ::d_decompress<T>(conf, d_cmpdata, d_decdata, nullptr, stream);
+        WALTZ::Waltz_report_enabled = true;
+    }
+    cudaStreamSynchronize(stream);
+    const WALTZ::WaltzE2ETimer ce2e_timer;
     const size_t bytes = WALTZ::d_decompress<T>(conf, d_cmpdata, d_decdata, nullptr, stream);
+    ce2e_timer.report("decompress", conf.num * sizeof(T), stream);
     if (bytes != conf.num * sizeof(T))
         throw std::runtime_error("Unexpected decompressed size");
-    std::vector<T> output(conf.num);
-    cudaMemcpy(output.data(), d_decdata, bytes, cudaMemcpyDeviceToHost);
-    write_output(decPath, output.data(), output.size());
+    std::unique_ptr<T[]> output(new T[conf.num]);
+    cudaMemcpy(output.get(), d_decdata, bytes, cudaMemcpyDeviceToHost);
+    WALTZ::writefile(decPath, output.get(), conf.num);
     cudaFree(d_decdata);
     cudaFree(d_cmpdata);
     cudaStreamDestroy(stream);
     // Optional host-side verification, outside the kernel and API e2e timers.
     if (originalPath != nullptr) {
         std::unique_ptr<T[]> original(WALTZ::readfile<T>(originalPath, conf.num));
-        statistic<T>(original.get(), output.data(), conf.num);
+        statistic<T>(original.get(), output.get(), conf.num);
     }
 }
 

@@ -52,8 +52,9 @@ template <typename T> __device__ __forceinline__ T atomicMaxFp(T* addr, T value)
 }
 
 template <typename T>
-__global__ void extrema_kernel(const T* in, uint64_t len, T* minel, T* maxel, T failsafe, int R) {
+__global__ void extrema_kernel(const T* in, uint64_t len, T* minel, T* maxel, int R) {
     __shared__ T shared_minv, shared_maxv;
+    const T failsafe = in[0];
     const uint64_t entry =
         static_cast<uint64_t>(blockDim.x) * static_cast<uint64_t>(R) * blockIdx.x + threadIdx.x;
     T tp_minv = failsafe, tp_maxv = failsafe;
@@ -95,21 +96,16 @@ inline void extrema_scan(const T* d_in, uint64_t len, T* result, cudaStream_t st
         throw std::length_error("extrema_scan CUDA grid exceeds uint32 capacity");
     const uint32_t grid = static_cast<uint32_t>(grid64);
 
-    T *d_minel = nullptr, *d_maxel = nullptr;
-    cudaMalloc(reinterpret_cast<void**>(&d_minel), sizeof(T));
-    cudaMalloc(reinterpret_cast<void**>(&d_maxel), sizeof(T));
-    T failsafe = T(0); // init min/max to in[0]
-    cudaMemcpyAsync(&failsafe, d_in, sizeof(T), cudaMemcpyDeviceToHost, stream);
+    T* d_minel = nullptr;
+    cudaMalloc(reinterpret_cast<void**>(&d_minel), 2U * sizeof(T));
+    T* d_maxel = d_minel + 1;
     cudaMemcpyAsync(d_minel, d_in, sizeof(T), cudaMemcpyDeviceToDevice, stream);
     cudaMemcpyAsync(d_maxel, d_in, sizeof(T), cudaMemcpyDeviceToDevice, stream);
-    cudaStreamSynchronize(stream); // need `failsafe` on host before launch
     detail::extrema_kernel<T>
-        <<<grid, nworker, 0, stream>>>(d_in, len, d_minel, d_maxel, failsafe, R);
-    cudaMemcpyAsync(&result[0], d_minel, sizeof(T), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&result[1], d_maxel, sizeof(T), cudaMemcpyDeviceToHost, stream);
+        <<<grid, nworker, 0, stream>>>(d_in, len, d_minel, d_maxel, R);
+    cudaMemcpyAsync(result, d_minel, 2U * sizeof(T), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
     cudaFree(d_minel);
-    cudaFree(d_maxel);
 }
 
 } // namespace waltz
@@ -117,6 +113,9 @@ inline void extrema_scan(const T* d_in, uint64_t len, T* result, cudaStream_t st
 
 // Host-side reporting shared by the compression and decompression pipelines.
 namespace WALTZ {
+
+// The CLI hides the untimed warm-up call's stage report.
+inline thread_local bool Waltz_report_enabled = true;
 
 struct CompressionTimes {
     double autotune, block_rank, dwt, quant, wzp, idwt, outlier;
@@ -142,8 +141,7 @@ class WaltzE2ETimer {
         cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream));
         const double ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - begin).count();
-        std::printf("[WALTZ-CE2E] %s_ms=%.6f throughput_GBs=%.6f\n",
-                    operation, ms, Waltz_throughput(bytes, ms));
+        std::printf("  [WALTZ-CE2E] %s_ms=%.6f throughput_GBs=%.6f\n", operation, ms, Waltz_throughput(bytes, ms));
     }
 };
 
@@ -166,6 +164,8 @@ template <typename T>
 inline void Waltz_print_compression(size_t bytes, const CompressionTimes& t,
                                    size_t mag_bytes, uint32_t pwe_count,
                                    uint32_t qout_count, size_t blob_bytes) {
+    if (!Waltz_report_enabled)
+        return;
     Waltz_print_header();
     Waltz_print_stage("autotune", bytes, t.autotune);
     Waltz_print_stage("block-rank", bytes, t.block_rank);
@@ -188,6 +188,8 @@ inline void Waltz_print_compression(size_t bytes, const CompressionTimes& t,
 }
 
 inline void Waltz_print_decompression(size_t bytes, size_t blob_bytes, const DecompressionTimes& t) {
+    if (!Waltz_report_enabled)
+        return;
     Waltz_print_header(true);
     Waltz_print_stage("block-offset", bytes, t.block_offset);
     Waltz_print_stage("WZP+sign", bytes, t.wzp, "   (sign fused in)");

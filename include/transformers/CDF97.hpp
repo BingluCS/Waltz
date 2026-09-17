@@ -1836,13 +1836,8 @@ dwt_3d_z_single_static(
         &z_count[counter_index], &s_chunkID, quant_mode);
 }
 
-template <typename T> inline cudaError_t idwt3d_plane_prealloc(dim3 dims);
-
 template <typename T>
-inline void dwt3d_split_prealloc(dim3 dims, bool use_dyadic) {
-    if (!use_dyadic)
-        idwt3d_plane_prealloc<T>(dims);
-
+inline void dwt3d_prealloc() {
     const cudaDeviceProp& prop = WALTZ::gpu_config().properties;
     const int multiprocessor_count = prop.multiProcessorCount;
     const auto initialize_grid_blocks = [multiprocessor_count](auto kernel, int& grid_blocks) {

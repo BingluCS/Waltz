@@ -38,38 +38,20 @@ size_t d_WALTZ_compress(
 template <typename T>
 void d_extrema(T* d_data, uint64_t n, double& out_min, double& out_max, void* stream);
 
-// Warm one-time modules and workspaces before the REL scan.
-template <typename T>
-void d_pipeline_prealloc(const WALTZ::Config& config, void* stream);
-
 template <typename T, int NDIMS>
 size_t d_WALTZ_decompress(
     char* d_cmpData, T* d_decData, const WALTZ::Config& config, const char* decPath, void* stream);
 
+// The caller resolves REL to conf.absErrorBound before entering this API.
+// Keep relErrorBound as the autotuner's relative-bound hint.
 template <typename T>
 size_t d_compress(
     const WALTZ::Config& config, T* d_oridata, char* d_cmpData, const char* cmpPath, void* stream) {
 
     Config conf(config);
-    const char* const warmup = std::getenv("WALTZ_ASYNC_ALLOC");
-    if (warmup != nullptr && std::atoi(warmup) != 0)
-        d_pipeline_prealloc<T>(conf, stream);
-    // CAL_range: resolve a REL bound into the absolute bound HERE, so the
-    // pipeline below only ever sees EB_ABS (conf.absErrorBound is updated).
-    if (conf.errorBoundMode == EB_REL) {
-        double dmin = 0.0, dmax = 0.0;
-        d_extrema<T>(d_oridata, static_cast<uint64_t>(conf.num), dmin, dmax, stream);
-        const double range = dmax - dmin;
-        conf.absErrorBound = conf.relErrorBound * range;
-        conf.errorBoundMode = EB_ABS;
-    }
-
-    // Preserve the existing CE2E scope: compression starts after the REL scan.
-    const WaltzE2ETimer ce2e_timer;
     if (conf.ndims != 3)
         throw std::invalid_argument("compression currently only supports 3D data.");
     const size_t cmpDataLen = d_WALTZ_compress<T, 3>(d_oridata, d_cmpData, conf, cmpPath, stream);
-    ce2e_timer.report("compress", static_cast<size_t>(conf.num) * sizeof(T), stream);
 
     return cmpDataLen;
 }
@@ -83,14 +65,12 @@ template <typename T>
 size_t d_decompress(
     const WALTZ::Config& config, char* d_cmpData, T* d_decData, const char* decPath, void* stream) {
     Config conf(config);
-    const WaltzE2ETimer ce2e_timer;
     size_t decLen = 0;
     if (conf.ndims == 3) {
         decLen = d_WALTZ_decompress<T, 3>(d_cmpData, d_decData, conf, decPath, stream);
     } else {
         throw std::invalid_argument("decompression currently only supports 3D data.");
     }
-    ce2e_timer.report("decompress", static_cast<size_t>(conf.num) * sizeof(T), stream);
     return decLen;
 }
 

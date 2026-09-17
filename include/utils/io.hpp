@@ -12,7 +12,7 @@
 #include <iostream>
 #include <iterator>
 #include <stdexcept>
-#include <vector>
+#include <string>
 
 namespace WALTZ {
 
@@ -31,6 +31,14 @@ template <typename T> T* readfile(const char* file, const size_t num) {
     fin.read(reinterpret_cast<char*>(data), num * sizeof(T));
     fin.close();
     return data;
+}
+
+// count is the number of T elements, not the number of bytes.
+template <typename T>
+void writefile(const char* path, const T* data, size_t count) {
+    std::ofstream file(path, std::ios::binary);
+    if (!file.write(reinterpret_cast<const char*>(data), count * sizeof(T)))
+        throw std::runtime_error(std::string("Cannot write output: ") + path);
 }
 
 } // namespace WALTZ

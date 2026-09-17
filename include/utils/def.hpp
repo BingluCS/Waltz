@@ -3,8 +3,6 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
-#include <stdexcept>
-#include <string>
 
 #ifdef _MSC_VER
 #define ALWAYS_INLINE __forceinline
@@ -13,13 +11,3 @@
 #else
 #define ALWAYS_INLINE inline
 #endif
-
-namespace WALTZ {
-
-inline void check_cuda(cudaError_t err, const char* where) {
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string(where) + ": " + cudaGetErrorString(err));
-    }
-}
-
-} // namespace WALTZ

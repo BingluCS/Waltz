@@ -13,17 +13,6 @@
 #include <type_traits>
 #include <utility>
 
-#ifdef WALTZ_P4_TRANSFORM
-#define CDF97_L0 1.1335628809201543
-#define CDF97_L1 0.24748737341529164
-#define CDF97_L2 -0.12374368670764582
-#define CDF97_L3 0.0
-#define CDF97_L4 0.016581654018824540
-#define CDF97_H0 0.70710678118654746
-#define CDF97_H1 -0.40092954493277239
-#define CDF97_H2 0.0
-#define CDF97_H3 0.047376154339498683
-#else
 #define CDF97_L0 0.852698679008896
 #define CDF97_L1 0.377402855612830
 #define CDF97_L2 -0.110624404418436
@@ -33,7 +22,7 @@
 #define CDF97_H1 0.418092273222947
 #define CDF97_H2 0.040689417609764
 #define CDF97_H3 -0.064538882629244
-#endif
+
 
 #define DWT_TPB 512
 #define TPB DWT_TPB
@@ -62,108 +51,35 @@ namespace CDF97 {
 using WALTZ::DWTConfig;
 using WALTZ::QuantMode;
 
-static __device__ unsigned int x_count[CDF97_MAX_LEVELS];
-static __device__ unsigned int y_count[CDF97_MAX_LEVELS];
 static __device__ unsigned int z_count[CDF97_MAX_LEVELS];
 
-// Device-side state for fused double DWT + quantization.
-struct DwtDoubleQuantParams {
+// Device-side state for fused DWT + quantization, specialized by coefficient type.
+template <typename T>
+struct DwtQuantParams {
     uint16_t* qint_z;
     uint32_t* sign_bm;
-    double* iquant;
-    const uint16_t* rank_table;
+    T* iquant;
+    const uint16_t* rank_table; // Regular slot, then edge slots selected by short XYZ bits.
     uint32_t q_bz;
     uint32_t block_nx;
     uint32_t block_ny;
     uint32_t bz_shift;
     uint32_t block_elems;
     uint32_t regular_blocks;
-    double inv_q;
-    double q;
+    T inv_q;
+    T q;
     uint32_t* qout_idx;
     int32_t* qout_val;
     unsigned int* qout_cnt;
     uint32_t qout_cap;
 };
 
-static __device__ DwtDoubleQuantParams double_quant_params;
-
-__device__ __forceinline__ void dwt_quant_emit_double(
-    double value, size_t s, uint32_t x, uint32_t y, uint32_t z, dim3 data_dims,
-    const DwtDoubleQuantParams* __restrict__ p) {
-    constexpr uint32_t BX = 16U, BY = 16U;
-    const uint32_t bz_size = p->q_bz;
-    const uint32_t x0 = x & ~(BX - 1U);
-    const uint32_t y0 = y & ~(BY - 1U);
-    uint32_t z0, lz;
-    if ((bz_size & (bz_size - 1U)) == 0U) {
-        z0 = z & ~(bz_size - 1U);
-        lz = z & (bz_size - 1U);
-    } else {
-        z0 = (z / bz_size) * bz_size;
-        lz = z - z0;
-    }
-    const uint32_t bdx = min(BX, data_dims.x - x0);
-    const uint32_t bdy = min(BY, data_dims.y - y0);
-    const uint32_t bdz = min(bz_size, data_dims.z - z0);
-    const uint32_t lx = x & (BX - 1U), ly = y & (BY - 1U);
-    const uint32_t local = lx + ly * bdx + lz * bdx * bdy;
-    const size_t base = static_cast<size_t>(data_dims.x) * data_dims.y * z0 +
-                        static_cast<size_t>(data_dims.x) * bdz * y0 +
-                        static_cast<size_t>(bdy) * bdz * x0;
-    const bool full = bdx == BX && bdy == BY && bdz == bz_size;
-    const uint32_t rank =
-        full ? p->rank_table[local]
-             : static_cast<uint32_t>(WALTZ::lossless::zorder_rank(local, bdx, bdy, bdz));
-    const size_t outpos = base + rank;
-    const long long rll = WALTZ::quantizer::llrint_real(value * p->inv_q);
-    const bool neg = rll < 0;
-    const int32_t mag = WALTZ::quantizer::saturate_q<int32_t>(neg ? -rll : rll);
-    p->qint_z[outpos] = static_cast<uint16_t>(mag > 65535 ? 65535 : mag);
-    if (neg && mag != 0)
-        atomicOr(p->sign_bm + (outpos >> 5U), 1U << (outpos & 31U));
-    p->iquant[s] = static_cast<double>(neg ? -mag : mag) * p->q;
-    if (mag > 65535 && p->qout_cnt != nullptr) {
-        const unsigned int slot = atomicAdd(p->qout_cnt, 1U);
-        if (slot < p->qout_cap) {
-            p->qout_idx[slot] = static_cast<uint32_t>(s);
-            p->qout_val[slot] = mag;
-        }
-    }
-}
-
-__device__ __forceinline__ void dwt_quant_emit_regular_double(
-    double value, size_t s, uint32_t x, uint32_t y, uint32_t z,
-    const DwtDoubleQuantParams* __restrict__ p) {
-    constexpr uint32_t BX = 16U, BY = 16U;
-    const uint32_t bz = p->q_bz;
-    const uint32_t block = (x >> 4U) + p->block_nx * (y >> 4U) +
-                           p->block_nx * p->block_ny * (z >> p->bz_shift);
-    const uint32_t local = (x & (BX - 1U)) + (y & (BY - 1U)) * BX +
-                           (z & (bz - 1U)) * BX * BY;
-    const size_t outpos =
-        static_cast<size_t>(block) * p->block_elems + p->rank_table[local];
-    const long long rll = WALTZ::quantizer::llrint_real(value * p->inv_q);
-    const bool neg = rll < 0;
-    const int32_t mag = WALTZ::quantizer::saturate_q<int32_t>(neg ? -rll : rll);
-    p->qint_z[outpos] = static_cast<uint16_t>(mag > 65535 ? 65535 : mag);
-    if (neg && mag != 0)
-        atomicOr(p->sign_bm + (outpos >> 5U), 1U << (outpos & 31U));
-    p->iquant[s] = static_cast<double>(neg ? -mag : mag) * p->q;
-    if (mag > 65535 && p->qout_cnt != nullptr) {
-        const unsigned int slot = atomicAdd(p->qout_cnt, 1U);
-        if (slot < p->qout_cap) {
-            p->qout_idx[slot] = static_cast<uint32_t>(s);
-            p->qout_val[slot] = mag;
-        }
-    }
-}
+static __device__ DwtQuantParams<double> double_quant_params;
+static __constant__ DwtQuantParams<float> float_quant_params;
 
 // Reset the multi-kernel work-distribution counters used by atomic chunk dispatch.
 static __global__ void d_reset() {
     for (int i = 0; i < CDF97_MAX_LEVELS; ++i) {
-        x_count[i] = 0U;
-        y_count[i] = 0U;
         z_count[i] = 0U;
     }
 }
@@ -209,394 +125,6 @@ template <typename T> __device__ __forceinline__ T high_filter(T center, T sum1,
     }
 }
 
-template <typename T>
-__device__ __forceinline__ void dwt_y_rows(T* tmp,
-                                           const T* input,
-                                           uint32_t row0,
-                                           uint32_t rows,
-                                           uint32_t active_x,
-                                           uint32_t active_y,
-                                           dim3 data_leaps) {
-    const uint32_t even_y = active_y - (active_y >> 1);
-    const int stride_y = data_leaps.y;
-
-
-    if ((active_y & 1U) != 0U) {
-        // Pair-fuse odd-height slices too.  A naive flattened row+=2 traversal is
-        // incorrect here because row parity flips at every odd-height z boundary.
-        // Map each half-open input-row chunk [row0,row0+rows) to its unique range
-        // of even-y owners instead: F(r)=slice*ceil(N/2)+ceil(local_y/2).
-        // An owner emits the even low and its adjacent odd high from one 9-point
-        // window.  Therefore a chunk beginning on an odd row does no duplicate
-        // work for that row: the preceding chunk's even owner already emitted it.
-        const uint32_t row1 = row0 + rows;
-        const uint32_t z0 = row0 / active_y;
-        const uint32_t y0 = row0 - z0 * active_y;
-        const uint32_t z1 = row1 / active_y;
-        const uint32_t y1 = row1 - z1 * active_y;
-        const uint32_t pair0 = z0 * even_y + ((y0 + 1U) >> 1U);
-        const uint32_t pair1 = z1 * even_y + ((y1 + 1U) >> 1U);
-        const uint32_t pair_count = pair1 - pair0;
-
-        for (uint32_t e = threadIdx.x; e < pair_count * active_x; e += blockDim.x) {
-            const uint32_t q = pair0 + e / active_x;
-            const int idx = static_cast<int>(e % active_x);
-            const int gidz = static_cast<int>(q / even_y);
-            const int pair = static_cast<int>(q - static_cast<uint32_t>(gidz) * even_y);
-            const int gidy = pair << 1;
-            const int global_id = idx + gidy * data_leaps.y + gidz * data_leaps.z;
-
-            int ym1 = gidy - 1, yp1 = gidy + 1;
-            int ym2 = gidy - 2, yp2 = gidy + 2;
-            int ym3 = gidy - 3, yp3 = gidy + 3;
-            int ym4 = gidy - 4, yp4 = gidy + 4;
-            if (ym1 < 0)
-                ym1 = -ym1;
-            if (ym2 < 0)
-                ym2 = -ym2;
-            if (ym3 < 0)
-                ym3 = -ym3;
-            if (ym4 < 0)
-                ym4 = -ym4;
-            if (yp1 >= static_cast<int>(active_y))
-                yp1 = 2 * active_y - 2 - yp1;
-            if (yp2 >= static_cast<int>(active_y))
-                yp2 = 2 * active_y - 2 - yp2;
-            if (yp3 >= static_cast<int>(active_y))
-                yp3 = 2 * active_y - 2 - yp3;
-            if (yp4 >= static_cast<int>(active_y))
-                yp4 = 2 * active_y - 2 - yp4;
-
-            const T c0 = input[global_id];
-            const T vm1 = input[global_id + (ym1 - gidy) * stride_y];
-            const T vp1 = input[global_id + (yp1 - gidy) * stride_y];
-            const T vm2 = input[global_id + (ym2 - gidy) * stride_y];
-            const T vp2 = input[global_id + (yp2 - gidy) * stride_y];
-            const T vm3 = input[global_id + (ym3 - gidy) * stride_y];
-            const T vp3 = input[global_id + (yp3 - gidy) * stride_y];
-            const T vm4 = input[global_id + (ym4 - gidy) * stride_y];
-            const T vp4 = input[global_id + (yp4 - gidy) * stride_y];
-
-            const T sum1 = add_rn<T>(vm1, vp1);
-            const T sum2 = add_rn<T>(vm2, vp2);
-            const T sum3 = add_rn<T>(vm3, vp3);
-            const T sum4 = add_rn<T>(vm4, vp4);
-            const int low_out = idx + pair * data_leaps.y + gidz * data_leaps.z;
-            tmp[low_out] = low_filter<T>(c0, sum1, sum2, sum3, sum4);
-
-            if (gidy + 1 < static_cast<int>(active_y)) {
-                const T h1 = add_rn<T>(c0, vp2);
-                const T h2 = add_rn<T>(vm1, vp3);
-                const T h3 = add_rn<T>(vm2, vp4);
-                const int high_out = idx + (even_y + pair) * data_leaps.y + gidz * data_leaps.z;
-                tmp[high_out] = high_filter<T>(vp1, h1, h2, h3);
-            }
-        }
-        return;
-    }
-
-    const uint32_t first_low = (row0 & 1U) ? 1U : 0U;
-    const uint32_t low_rows = (first_low < rows) ? ((rows - first_low + 1U) >> 1U) : 0U;
-
-    // Pair-fused (always): each even row loads its 9-tap y-window once and emits
-    // both the low coefficient (row gidy) and the high coefficient (row gidy+1),
-    // reusing the same shifted window -> ~1/2 the neighbour loads of split low/high
-    // passes. Bit-identical to the removed split path (same operands and order).
-    {
-        for (uint32_t i = threadIdx.x; i < low_rows * active_x; i += blockDim.x) {
-            const uint32_t row = row0 + first_low + ((i / active_x) << 1U);
-            const int idx = i % active_x;
-            const int gidy = row % active_y;
-            const int gidz = row / active_y;
-            const int global_id = idx + gidy * data_leaps.y + gidz * data_leaps.z;
-
-            // Interior rows are the overwhelmingly common case on the wide
-            // plane levels.  Avoid four reflection-index branches and the
-            // associated integer arithmetic; the boundary/tail rows below
-            // retain the exact whole-sample mirror semantics.
-            if (gidy >= 4 && gidy + 4 < static_cast<int>(active_y)) {
-                const T c0 = input[global_id];
-                const T vm1 = input[global_id - stride_y];
-                const T vp1 = input[global_id + stride_y];
-                const T vm2 = input[global_id - 2 * stride_y];
-                const T vp2 = input[global_id + 2 * stride_y];
-                const T vm3 = input[global_id - 3 * stride_y];
-                const T vp3 = input[global_id + 3 * stride_y];
-                const T vm4 = input[global_id - 4 * stride_y];
-                const T vp4 = input[global_id + 4 * stride_y];
-                const T sum1 = add_rn<T>(vm1, vp1);
-                const T sum2 = add_rn<T>(vm2, vp2);
-                const T sum3 = add_rn<T>(vm3, vp3);
-                const T sum4 = add_rn<T>(vm4, vp4);
-                const int low_out = idx + (gidy >> 1) * data_leaps.y + gidz * data_leaps.z;
-                tmp[low_out] = low_filter<T>(c0, sum1, sum2, sum3, sum4);
-                if (gidy + 1 < static_cast<int>(active_y)) {
-                    const T h1 = add_rn<T>(c0, vp2);
-                    const T h2 = add_rn<T>(vm1, vp3);
-                    const T h3 = add_rn<T>(vm2, vp4);
-                    const int high_out =
-                        idx + ((gidy >> 1) + even_y) * data_leaps.y + gidz * data_leaps.z;
-                    tmp[high_out] = high_filter<T>(vp1, h1, h2, h3);
-                }
-                continue;
-            }
-
-            int ym1 = gidy - 1;
-            int yp1 = gidy + 1;
-            int ym2 = gidy - 2;
-            int yp2 = gidy + 2;
-            int ym3 = gidy - 3;
-            int yp3 = gidy + 3;
-            int ym4 = gidy - 4;
-            int yp4 = gidy + 4;
-
-            if (ym1 < 0)
-                ym1 = -ym1;
-            if (ym2 < 0)
-                ym2 = -ym2;
-            if (ym3 < 0)
-                ym3 = -ym3;
-            if (ym4 < 0)
-                ym4 = -ym4;
-
-            if (yp1 >= active_y)
-                yp1 = 2 * active_y - 2 - yp1;
-            if (yp2 >= active_y)
-                yp2 = 2 * active_y - 2 - yp2;
-            if (yp3 >= active_y)
-                yp3 = 2 * active_y - 2 - yp3;
-            if (yp4 >= active_y)
-                yp4 = 2 * active_y - 2 - yp4;
-
-            const T c0 = input[global_id];
-            const T vm1 = input[global_id + (ym1 - gidy) * stride_y];
-            const T vp1 = input[global_id + (yp1 - gidy) * stride_y];
-            const T vm2 = input[global_id + (ym2 - gidy) * stride_y];
-            const T vp2 = input[global_id + (yp2 - gidy) * stride_y];
-            const T vm3 = input[global_id + (ym3 - gidy) * stride_y];
-            const T vp3 = input[global_id + (yp3 - gidy) * stride_y];
-            const T vm4 = input[global_id + (ym4 - gidy) * stride_y];
-            const T vp4 = input[global_id + (yp4 - gidy) * stride_y];
-
-            {
-                const T sum1 = add_rn<T>(vm1, vp1);
-                const T sum2 = add_rn<T>(vm2, vp2);
-                const T sum3 = add_rn<T>(vm3, vp3);
-                const T sum4 = add_rn<T>(vm4, vp4);
-                const int out_id = idx + (gidy >> 1) * data_leaps.y + gidz * data_leaps.z;
-                tmp[out_id] = low_filter<T>(c0, sum1, sum2, sum3, sum4);
-            }
-
-            if (gidy + 1 < static_cast<int>(active_y)) {
-                const T sum1 = add_rn<T>(c0, vp2);
-                const T sum2 = add_rn<T>(vm1, vp3);
-                const T sum3 = add_rn<T>(vm2, vp4);
-                const int out_id =
-                    idx + ((gidy >> 1) + even_y) * data_leaps.y + gidz * data_leaps.z;
-                tmp[out_id] = high_filter<T>(vp1, sum1, sum2, sum3);
-            }
-        }
-    }
-}
-
-// X-direction DWT on a batch of `rows` rows (a row = a fixed (y,z) line of length
-// active_x), the X counterpart of dwt_y_rows.  Unlike Y, the x-axis is contiguous,
-// so each row is staged into shared `s_data` once (coalesced) and transformed there;
-// `s_rowbase` precomputes the per-row global base to kill per-element /active_y,
-// %active_y.  Pair-fused: each even owner emits BOTH low (col lx) and high
-// (col even_tile+lx, for gidx+1) from one 9-tap window -> ~1/2 the index/clamp work.
-// Reads `src`, writes `dst` deinterleaved low|high; safe in place (src==dst) since a
-// row is fully staged before any write.  Caller owns the chunk work-queue (like the
-// Y passes) and provides the shared staging tile `s_data` (>= rows*active_x elems).
-// Requires rows <= 256 (s_rowbase capacity); callers cap tile_y accordingly.
-template <typename T>
-__device__ __forceinline__ void dwt_x_rows(T* dst,
-                                           const T* src,
-                                           uint32_t row0,
-                                           uint32_t rows,
-                                           uint32_t active_x,
-                                           uint32_t active_y,
-                                           dim3 data_leaps,
-                                           T* s_data) {
-    __shared__ int s_rowbase[256];
-    const int odd_tile = active_x >> 1;
-    const int even_tile = active_x - odd_tile;
-
-    for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
-        const uint32_t row = row0 + r;
-        s_rowbase[r] = (row % active_y) * data_leaps.y + (row / active_y) * data_leaps.z;
-    }
-    __syncthreads();
-
-    const int len = rows * active_x;
-    const int low_len = rows * even_tile;
-
-    // When the active x-line spans the full physical row and the volume has no
-    // gaps (first level: active_x == row stride, active_y == full y), the chunk's
-    // rows are contiguous in memory, so stage them with a flat coalesced copy
-    // (skips the per-element row/col split + s_rowbase lookup).  The condition is
-    // loop-invariant, so the compiler hoists it into two specialised load loops.
-    if (active_x == (uint32_t)data_leaps.y &&
-        (uint32_t)data_leaps.z == (uint32_t)data_leaps.y * active_y) {
-        const int base0 = (int)row0 * data_leaps.y;
-        if constexpr (sizeof(T) == sizeof(double)) {
-            // A flat, 16-byte-aligned double X pass can move two coefficients
-            // per instruction. Keep a scalar fallback for arbitrary pointers
-            // and a possible one-element tail.
-            const T* const in = src + base0;
-            if ((reinterpret_cast<uintptr_t>(in) & 15U) == 0U) {
-                const int nv = len >> 1;
-                const double2* const in2 = reinterpret_cast<const double2*>(in);
-                double2* const sh2 = reinterpret_cast<double2*>(s_data);
-                for (int v = threadIdx.x; v < nv; v += blockDim.x)
-                    sh2[v] = in2[v];
-                for (int i = (nv << 1) + threadIdx.x; i < len; i += blockDim.x)
-                    s_data[i] = in[i];
-            } else {
-                for (int i = threadIdx.x; i < len; i += blockDim.x)
-                    s_data[i] = in[i];
-            }
-        } else {
-            const T* const in = src + base0;
-            if ((len & 3) == 0 && (reinterpret_cast<uintptr_t>(in) & 15U) == 0U) {
-                const int nv = len >> 2;
-                const float4* const in4 = reinterpret_cast<const float4*>(in);
-                float4* const sh4 = reinterpret_cast<float4*>(s_data);
-                for (int v = threadIdx.x; v < nv; v += blockDim.x)
-                    sh4[v] = in4[v];
-            } else {
-                for (int i = threadIdx.x; i < len; i += blockDim.x)
-                    s_data[i] = in[i];
-            }
-        }
-    } else {
-        if constexpr (sizeof(T) == sizeof(float)) {
-            const bool vec_ok = (active_x & 3U) == 0U &&
-                                (static_cast<uint32_t>(data_leaps.y) & 3U) == 0U &&
-                                (reinterpret_cast<uintptr_t>(src) & 15U) == 0U;
-            if (vec_ok) {
-                const int nvrow = static_cast<int>(active_x >> 2U);
-                const int totalv = static_cast<int>(rows) * nvrow;
-                for (int v = threadIdx.x; v < totalv; v += blockDim.x) {
-                    const int local_row = v / nvrow;
-                    const int vx = v - local_row * nvrow;
-                    *reinterpret_cast<float4*>(s_data + local_row * static_cast<int>(active_x) +
-                                               (vx << 2)) =
-                        *reinterpret_cast<const float4*>(src + s_rowbase[local_row] + (vx << 2));
-                }
-            } else {
-                for (int i = threadIdx.x; i < len; i += blockDim.x) {
-                    const int local_row = i / static_cast<int>(active_x);
-                    const int idx = i - local_row * static_cast<int>(active_x);
-                    s_data[i] = src[s_rowbase[local_row] + idx];
-                }
-            }
-        } else {
-            for (int i = threadIdx.x; i < len; i += blockDim.x) {
-                const int local_row = i / static_cast<int>(active_x);
-                const int idx = i - local_row * static_cast<int>(active_x);
-                s_data[i] = src[s_rowbase[local_row] + idx];
-            }
-        }
-    }
-    __syncthreads();
-
-    for (int i = threadIdx.x; i < low_len; i += blockDim.x) {
-        const int local_row = i / even_tile;
-        const int lx = i - local_row * even_tile;
-        const int gidx = lx << 1;
-        const int id = local_row * (int)active_x + gidx;
-        int xm1 = gidx - 1, xp1 = gidx + 1, xm2 = gidx - 2, xp2 = gidx + 2;
-        int xm3 = gidx - 3, xp3 = gidx + 3, xm4 = gidx - 4, xp4 = gidx + 4;
-        if (xm1 < 0)
-            xm1 = -xm1;
-        if (xm2 < 0)
-            xm2 = -xm2;
-        if (xm3 < 0)
-            xm3 = -xm3;
-        if (xm4 < 0)
-            xm4 = -xm4;
-        if (xp1 >= (int)active_x)
-            xp1 = 2 * (int)active_x - 2 - xp1;
-        if (xp2 >= (int)active_x)
-            xp2 = 2 * (int)active_x - 2 - xp2;
-        if (xp3 >= (int)active_x)
-            xp3 = 2 * (int)active_x - 2 - xp3;
-        if (xp4 >= (int)active_x)
-            xp4 = 2 * (int)active_x - 2 - xp4;
-
-        const T c0 = s_data[id];
-        const T vm1 = s_data[id + (xm1 - gidx)];
-        const T vp1 = s_data[id + (xp1 - gidx)];
-        const T vm2 = s_data[id + (xm2 - gidx)];
-        const T vp2 = s_data[id + (xp2 - gidx)];
-        const T vm3 = s_data[id + (xm3 - gidx)];
-        const T vp3 = s_data[id + (xp3 - gidx)];
-        const T vm4 = s_data[id + (xm4 - gidx)];
-        const T vp4 = s_data[id + (xp4 - gidx)];
-
-        dst[s_rowbase[local_row] + lx] = low_filter<T>(
-            c0, add_rn<T>(vm1, vp1), add_rn<T>(vm2, vp2), add_rn<T>(vm3, vp3), add_rn<T>(vm4, vp4));
-
-        if (gidx + 1 < (int)active_x) {
-            dst[s_rowbase[local_row] + even_tile + lx] =
-                high_filter<T>(vp1, add_rn<T>(c0, vp2), add_rn<T>(vm1, vp3), add_rn<T>(vm2, vp4));
-        }
-    }
-    __syncthreads();
-}
-
-
-
-// One X-axis kernel serves float/double and both in-place/out-of-place paths.
-// dwt_x_rows stages each complete row before writing, so src == dst is safe.
-template <typename T>
-__global__ __launch_bounds__(TPB, sizeof(T) == sizeof(float) ? 3 : 2) void dwt_x_axis(
-    const T* src, T* dst, uint32_t nx, uint32_t ny, uint32_t lx, uint32_t ly, uint32_t lz,
-    uint32_t counter_index) {
-    constexpr uint32_t cap = 32768U / sizeof(T);
-    __shared__ alignas(128) T s_data[cap];
-    __shared__ uint32_t chunk_id;
-    const dim3 leaps(1, nx, nx * ny);
-    const uint32_t rpt = min(max(cap / lx, 1U), 256U);
-    const uint32_t rows_total = ly * lz;
-    const uint32_t chunks = (rows_total + rpt - 1U) / rpt;
-    while (true) {
-        if (threadIdx.x == 0)
-            chunk_id = atomicAdd(&x_count[counter_index], 1U);
-        __syncthreads();
-        const uint32_t chunk = chunk_id;
-        __syncthreads();
-        if (chunk >= chunks)
-            break;
-        const uint32_t row0 = chunk * rpt;
-        dwt_x_rows<T>(dst, src, row0, min(rpt, rows_total - row0), lx, ly, leaps, s_data);
-    }
-}
-
-template <typename T>
-__global__ __launch_bounds__(TPB, sizeof(T) == sizeof(float) ? 3 : 2) void dwt_y_axis(
-    const T* src, T* dst, uint32_t nx, uint32_t ny, uint32_t lx, uint32_t ly, uint32_t lz,
-    uint32_t counter_index) {
-    constexpr uint32_t cap = 32768U / sizeof(T);
-    __shared__ uint32_t chunk_id;
-    const dim3 leaps(1, nx, nx * ny);
-    const uint32_t rpt = max(cap / lx, 1U);
-    const uint32_t rows_total = ly * lz;
-    const uint32_t chunks = (rows_total + rpt - 1U) / rpt;
-    while (true) {
-        if (threadIdx.x == 0)
-            chunk_id = atomicAdd(&y_count[counter_index], 1U);
-        __syncthreads();
-        const uint32_t chunk = chunk_id;
-        __syncthreads();
-        if (chunk >= chunks)
-            break;
-        const uint32_t row0 = chunk * rpt;
-        dwt_y_rows<T>(dst, src, row0, min(rpt, rows_total - row0), lx, ly, leaps);
-    }
-}
-
 constexpr int DWT_HALO_R = 4;
 
 __device__ __forceinline__ int dwt_halo_reflect(int i, int n) {
@@ -629,35 +157,10 @@ __device__ __forceinline__ int dwt_halo_reflect(int i, int n) {
 // Wide planes can use the optional 64x32 specialization (about 22 KiB), which
 // lowers the halo/owner ratio; the launcher below keeps both variants available
 // for shape A/B tests without changing the default path.
-constexpr int BX_32 = 32;
 constexpr int BY_16 = 16;
 constexpr int BX_64 = 64;
 constexpr int BY_32 = 32;
 constexpr int BX_128 = 128;
-
-// Kept in one device-side record so the optional DWT->quant path does not keep
-// ten independent pointers/scalars live in every halo thread.  The default
-// QuantMode::None kernels never dereference this record.
-struct DwtFuseQuantParams {
-    uint16_t* qint_z;
-    uint32_t* sign_bm;
-    float* iquant;
-    const uint16_t* rank_table;
-    uint32_t q_bz;
-    uint32_t block_nx;
-    uint32_t block_ny;
-    uint32_t bz_shift;
-    uint32_t block_elems;
-    uint32_t regular_blocks;
-    float inv_qf;
-    float qf;
-    uint32_t* qout_idx;
-    int32_t* qout_val;
-    unsigned int* qout_cnt;
-    uint32_t qout_cap;
-};
-
-static __constant__ DwtFuseQuantParams float_quant_params;
 
 template <typename T>
 inline cudaError_t set_quant_params(uint16_t* qint_z, uint32_t* sign_bm, T* iquant,
@@ -665,64 +168,32 @@ inline cudaError_t set_quant_params(uint16_t* qint_z, uint32_t* sign_bm, T* iqua
                                     double q, uint32_t* qout_idx, int32_t* qout_val,
                                     unsigned int* qout_cnt, uint32_t qout_cap,
                                     cudaStream_t stream = 0) {
+    static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
+                  "fused quantization supports float and double");
     const bool regular_blocks =
         q_bz != 0U && (q_bz & (q_bz - 1U)) == 0U && (dims.x & 15U) == 0U &&
         (dims.y & 15U) == 0U && dims.z % q_bz == 0U;
-    if constexpr (std::is_same_v<T, double>) {
-        DwtDoubleQuantParams p{qint_z,
-                               sign_bm,
-                               iquant,
-                               rank_table,
-                               q_bz,
-                               (dims.x + 15U) >> 4U,
-                               (dims.y + 15U) >> 4U,
-                               q_bz != 0U
-                                   ? static_cast<uint32_t>(
-                                         __builtin_ctz(static_cast<unsigned int>(q_bz)))
-                                   : 0U,
-                               16U * 16U * q_bz,
-                               regular_blocks,
-                               q != 0.0 ? 1.0 / q : 0.0,
-                               q,
-                               qout_idx,
-                               qout_val,
-                               qout_cnt,
-                               qout_cap};
+    const uint32_t bz_shift = q_bz != 0U
+        ? static_cast<uint32_t>(__builtin_ctz(static_cast<unsigned int>(q_bz))) : 0U;
+    const DwtQuantParams<T> p{qint_z, sign_bm, iquant, rank_table, q_bz,
+                   (dims.x + 15U) >> 4U, (dims.y + 15U) >> 4U,
+                   bz_shift, 16U * 16U * q_bz, regular_blocks,
+                   static_cast<T>(q != 0.0 ? 1.0 / q : 0.0), static_cast<T>(q),
+                   qout_idx, qout_val, qout_cnt, qout_cap};
+    if constexpr (std::is_same_v<T, double>)
         return cudaMemcpyToSymbolAsync(
             double_quant_params, &p, sizeof(p), 0, cudaMemcpyHostToDevice, stream);
-    } else {
-        static_assert(std::is_same_v<T, float>, "fused quantization supports float and double");
-        DwtFuseQuantParams p{qint_z,
-                             sign_bm,
-                             iquant,
-                             rank_table,
-                             q_bz,
-                             (dims.x + 15U) >> 4U,
-                             (dims.y + 15U) >> 4U,
-                             q_bz != 0U
-                                 ? static_cast<uint32_t>(
-                                       __builtin_ctz(static_cast<unsigned int>(q_bz)))
-                                 : 0U,
-                             16U * 16U * q_bz,
-                             regular_blocks,
-                             q != 0.0 ? static_cast<float>(1.0 / q) : 0.0f,
-                             static_cast<float>(q),
-                             qout_idx,
-                             qout_val,
-                             qout_cnt,
-                             qout_cap};
+    else
         return cudaMemcpyToSymbolAsync(
             float_quant_params, &p, sizeof(p), 0, cudaMemcpyHostToDevice, stream);
-    }
 }
 
 
-__device__ __forceinline__ void dwt_quant_emit_float(float value, size_t s, uint32_t x,
-                                                     uint32_t y,
-                                                     uint32_t z,
-                                                     dim3 data_dims,
-                                                     const DwtFuseQuantParams* __restrict__ p) {
-    const long long rll = WALTZ::quantizer::llrint_real(value * p->inv_qf);
+template <typename T>
+__device__ __forceinline__ void dwt_quant_emit(
+    T value, size_t s, uint32_t x, uint32_t y, uint32_t z, dim3 data_dims,
+    const DwtQuantParams<T>* __restrict__ p) {
+    const long long rll = WALTZ::quantizer::llrint_real(value * p->inv_q);
     const bool neg = rll < 0;
     const int32_t mag = WALTZ::quantizer::saturate_q<int32_t>(neg ? -rll : rll);
     constexpr uint32_t Bx = 16U, By = 16U;
@@ -753,13 +224,16 @@ __device__ __forceinline__ void dwt_quant_emit_float(float value, size_t s, uint
              static_cast<size_t>(data_dims.x) * bdz * y0 + static_cast<size_t>(bdy) * bdz * x0;
         const size_t local = (x & (Bx - 1U)) + static_cast<size_t>(y & (By - 1U)) * bdx +
                              static_cast<size_t>(lz) * bdx * bdy;
-        rank = WALTZ::lossless::zorder_rank(local, bdx, bdy, bdz);
+        const uint32_t shape = static_cast<uint32_t>(bdx != Bx) |
+            (static_cast<uint32_t>(bdy != By) << 1U) |
+            (static_cast<uint32_t>(bdz != Bz) << 2U);
+        rank = p->rank_table[shape * p->block_elems + local];
     }
     const size_t outpos = b0 + rank;
     p->qint_z[outpos] = static_cast<uint16_t>(mag > 65535 ? 65535 : mag);
     if (neg && mag != 0)
         atomicOr(p->sign_bm + (outpos >> 5U), 1U << (outpos & 31U));
-    p->iquant[s] = static_cast<float>(neg ? -mag : mag) * p->qf;
+    p->iquant[s] = static_cast<T>(neg ? -mag : mag) * p->q;
     if (mag > 65535 && p->qout_cnt != nullptr) {
         const unsigned int slot = atomicAdd(p->qout_cnt, 1U);
         if (slot < p->qout_cap) {
@@ -773,14 +247,15 @@ __device__ __forceinline__ void dwt_quant_emit_float(float value, size_t s, uint
 // The dimensions remain runtime values; only the absence of edge blocks is a
 // compile-time property of this kernel variant.  Irregular volumes continue to
 // use the generic emitter above.
-__device__ __forceinline__ void dwt_quant_emit_regular_float(float value, size_t s,
-    uint32_t x, uint32_t y, uint32_t z, const DwtFuseQuantParams* __restrict__ p) {
+template <typename T>
+__device__ __forceinline__ void dwt_quant_emit_regular(T value, size_t s,
+    uint32_t x, uint32_t y, uint32_t z, const DwtQuantParams<T>* __restrict__ p) {
     constexpr uint32_t BX = 16U, BY = 16U;
     const uint32_t bz = p->q_bz;
     const uint32_t block = (x >> 4U) + p->block_nx * (y >> 4U) + p->block_nx * p->block_ny * (z >> p->bz_shift);
     const uint32_t local = (x & (BX - 1U)) + (y & (BY - 1U)) * BX + (z & (bz - 1U)) * BX * BY;
     const size_t outpos = static_cast<size_t>(block) * p->block_elems + p->rank_table[local];
-    const long long rll = WALTZ::quantizer::llrint_real(value * p->inv_qf);
+    const long long rll = WALTZ::quantizer::llrint_real(value * p->inv_q);
     const bool neg = rll < 0;
     const int32_t mag = WALTZ::quantizer::saturate_q<int32_t>(neg ? -rll : rll);
     p->qint_z[outpos] = static_cast<uint16_t>(mag > 65535 ? 65535 : mag);
@@ -788,7 +263,7 @@ __device__ __forceinline__ void dwt_quant_emit_regular_float(float value, size_t
     if (neg && mag != 0)
         atomicOr(p->sign_bm + (outpos >> 5U), 1U << (outpos & 31U));
     
-    p->iquant[s] = static_cast<float>(neg ? -mag : mag) * p->qf;
+    p->iquant[s] = static_cast<T>(neg ? -mag : mag) * p->q;
     if (mag > 65535 && p->qout_cnt != nullptr) {
         const unsigned int slot = atomicAdd(p->qout_cnt, 1U);
         if (slot < p->qout_cap) {
@@ -801,33 +276,31 @@ __device__ __forceinline__ void dwt_quant_emit_regular_float(float value, size_t
 template <typename T>
 __device__ __forceinline__ void quantization(
     T value, size_t s, uint32_t x, uint32_t y, uint32_t z, dim3 data_dims) {
-    if constexpr (std::is_same_v<T, float>) {
-        if (float_quant_params.regular_blocks != 0U)
-            dwt_quant_emit_regular_float(value, s, x, y, z, &float_quant_params);
-        else
-            dwt_quant_emit_float(value, s, x, y, z, data_dims, &float_quant_params);
-    } else if constexpr (std::is_same_v<T, double>) {
-        if (double_quant_params.regular_blocks != 0U)
-            dwt_quant_emit_regular_double(value, s, x, y, z, &double_quant_params);
-        else
-            dwt_quant_emit_double(value, s, x, y, z, data_dims, &double_quant_params);
-    }
+    const DwtQuantParams<T>* params;
+    if constexpr (std::is_same_v<T, float>)
+        params = &float_quant_params;
+    else
+        params = &double_quant_params;
+
+    if (params->regular_blocks != 0U)
+        dwt_quant_emit_regular(value, s, x, y, z, params);
+    else
+        dwt_quant_emit(value, s, x, y, z, data_dims, params);
 }
 
 template <bool RegularBlocks, typename T>
 __device__ __forceinline__ void quantization(
     T value, size_t s, uint32_t x, uint32_t y, uint32_t z, dim3 data_dims) {
-    if constexpr (std::is_same_v<T, float>) {
-        if constexpr (RegularBlocks)
-            dwt_quant_emit_regular_float(value, s, x, y, z, &float_quant_params);
-        else
-            dwt_quant_emit_float(value, s, x, y, z, data_dims, &float_quant_params);
-    } else if constexpr (std::is_same_v<T, double>) {
-        if constexpr (RegularBlocks)
-            dwt_quant_emit_regular_double(value, s, x, y, z, &double_quant_params);
-        else
-            dwt_quant_emit_double(value, s, x, y, z, data_dims, &double_quant_params);
-    }
+    const DwtQuantParams<T>* params;
+    if constexpr (std::is_same_v<T, float>)
+        params = &float_quant_params;
+    else
+        params = &double_quant_params;
+
+    if constexpr (RegularBlocks)
+        dwt_quant_emit_regular(value, s, x, y, z, params);
+    else
+        dwt_quant_emit(value, s, x, y, z, data_dims, params);
 }
 
 template <int BX, int BY, QuantMode Quant = QuantMode::None, bool QuantBlocksRegular = false>
@@ -1391,39 +864,6 @@ void dwt_3d_z_all_static(const T* src, T* dst, dim3 data_dims,
 // At coarse plane levels the number of row tiles quickly drops below the
 // occupancy-sized persistent grid.  Launching hundreds of CTAs that immediately
 // fail the grid-stride loop is a measurable fixed cost on shallow volumes.
-// Cap each launch at its exact tile count; the kernels and arithmetic are
-// unchanged, and fine levels still use the full occupancy grid.
-template <typename T>
-inline int dwt_plane_x_launch_grid(uint32_t lx, uint32_t ly, uint32_t nz) {
-    constexpr uint32_t cap = 32768U / sizeof(T);
-    const uint32_t rpt = min(max(cap / lx, 1U), 256U);
-    const uint64_t rows = static_cast<uint64_t>(ly) * nz;
-    const uint64_t chunks = (rows + rpt - 1U) / rpt;
-    const int occupancy_blocks = DWTConfig<T>::x_blocks;
-    return chunks < static_cast<uint64_t>(occupancy_blocks)
-               ? max(1, static_cast<int>(chunks))
-               : occupancy_blocks;
-}
-
-template <typename T>
-inline int dwt_plane_y_launch_grid(uint32_t lx, uint32_t ly, uint32_t nz) {
-    constexpr uint32_t cap = 32768U / sizeof(T);
-    const uint32_t rpt = max(cap / lx, 1U);
-    const uint64_t rows = static_cast<uint64_t>(ly) * nz;
-    const uint64_t chunks = (rows + rpt - 1U) / rpt;
-    const int occupancy_blocks = DWTConfig<T>::y_blocks;
-    return chunks < static_cast<uint64_t>(occupancy_blocks)
-               ? max(1, static_cast<int>(chunks))
-               : occupancy_blocks;
-}
-
-template <typename T>
-inline void dwt_plane_y_coarse_launch(const T* src, T* dst, uint32_t nx, uint32_t ny, uint32_t lx, uint32_t ly,
-                                      uint32_t lz, uint32_t counter_index, cudaStream_t stream) {
-    const int gy = dwt_plane_y_launch_grid<T>(lx, ly, lz);
-    dwt_y_axis<T><<<gy, TPB, 0, stream>>>(src, dst, nx, ny, lx, ly, lz, counter_index);
-}
-
 // Launch one fused XY level over the active low-low rectangle while retaining
 // the original volume strides. Finalized subbands are quantized immediately;
 // only the next low-low rectangle is materialized for the following level.
@@ -2168,100 +1608,6 @@ __device__ __forceinline__ void dwt_z_active_transform_pair(
     }
 }
 
-// Double-precision one-level Z body inlined into dwt_3d_z_single_static<double>.
-// It stages one or more active columns in one buffer and writes the
-// low/high coefficients directly to global memory; no all-level ping-pong
-// state is carried into this specialized path.
-template <bool ZTilesStayInRow, bool QuantBlocksRegular>
-__device__ __forceinline__ void dwt_3d_single_shared_double(
-    const double* src, double* dst, dim3 data_dims, dim3 chunk_dims, double* s_data,
-    uint32_t capacity, unsigned int* counter, int* chunk_id,
-    QuantMode quant_mode) {
-    const uint32_t nx = data_dims.x;
-    const uint32_t ny = data_dims.y;
-    const uint32_t lx = chunk_dims.x;
-    const uint32_t ly = chunk_dims.y;
-    const uint32_t lz = chunk_dims.z;
-    const size_t leap_z = static_cast<size_t>(nx) * ny;
-    const uint32_t total_columns = lx * ly;
-    uint32_t columns_per_chunk = min(capacity / lz, total_columns);
-    if (columns_per_chunk >= 2U)
-        columns_per_chunk &= ~1U;
-    columns_per_chunk = max(columns_per_chunk, 1U);
-
-    const uint32_t chunks =
-        (total_columns + columns_per_chunk - 1U) / columns_per_chunk;
-    const uint32_t even_z = lz - (lz >> 1U);
-    const uint32_t low_x = lx - (lx >> 1U);
-    const uint32_t low_y = ly - (ly >> 1U);
-
-    while (true) {
-        if (threadIdx.x == 0)
-            *chunk_id = static_cast<int>(atomicAdd(counter, 1U));
-        __syncthreads();
-        const uint32_t chunk = static_cast<uint32_t>(*chunk_id);
-        if (chunk >= chunks)
-            break;
-
-        const uint32_t column0 = chunk * columns_per_chunk;
-        const uint32_t ncol = min(columns_per_chunk, total_columns - column0);
-        const uint32_t tile_elements = ncol * lz;
-        uint32_t tile_x0 = 0U;
-        uint32_t tile_y = 0U;
-        if constexpr (ZTilesStayInRow) {
-            tile_y = column0 / lx;
-            tile_x0 = column0 - tile_y * lx;
-        }
-
-        const bool contiguous_columns = lx == nx || ZTilesStayInRow;
-        const size_t global_column0 = ZTilesStayInRow
-                                          ? tile_x0 + static_cast<size_t>(tile_y) * nx
-                                          : column0;
-        const bool vector_load = contiguous_columns && ncol == columns_per_chunk &&
-                                 (ncol & 1U) == 0U &&
-                                 (global_column0 & 1U) == 0U &&
-                                 (leap_z & 1U) == 0U &&
-                                 (reinterpret_cast<uintptr_t>(src) & 15U) == 0U;
-        if (vector_load) {
-            const uint32_t vector_columns = ncol >> 1U;
-            const uint32_t vector_elements = lz * vector_columns;
-            double2* const shared2 = reinterpret_cast<double2*>(s_data);
-            for (uint32_t i = threadIdx.x; i < vector_elements; i += TPB) {
-                const uint32_t z = i / vector_columns;
-                const uint32_t vc = i - z * vector_columns;
-                shared2[i] = *reinterpret_cast<const double2*>(
-                    src + global_column0 + (vc << 1U) +
-                    static_cast<size_t>(z) * leap_z);
-            }
-        } else {
-            for (uint32_t i = threadIdx.x; i < tile_elements; i += TPB) {
-                const uint32_t z = i / ncol;
-                const uint32_t local_column = i - z * ncol;
-                const uint32_t active_column = column0 + local_column;
-                const uint32_t x = ZTilesStayInRow
-                                       ? tile_x0 + local_column
-                                       : active_column % lx;
-                const uint32_t y = ZTilesStayInRow ? tile_y : active_column / lx;
-                s_data[i] = src[x + static_cast<size_t>(y) * nx +
-                                static_cast<size_t>(z) * leap_z];
-            }
-        }
-        __syncthreads();
-
-        const uint32_t work = even_z * ncol;
-        for (uint32_t i = threadIdx.x; i < work; i += TPB) {
-            const uint32_t pair = i / ncol;
-            const uint32_t local_column = i - pair * ncol;
-            dwt_z_active_transform_pair<double, true, ZTilesStayInRow, true,
-                                        QuantBlocksRegular>(
-                s_data, dst, ncol, data_dims, lx, lz, column0, pair,
-                local_column, leap_z, even_z, low_x, low_y, quant_mode,
-                tile_x0, tile_y);
-        }
-        __syncthreads();
-    }
-}
-
 template <typename T>
 __global__ __launch_bounds__(TPB, 2) void dwt_3d_z_single_global(const T* src, T* dst, dim3 data_dims, dim3 chunk_dims,
     QuantMode quant_mode) {
@@ -2312,16 +1658,18 @@ __global__ __launch_bounds__(TPB, 2) void dwt_3d_z_single_global(const T* src, T
     }
 }
 
-// One-level float body inlined into dwt_3d_z_single_static<float>.
-// It deliberately keeps the original two-buffer data flow: stage the
-// input, form a complete transformed tile, then quantize that tile in linear
-// order. __forceinline__ makes this body part of each kernel's generated SASS;
-// it does not call the multi-level Z-all implementation.
-template <bool ZTilesStayInRow, bool QuantBlocksRegular>
-__device__ __forceinline__ void dwt_3d_single_shared_float(
-    const float* src, float* dst, dim3 data_dims, dim3 chunk_dims,
-    float* s_data, uint32_t capacity, unsigned int* counter, int* chunk_id,
+// One-level shared Z body. Common scheduling and vector loads; float retains
+// two buffers and two-pair input reuse, double retains direct one-pair output.
+template <typename T, bool ZTilesStayInRow, bool QuantBlocksRegular>
+__device__ __forceinline__ void dwt_3d_single_shared(
+    const T* src, T* dst, dim3 data_dims, dim3 chunk_dims,
+    T* s_data, uint32_t capacity, unsigned int* counter, int* chunk_id,
     QuantMode quant_mode) {
+    constexpr bool is_float = std::is_same_v<T, float>;
+    constexpr uint32_t vector_shift = is_float ? 2U : 1U;
+    constexpr uint32_t vector_width = 1U << vector_shift;
+    constexpr uint32_t vector_mask = vector_width - 1U;
+    using Vector = std::conditional_t<is_float, float4, double2>;
     const uint32_t nx = data_dims.x;
     const uint32_t ny = data_dims.y;
     const uint32_t lx = chunk_dims.x;
@@ -2329,9 +1677,9 @@ __device__ __forceinline__ void dwt_3d_single_shared_float(
     const uint32_t lz = chunk_dims.z;
     const size_t leap_z = static_cast<size_t>(nx) * ny;
     const uint32_t total_columns = lx * ly;
-    uint32_t columns_per_chunk = min(capacity / (2U * lz), total_columns);
-    if (columns_per_chunk >= 4U)
-        columns_per_chunk &= ~3U;
+    uint32_t columns_per_chunk = min(capacity / ((is_float ? 2U : 1U) * lz), total_columns);
+    if (columns_per_chunk >= vector_width)
+        columns_per_chunk &= ~vector_mask;
     columns_per_chunk = max(columns_per_chunk, 1U);
     const uint32_t chunks =
         (total_columns + columns_per_chunk - 1U) / columns_per_chunk;
@@ -2350,9 +1698,6 @@ __device__ __forceinline__ void dwt_3d_single_shared_float(
         const uint32_t column0 = chunk * columns_per_chunk;
         const uint32_t ncol = min(columns_per_chunk, total_columns - column0);
         const uint32_t tile_elements = ncol * lz;
-        const uint32_t buffer_elements = columns_per_chunk * lz;
-        float* const s_src = s_data;
-        float* const s_dst = s_data + buffer_elements;
         uint32_t tile_x0 = 0U;
         uint32_t tile_y = 0U;
         if constexpr (ZTilesStayInRow) {
@@ -2365,19 +1710,19 @@ __device__ __forceinline__ void dwt_3d_single_shared_float(
                                           ? tile_x0 + static_cast<size_t>(tile_y) * nx
                                           : column0;
         const bool vector_load = contiguous_columns && ncol == columns_per_chunk &&
-                                 (ncol & 3U) == 0U &&
-                                 (global_column0 & 3U) == 0U &&
-                                 (leap_z & 3U) == 0U &&
+                                 (ncol & vector_mask) == 0U &&
+                                 (global_column0 & vector_mask) == 0U &&
+                                 (leap_z & vector_mask) == 0U &&
                                  (reinterpret_cast<uintptr_t>(src) & 15U) == 0U;
         if (vector_load) {
-            const uint32_t vector_columns = ncol >> 2U;
+            const uint32_t vector_columns = ncol >> vector_shift;
             const uint32_t vector_elements = lz * vector_columns;
-            float4* const shared4 = reinterpret_cast<float4*>(s_src);
+            Vector* const shared_vec = reinterpret_cast<Vector*>(s_data);
             for (uint32_t i = threadIdx.x; i < vector_elements; i += TPB) {
                 const uint32_t z = i / vector_columns;
                 const uint32_t vc = i - z * vector_columns;
-                shared4[i] = *reinterpret_cast<const float4*>(
-                    src + global_column0 + (vc << 2U) +
+                shared_vec[i] = *reinterpret_cast<const Vector*>(
+                    src + global_column0 + (vc << vector_shift) +
                     static_cast<size_t>(z) * leap_z);
             }
         } else {
@@ -2389,73 +1734,87 @@ __device__ __forceinline__ void dwt_3d_single_shared_float(
                                        ? tile_x0 + local_column
                                        : active_column % lx;
                 const uint32_t y = ZTilesStayInRow ? tile_y : active_column / lx;
-                s_src[i] = src[x + static_cast<size_t>(y) * nx +
+                s_data[i] = src[x + static_cast<size_t>(y) * nx +
                                static_cast<size_t>(z) * leap_z];
             }
         }
         __syncthreads();
 
-        const uint32_t groups = (even_z + 1U) >> 1U;
-        const uint32_t work = groups * ncol;
-        for (uint32_t i = threadIdx.x; i < work; i += TPB) {
-            const uint32_t group = i / ncol;
-            const uint32_t local_column = i - group * ncol;
-            const uint32_t pair = group << 1U;
-            const int z = static_cast<int>(pair << 1U);
-            if (pair + 1U < even_z && z >= 4 && z + 6 < static_cast<int>(lz)) {
-                const float c0 = s_src[static_cast<uint32_t>(z - 4) * ncol + local_column];
-                const float c1 = s_src[static_cast<uint32_t>(z - 3) * ncol + local_column];
-                const float c2 = s_src[static_cast<uint32_t>(z - 2) * ncol + local_column];
-                const float c3 = s_src[static_cast<uint32_t>(z - 1) * ncol + local_column];
-                const float c4 = s_src[static_cast<uint32_t>(z) * ncol + local_column];
-                const float c5 = s_src[static_cast<uint32_t>(z + 1) * ncol + local_column];
-                const float c6 = s_src[static_cast<uint32_t>(z + 2) * ncol + local_column];
-                const float c7 = s_src[static_cast<uint32_t>(z + 3) * ncol + local_column];
-                const float c8 = s_src[static_cast<uint32_t>(z + 4) * ncol + local_column];
-                const float c9 = s_src[static_cast<uint32_t>(z + 5) * ncol + local_column];
-                const float c10 = s_src[static_cast<uint32_t>(z + 6) * ncol + local_column];
-                s_dst[pair * ncol + local_column] = plane_z_low_filter<float>(
-                    c4, add_rn<float>(c3, c5), add_rn<float>(c2, c6),
-                    add_rn<float>(c1, c7), add_rn<float>(c0, c8));
-                s_dst[(even_z + pair) * ncol + local_column] =
-                    plane_z_high_filter<float>(
-                        c5, add_rn<float>(c4, c6), add_rn<float>(c3, c7),
-                        add_rn<float>(c2, c8));
-                s_dst[(pair + 1U) * ncol + local_column] =
-                    plane_z_low_filter<float>(
-                        c6, add_rn<float>(c5, c7), add_rn<float>(c4, c8),
-                        add_rn<float>(c3, c9), add_rn<float>(c2, c10));
-                if (z + 3 < static_cast<int>(lz))
-                    s_dst[(even_z + pair + 1U) * ncol + local_column] =
+        if constexpr (is_float) {
+            T* const s_dst = s_data + columns_per_chunk * lz;
+            const uint32_t groups = (even_z + 1U) >> 1U;
+            const uint32_t work = groups * ncol;
+            for (uint32_t i = threadIdx.x; i < work; i += TPB) {
+                const uint32_t group = i / ncol;
+                const uint32_t local_column = i - group * ncol;
+                const uint32_t pair = group << 1U;
+                const int z = static_cast<int>(pair << 1U);
+                if (pair + 1U < even_z && z >= 4 && z + 6 < static_cast<int>(lz)) {
+                    const float c0 = s_data[static_cast<uint32_t>(z - 4) * ncol + local_column];
+                    const float c1 = s_data[static_cast<uint32_t>(z - 3) * ncol + local_column];
+                    const float c2 = s_data[static_cast<uint32_t>(z - 2) * ncol + local_column];
+                    const float c3 = s_data[static_cast<uint32_t>(z - 1) * ncol + local_column];
+                    const float c4 = s_data[static_cast<uint32_t>(z) * ncol + local_column];
+                    const float c5 = s_data[static_cast<uint32_t>(z + 1) * ncol + local_column];
+                    const float c6 = s_data[static_cast<uint32_t>(z + 2) * ncol + local_column];
+                    const float c7 = s_data[static_cast<uint32_t>(z + 3) * ncol + local_column];
+                    const float c8 = s_data[static_cast<uint32_t>(z + 4) * ncol + local_column];
+                    const float c9 = s_data[static_cast<uint32_t>(z + 5) * ncol + local_column];
+                    const float c10 = s_data[static_cast<uint32_t>(z + 6) * ncol + local_column];
+                    s_dst[pair * ncol + local_column] = plane_z_low_filter<float>(
+                        c4, add_rn<float>(c3, c5), add_rn<float>(c2, c6),
+                        add_rn<float>(c1, c7), add_rn<float>(c0, c8));
+                    s_dst[(even_z + pair) * ncol + local_column] =
                         plane_z_high_filter<float>(
-                            c7, add_rn<float>(c6, c8), add_rn<float>(c5, c9),
-                            add_rn<float>(c4, c10));
-            } else {
-                plane_z_forward_pair_float(
-                    s_src, s_dst, ncol, lz, even_z, pair, local_column);
-                if (pair + 1U < even_z)
+                            c5, add_rn<float>(c4, c6), add_rn<float>(c3, c7),
+                            add_rn<float>(c2, c8));
+                    s_dst[(pair + 1U) * ncol + local_column] =
+                        plane_z_low_filter<float>(
+                            c6, add_rn<float>(c5, c7), add_rn<float>(c4, c8),
+                            add_rn<float>(c3, c9), add_rn<float>(c2, c10));
+                    if (z + 3 < static_cast<int>(lz))
+                        s_dst[(even_z + pair + 1U) * ncol + local_column] =
+                            plane_z_high_filter<float>(
+                                c7, add_rn<float>(c6, c8), add_rn<float>(c5, c9),
+                                add_rn<float>(c4, c10));
+                } else {
                     plane_z_forward_pair_float(
-                        s_src, s_dst, ncol, lz, even_z, pair + 1U, local_column);
+                        s_data, s_dst, ncol, lz, even_z, pair, local_column);
+                    if (pair + 1U < even_z)
+                        plane_z_forward_pair_float(
+                            s_data, s_dst, ncol, lz, even_z, pair + 1U, local_column);
+                }
             }
-        }
-        __syncthreads();
+            __syncthreads();
 
-        for (uint32_t i = threadIdx.x; i < tile_elements; i += TPB) {
-            const uint32_t z = i / ncol;
-            const uint32_t local_column = i - z * ncol;
-            const uint32_t active_column = column0 + local_column;
-            const uint32_t x = ZTilesStayInRow
-                                   ? tile_x0 + local_column
-                                   : active_column % lx;
-            const uint32_t y = ZTilesStayInRow ? tile_y : active_column / lx;
-            const size_t index = x + static_cast<size_t>(y) * nx +
-                                 static_cast<size_t>(z) * leap_z;
-            const float value = s_dst[i];
-            if (quant_mode == QuantMode::High && x < low_x && y < low_y && z < even_z)
-                dst[index] = value;
-            else
-                quantization<QuantBlocksRegular>(
-                    value, index, x, y, z, data_dims);
+            for (uint32_t i = threadIdx.x; i < tile_elements; i += TPB) {
+                const uint32_t z = i / ncol;
+                const uint32_t local_column = i - z * ncol;
+                const uint32_t active_column = column0 + local_column;
+                const uint32_t x = ZTilesStayInRow
+                                       ? tile_x0 + local_column
+                                       : active_column % lx;
+                const uint32_t y = ZTilesStayInRow ? tile_y : active_column / lx;
+                const size_t index = x + static_cast<size_t>(y) * nx +
+                                     static_cast<size_t>(z) * leap_z;
+                const float value = s_dst[i];
+                if (quant_mode == QuantMode::High && x < low_x && y < low_y && z < even_z)
+                    dst[index] = value;
+                else
+                    quantization<QuantBlocksRegular>(
+                        value, index, x, y, z, data_dims);
+            }
+        } else {
+            const uint32_t work = even_z * ncol;
+            for (uint32_t i = threadIdx.x; i < work; i += TPB) {
+                const uint32_t pair = i / ncol;
+                const uint32_t local_column = i - pair * ncol;
+                dwt_z_active_transform_pair<T, true, ZTilesStayInRow, true,
+                                            QuantBlocksRegular>(
+                    s_data, dst, ncol, data_dims, lx, lz, column0, pair,
+                    local_column, leap_z, even_z, low_x, low_y, quant_mode,
+                    tile_x0, tile_y);
+            }
         }
         __syncthreads();
     }
@@ -2472,15 +1831,9 @@ dwt_3d_z_single_static(
     constexpr uint32_t capacity = 32768U / sizeof(T);
     __shared__ alignas(128) T s_data[capacity];
     __shared__ int s_chunkID;
-    if constexpr (std::is_same_v<T, float>) {
-        dwt_3d_single_shared_float<ZTilesStayInRow, QuantBlocksRegular>(
-            src, dst, data_dims, chunk_dims, s_data, capacity,
-            &z_count[counter_index], &s_chunkID, quant_mode);
-    } else if constexpr (std::is_same_v<T, double>) {
-        dwt_3d_single_shared_double<ZTilesStayInRow, QuantBlocksRegular>(
-            src, dst, data_dims, chunk_dims, s_data, capacity,
-            &z_count[counter_index], &s_chunkID, quant_mode);
-    }
+    dwt_3d_single_shared<T, ZTilesStayInRow, QuantBlocksRegular>(
+        src, dst, data_dims, chunk_dims, s_data, capacity,
+        &z_count[counter_index], &s_chunkID, quant_mode);
 }
 
 template <typename T> inline cudaError_t idwt3d_plane_prealloc(dim3 dims);
@@ -2500,8 +1853,6 @@ inline void dwt3d_split_prealloc(dim3 dims, bool use_dyadic) {
         grid_blocks = max(blocks_per_sm, 1) * multiprocessor_count;
     };
 
-    initialize_grid_blocks(dwt_x_axis<T>, DWTConfig<T>::x_blocks);
-    initialize_grid_blocks(dwt_y_axis<T>, DWTConfig<T>::y_blocks);
     initialize_grid_blocks(dwt_3d_z_all_static<T>, DWTConfig<T>::z_blocks);
 }
 

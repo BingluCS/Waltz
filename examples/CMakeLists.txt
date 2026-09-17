@@ -5,8 +5,4 @@ set_target_properties(
     PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}
                INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
 
-add_executable(tune_demo tune_demo.cu)
-target_link_libraries(tune_demo PRIVATE Waltz::waltz)
-set_target_properties(tune_demo PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR})
-
 install(TARGETS waltz RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

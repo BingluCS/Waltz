@@ -105,7 +105,6 @@ The default build produces:
 
 - `build/libwaltz.so` (or a static library with `-DBUILD_SHARED_LIBS=OFF`)
 - `build/waltz`, the command-line compression and verification driver
-- `build/tune_demo`, the standalone topology-tuner harness
 
 Install the library, headers, CLI, and CMake package metadata with:
 
@@ -166,11 +165,22 @@ Float64 with an absolute error bound:
   -M ABS 1e-6
 ```
 
-`-o` is optional. When supplied, the driver immediately decodes the in-memory
-blob, writes the reconstructed field, and reports Max_E, Max_RE, PSNR, NRMSE,
-compressed size, compression ratio, and stage timings. The driver writes the
-compressed blob named by `-z`; it does not yet provide a separate command that
-reopens an existing blob in a later process.
+`-o` is optional. When supplied during compression, the driver reopens the
+compressed file, decompresses it, writes the reconstruction, and reports
+Max_E, Max_RE, PSNR and NRMSE against the original input. Host verification is
+outside kernel and API e2e timing. Compression and decompression each report
+their compression ratio and stage timings; decode includes `block-offset`.
+
+An existing compressed file can also be decompressed independently:
+
+```bash
+./build/waltz -f -z field.waltz -o field.reconstructed.f32 -3 512 512 512
+```
+
+The current compressed header stores neither dimensions nor data type. Supply
+the original `-3` dimensions and `-f`/`-d` type on decode. Standalone decode
+without an original reference does not report PSNR or error statistics.
+Old development formats are not supported; regenerate old compressed files.
 
 Use `CUDA_VISIBLE_DEVICES` to select a GPU:
 
@@ -221,8 +231,6 @@ switches are:
 | --- | --- |
 | `WALTZ_REPORT_CE2E=1` | report wall time for the timed compression/decompression region; see scope below |
 | `WALTZ_ASYNC_ALLOC=1` | enable explicit one-time pipeline preallocation/warmup |
-| `WALTZ_WZP=0` | select the legacy LC magnitude backend instead of default WZP |
-| `WALTZ_WZP_DEQUANT_FUSE_OFF=1` | disable fused WZP decode/reorder/dequantization for comparison |
 
 The default benchmark path is cold-start compatible: no hidden warmup pass is
 performed unless `WALTZ_ASYNC_ALLOC=1` is explicitly set.
@@ -274,9 +282,8 @@ general compression-ratio guarantee.
 ```text
 include/                 public API and CUDA transform/codec headers
 src/waltz.cu             compression and decompression pipeline
-src/lossless/            LC and WZP GPU backends
+src/lossless/            WZP GPU backend
 examples/waltz.cu        command-line driver
-examples/tune_demo.cu    transform-topology tuner harness
 tools/wzp_gpu_bench.cu   optional WZP round-trip benchmark
 tools/wzp_single_kernel_test.cu  optional signed-WZP regression
 ```

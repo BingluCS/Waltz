@@ -1,10 +1,9 @@
-#include "lossless/lc.hpp"
 #include "lossless/reorder.hpp"
 #include "lossless/wzp.hpp"
-#include "quantizer/quant_reorder.hpp"
 #include "transformers/CDF97.hpp"
 #include "transformers/ICDF97.hpp"
 #include "waltz.hpp"
+#include "utils/Blob.hpp"
 #include "utils/Timer.hpp"
 #include "utils/Statistics.hpp"
 #include "utils/def.hpp"
@@ -19,27 +18,6 @@
 
 namespace WALTZ {
 
-// Compressed-stream header (device blob layout; 8B-aligned sections follow):
-//   header | magnitude stream | packed sign | pwe_idx u32[] | pwe_error stream |
-//   qo_idx u32[] | qo_val i32[]
-struct WaltzBlobHeader {
-    uint32_t dimx, dimy, dimz, datasize;
-    uint8_t dtype;      // sizeof(T)
-    uint8_t use_dyadic; // bit0: dyadic; bits1..6: reorder z-band (0=legacy)
-    uint8_t levels_xy, levels_z;
-    uint8_t sep_xy;          // Encoder writes 0; nonzero values are legacy decode modes.
-    uint8_t mag_coder;       // 0=LC, 7=WZP; all other values are unsupported.
-    uint8_t pwe_format;      // 2: uint32_t index followed by an exact raw T error
-    uint8_t transform_flags; // Legacy format flags; unsupported transforms are rejected.
-    uint32_t nnz;            // sign bits
-
-    double q;     // quantization step
-    double bound; // point-wise error bound
-    uint64_t mag_comp_bytes;
-    uint32_t n_pwe, n_qo;
-};
-static constexpr uint8_t TRANSFORM_P4 = 0x80U;
-static_assert(sizeof(WaltzBlobHeader) == 64, "Waltz blob header layout must remain 64 bytes");
 static inline size_t blob_align(size_t v) {
     return (v + 7) & ~static_cast<size_t>(7);
 }
@@ -50,46 +28,35 @@ struct BlobSection {
 };
 
 template <typename T>
-static size_t Waltz_gather(void* output, dim3 dims, uint32_t datasize, bool use_dyadic,
-                     uint32_t fused_bz, uint8_t levels_xy, uint8_t levels_z,
-                     uint32_t nnz, double quantity, double bound, uint8_t mag_coder,
-                     size_t mag_bytes, const unsigned char* sign,
+static size_t Waltz_gather(void* output, bool use_dyadic,
+                     uint32_t reorder_bz, uint8_t levels_xy, uint8_t levels_z,
+                     double quantity, size_t mag_bytes,
                      uint32_t pwe_count, const uint32_t* pwe_index, const T* pwe_error,
                      uint32_t qout_count, const uint32_t* quant_index,
                      const int32_t* quant_value, cudaStream_t stream) {
     WaltzBlobHeader hdr{};
-    hdr.dimx = dims.x;
-    hdr.dimy = dims.y;
-    hdr.dimz = dims.z;
-    hdr.datasize = datasize;
-    hdr.dtype = static_cast<uint8_t>(sizeof(T));
-    // bit 0 is dyadic; bits 1..6 encode the reorder z-band (0 = legacy).
-    hdr.use_dyadic = static_cast<uint8_t>((use_dyadic ? 1U : 0U) | (fused_bz << 1U));
+    hdr.use_dyadic = static_cast<uint8_t>(use_dyadic);
+    hdr.reorder_bz = static_cast<uint8_t>(reorder_bz);
     hdr.levels_xy = levels_xy;
     hdr.levels_z = levels_z;
-    hdr.nnz = nnz;
     hdr.q = quantity;
-    hdr.bound = bound;
-    hdr.mag_coder = mag_coder;
-    hdr.pwe_format = 2U;
     hdr.mag_comp_bytes = static_cast<uint64_t>(mag_bytes);
     hdr.n_pwe = pwe_count;
     hdr.n_qo = qout_count;
     // Keep section order and 8-byte alignment identical to Waltz_scatter.
     const BlobSection sections[] = {
-        {mag_coder == 7U ? lossless::wzp_encoded_buf() : lossless::lc_encoded_buf(), mag_bytes},
-        {sign, mag_coder == 0U ? (static_cast<size_t>(nnz) + 7U) / 8U : 0U},
+        {lossless::wzp_encoded_buf(), mag_bytes},
         {pwe_index, pwe_count * sizeof(uint32_t)},
         {pwe_error, pwe_count * sizeof(T)},
         {quant_index, qout_count * sizeof(uint32_t)},
         {quant_value, qout_count * sizeof(int32_t)},
     };
-    auto* blob = static_cast<unsigned char*>(output);
-    cudaMemcpyAsync(blob, &hdr, sizeof(hdr), cudaMemcpyHostToDevice, stream);
+    auto* cmpdata = static_cast<unsigned char*>(output);
+    cudaMemcpyAsync(cmpdata, &hdr, sizeof(hdr), cudaMemcpyHostToDevice, stream);
     size_t offset = blob_align(sizeof(hdr));
     for (const auto& section : sections) {
         if (section.bytes != 0U)
-            cudaMemcpyAsync(blob + offset, section.data, section.bytes,
+            cudaMemcpyAsync(cmpdata + offset, section.data, section.bytes,
                             cudaMemcpyDeviceToDevice, stream);
         offset = blob_align(offset + section.bytes);
     }
@@ -100,39 +67,40 @@ static size_t Waltz_gather(void* output, dim3 dims, uint32_t datasize, bool use_
 
 struct BlobView {
     const unsigned char* magnitude;
-    const unsigned char* sign;
     const unsigned char* pwe_index;
     const unsigned char* pwe_error;
     const unsigned char* quant_index;
     const unsigned char* quant_value;
+    size_t bytes;
 };
 
 // Split the blob into device views, without allocating or copying payloads.
+template <typename T>
 static BlobView Waltz_scatter(const void* input, const WaltzBlobHeader& hdr) {
-    const auto* blob = static_cast<const unsigned char*>(input);
+    const auto* cmpdata = static_cast<const unsigned char*>(input);
     const size_t sizes[] = {
         static_cast<size_t>(hdr.mag_comp_bytes),
-        hdr.mag_coder == 0U ? (static_cast<size_t>(hdr.nnz) + 7U) / 8U : 0U,
         hdr.n_pwe * sizeof(uint32_t),
-        static_cast<size_t>(hdr.n_pwe) * hdr.dtype,
+        static_cast<size_t>(hdr.n_pwe) * sizeof(T),
         hdr.n_qo * sizeof(uint32_t),
         hdr.n_qo * sizeof(int32_t),
     };
     BlobView view{};
     const unsigned char** sections[] = {
-        &view.magnitude, &view.sign, &view.pwe_index, &view.pwe_error,
+        &view.magnitude, &view.pwe_index, &view.pwe_error,
         &view.quant_index, &view.quant_value,
     };
     size_t offset = blob_align(sizeof(hdr));
-    for (size_t i = 0; i < 6; ++i) {
-        *sections[i] = blob + offset;
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        *sections[i] = cmpdata + offset;
         offset = blob_align(offset + sizes[i]);
     }
+    view.bytes = offset;
     return view;
 }
 
 // Detect and record points whose reconstruction error exceeds the bound.  The
-// dyadic path fuses the same operation into the finest inverse-DWT pass.
+// Inverse-DWT paths fuse this operation when a final synthesis pass is available.
 template <typename T>
 __global__ void count_outliers(const T* xhat, const T* orig, uint64_t n, double bound, unsigned int* cnt,
     uint32_t* oidx, T* oerr, uint32_t ocap) {
@@ -251,10 +219,6 @@ __global__ void d_isotropy_stats(const T* __restrict__ vol, uint32_t nx, uint32_
     }
 }
 
-template <typename T, uint32_t STEP>
-__global__ void d_isotropy_stats(const T* vol, uint32_t nx, uint32_t ny, uint32_t nz,
-                                 double ctau, double* acc, unsigned int* nzc);
-
 // Tiny compression-result copies use this reusable pinned array so they can be
 // queued together and completed by one synchronization.
 static unsigned int* g_host_outlier_counts = nullptr;
@@ -265,7 +229,26 @@ static double* g_tune_host_acc = nullptr;
 static unsigned int* g_tune_host_nzc = nullptr;
 static cudaEvent_t g_tune_begin = nullptr;
 static cudaEvent_t g_tune_end = nullptr;
+constexpr size_t TUNE_RESULT_BYTES = 6U * sizeof(double) + sizeof(unsigned int);
 void calculate_dwt_levels(dim3 data_dims, uint8_t& levels_xy, uint8_t& levels_z);
+
+static void reserve_tuner(cudaStream_t stream, bool async_alloc = false) {
+    if (g_tune_acc == nullptr) {
+        if (async_alloc)
+            cudaMallocAsync(reinterpret_cast<void**>(&g_tune_acc), TUNE_RESULT_BYTES, stream);
+        else
+            cudaMalloc(reinterpret_cast<void**>(&g_tune_acc), TUNE_RESULT_BYTES);
+        g_tune_nzc = reinterpret_cast<unsigned int*>(g_tune_acc + 6);
+    }
+    if (g_tune_host_acc == nullptr) {
+        cudaMallocHost(reinterpret_cast<void**>(&g_tune_host_acc), TUNE_RESULT_BYTES);
+        g_tune_host_nzc = reinterpret_cast<unsigned int*>(g_tune_host_acc + 6);
+    }
+    if (g_tune_begin == nullptr) {
+        cudaEventCreate(&g_tune_begin);
+        cudaEventCreate(&g_tune_end);
+    }
+}
 
 template <typename T>
 void d_pipeline_prealloc(const WALTZ::Config& config, void* stream) {
@@ -276,21 +259,7 @@ void d_pipeline_prealloc(const WALTZ::Config& config, void* stream) {
     if (g_pipeline_host_header == nullptr)
         cudaMallocHost(reinterpret_cast<void**>(&g_pipeline_host_header),
                        sizeof(WaltzBlobHeader));
-
-    if (g_tune_acc == nullptr) {
-        cudaMallocAsync(reinterpret_cast<void**>(&g_tune_acc),
-                       6U * sizeof(double) + sizeof(unsigned int), st);
-        g_tune_nzc = reinterpret_cast<unsigned int*>(g_tune_acc + 6);
-    }
-    if (g_tune_host_acc == nullptr) {
-        cudaMallocHost(reinterpret_cast<void**>(&g_tune_host_acc),
-                       6U * sizeof(double) + sizeof(unsigned int));
-        g_tune_host_nzc = reinterpret_cast<unsigned int*>(g_tune_host_acc + 6);
-    }
-    if (g_tune_begin == nullptr) {
-        cudaEventCreate(&g_tune_begin);
-        cudaEventCreate(&g_tune_end);
-    }
+    reserve_tuner(st, true);
 
     // Load both adaptive-sampling kernel variants and map their tiny result
     // buffer before the measured compression interval. The real field sample
@@ -298,7 +267,7 @@ void d_pipeline_prealloc(const WALTZ::Config& config, void* stream) {
     T* tune_dummy = nullptr;
     cudaMallocAsync(reinterpret_cast<void**>(&tune_dummy), 27U * sizeof(T), st);
     cudaMemsetAsync(tune_dummy, 0, 27U * sizeof(T), st);
-    cudaMemsetAsync(g_tune_acc, 0, 6U * sizeof(double) + sizeof(unsigned int), st);
+    cudaMemsetAsync(g_tune_acc, 0, TUNE_RESULT_BYTES, st);
     d_isotropy_stats<T, 8U><<<1, 256, 0, st>>>(
         tune_dummy, 3U, 3U, 3U, 0.0, g_tune_acc, g_tune_nzc);
     d_isotropy_stats<T, 4U><<<1, 256, 0, st>>>(
@@ -309,27 +278,14 @@ void d_pipeline_prealloc(const WALTZ::Config& config, void* stream) {
     if (n64 > std::numeric_limits<uint32_t>::max())
         throw std::overflow_error("Waltz WZP workspace exceeds uint32 capacity");
     const uint32_t n = static_cast<uint32_t>(n64);
-    const char* const wzp_env = std::getenv("WALTZ_WZP");
-    if (wzp_env == nullptr || std::atoi(wzp_env) != 0)
-        WALTZ::lossless::wzp_prealloc(n, st);
+    WALTZ::lossless::wzp_prealloc(n, st);
 
-    // Load and initialize the inverse-quantization module outside the measured interval.
-    uint16_t* warm_q = nullptr;
-    uint32_t* warm_sb = nullptr;
-    T* warm_out = nullptr;
-    uint16_t* warm_tb = nullptr;
-    cudaMallocAsync(reinterpret_cast<void**>(&warm_q), 256U * sizeof(uint16_t), st);
-    cudaMallocAsync(reinterpret_cast<void**>(&warm_sb), 1024U, st);
-    cudaMallocAsync(reinterpret_cast<void**>(&warm_out), 256U * sizeof(T), st);
+    // Warm the inverse-reorder table builder used by fused WZP decode.
+    uint32_t* warm_tb = nullptr;
     cudaMallocAsync(reinterpret_cast<void**>(&warm_tb),
-                   32U * 32U * 32U * sizeof(uint16_t), st);
-    cudaMemsetAsync(warm_q, 0, 256U * sizeof(uint16_t), st);
-    cudaMemsetAsync(warm_sb, 0, 1024U, st);
-    WALTZ::quantizer::unquant<T>(
-        warm_q, warm_sb, warm_out, dim3(16U, 16U, 1U), 1U, warm_tb, 1.0, st);
-    cudaFreeAsync(warm_q, st);
-    cudaFreeAsync(warm_sb, st);
-    cudaFreeAsync(warm_out, st);
+                   256U * sizeof(uint32_t), st);
+    WALTZ::lossless::d_build_block_ioffset<<<1, 256, 0, st>>>(
+        warm_tb, 16U, 16U, 1U, 16U, 256U, dim3(16U, 16U, 1U));
     cudaFreeAsync(warm_tb, st);
 
     const dim3 dims(config.dimx, config.dimy, config.dimz);
@@ -339,7 +295,7 @@ void d_pipeline_prealloc(const WALTZ::Config& config, void* stream) {
     cudaStreamSynchronize(st);
 }
 template <typename T, uint32_t STEP>
-static void sample_isotropy(const T* d_data, dim3 dims, double ctau, double* d_acc, unsigned int* d_nzc,
+static void sample_isotropy(const T* d_data, dim3 dims, double ctau,
     cudaStream_t st, double& cs, double& nz0, double& time_ms) {
     static_assert(STEP == 4u || STEP == 8u, "autotune sampling stride must be 4 or 8");
 
@@ -350,30 +306,13 @@ static void sample_isotropy(const T* d_data, dim3 dims, double ctau, double* d_a
     const int tb = 256;
     const int gb = std::min(static_cast<int>((points + tb - 1) / tb), 4096);
 
-    // The default preallocation path initializes both device and pinned-host
-    // results before REL. Keep a fallback for explicit ordinary-allocation runs.
-    if (g_tune_acc == nullptr) {
-        cudaMalloc(reinterpret_cast<void**>(&g_tune_acc),
-                  6U * sizeof(double) + sizeof(unsigned int));
-        g_tune_nzc = reinterpret_cast<unsigned int*>(g_tune_acc + 6);
-    }
-    if (g_tune_host_acc == nullptr) {
-        cudaMallocHost(reinterpret_cast<void**>(&g_tune_host_acc),
-                       6U * sizeof(double) + sizeof(unsigned int));
-        g_tune_host_nzc = reinterpret_cast<unsigned int*>(g_tune_host_acc + 6);
-    }
-    if (g_tune_begin == nullptr) {
-        cudaEventCreate(&g_tune_begin);
-        cudaEventCreate(&g_tune_end);
-    }
+    reserve_tuner(st);
 
     cudaEventRecord(g_tune_begin, st);
-    d_acc = g_tune_acc;
-    d_nzc = g_tune_nzc;
-    cudaMemsetAsync(d_acc, 0, 6 * sizeof(double), st);
-    cudaMemsetAsync(d_nzc, 0, sizeof(unsigned int), st);
-    d_isotropy_stats<T, STEP><<<gb, tb, 0, st>>>(d_data, dims.x, dims.y, dims.z, ctau, d_acc, d_nzc);
-    cudaMemcpyAsync(g_tune_host_acc, d_acc, 6 * sizeof(double) + sizeof(unsigned int),
+    cudaMemsetAsync(g_tune_acc, 0, TUNE_RESULT_BYTES, st);
+    d_isotropy_stats<T, STEP><<<gb, tb, 0, st>>>(
+        d_data, dims.x, dims.y, dims.z, ctau, g_tune_acc, g_tune_nzc);
+    cudaMemcpyAsync(g_tune_host_acc, g_tune_acc, TUNE_RESULT_BYTES,
                     cudaMemcpyDeviceToHost, st);
     cudaEventRecord(g_tune_end, st);
     // This sample is only a few microseconds long. cudaEventSynchronize can
@@ -432,11 +371,10 @@ void calculate_dwt_levels(dim3 data_dims, uint8_t& levels_xy, uint8_t& levels_z)
 // CR-first topology decision using statistics already produced by d_isotropy_stats.
 // The REL boundaries are half-decades, so arbitrary bounds map to the nearest tested
 // decade without log10/pow.  No field names or exact dimensions are encoded here;
-// equal decomposition depth and very_flat are geometry-only distinctions.
-static int pick_cr_first_mode(
-    dim3 dims, double rel, uint8_t levels_xy, uint8_t levels_z, double cs, double nz0) {
+// very_flat is a geometry-only distinction.
+static int pick_cr_first_mode(dim3 dims, double rel, double cs, double nz0) {
     // ABS callers do not provide a normalized bound.  Preserve the conservative
-    // geometry-only fallback rather than interpreting rel=0 as an extremely tight REL.
+    // sphericity fallback rather than interpreting rel=0 as an extremely tight REL.
     if (rel <= 0.0)
         return cs >= 0.21 ? 0 : 1;
 
@@ -473,7 +411,6 @@ static int pick_cr_first_mode(
 }
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // FAST transform auto-tuner. Sample at stride 8 first and refine uncertain decisions at stride 4.
 //
 // CR-first decision based on decomposition geometry, sampled field statistics, and
@@ -485,27 +422,21 @@ static int pick_cr_first_mode(
 // the choice adapts to error without another kernel, trial transform, or device read.
 // ---------------------------------------------------------------------------
 template <typename T>
-static int autotune_pick_mode_fast(const T* d_data, dim3 dims, uint8_t levels_xy, uint8_t levels_z, double tau,
+static int autotune_pick_mode_fast(const T* d_data, dim3 dims, double tau,
     double rel_hint, cudaStream_t st, double* tune_ms) {
-    double* d_acc = g_tune_acc;
-    unsigned int* d_nzc = g_tune_nzc;
     const double ctau = 2.0 * tau;
     double cs = 0.0, nz0 = 0.0, sample_ms = 0.0;
-    sample_isotropy<T, 8>(d_data, dims, ctau, d_acc, d_nzc, st, cs, nz0, sample_ms);
+    sample_isotropy<T, 8>(d_data, dims, ctau, st, cs, nz0, sample_ms);
     double accumulated_ms = sample_ms;
 
     const bool uncertain_cs = cs >= 0.10 && cs <= 0.32;
     const bool uncertain_nz = rel_hint <= 1.5e-4 && nz0 >= 0.45 && nz0 <= 0.55;
     if (uncertain_cs || uncertain_nz) {
-        sample_isotropy<T, 4>(d_data, dims, ctau, d_acc, d_nzc, st, cs, nz0, sample_ms);
+        sample_isotropy<T, 4>(d_data, dims, ctau, st, cs, nz0, sample_ms);
         accumulated_ms += sample_ms;
     }
-    const int mode = pick_cr_first_mode(dims, rel_hint, levels_xy, levels_z, cs, nz0);
+    const int mode = pick_cr_first_mode(dims, rel_hint, cs, nz0);
     *tune_ms = accumulated_ms;
-    const double databytes = static_cast<double>(dims.x) * dims.y * dims.z * sizeof(T);
-    static const char* names[2] = {"DYADIC", "XY+Z"};
-    std::printf("[WALTZ] autotune-fast: cs=%.6f nz0=%.6f rel=%.1e -> %s (%.3f ms = %.0f GB/s eff)\n",
-                cs, nz0, rel_hint, names[mode], *tune_ms, databytes / (*tune_ms * 1e6));
     return mode;
 }
 
@@ -519,266 +450,197 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
     double real_error = config.absErrorBound;
     double quantity = 1.5 * real_error;
 
-    if (cmpPath != nullptr) {
-        const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-        if (g_host_outlier_counts == nullptr)
-            cudaMallocHost(reinterpret_cast<void**>(&g_host_outlier_counts), 2U * sizeof(unsigned int));
-        // Decide dyadic vs non-dyadic (wavelet packet) just like SPERR's can_use_dyadic.
-        uint8_t levels_xy = 0, levels_z = 0;
-        calculate_dwt_levels(data_dims, levels_xy, levels_z);
-        uint8_t use_dyadic = 0;
-        uint8_t dyadic_level = std::min(levels_xy, levels_z);
-        double tune_ms = 0.0;
-        const int mode = autotune_pick_mode_fast<T>(d_oridata, data_dims, levels_xy, levels_z, real_error, config.relErrorBound,
-            cuda_stream, &tune_ms);
-        use_dyadic = mode == 0 ? 1 : 0;
 
-        if (!use_dyadic && levels_z > 0 &&
-            data_dims.z > CDF97::DWT_Z_STATIC_BYTES / (2U * sizeof(T)))
-            throw std::invalid_argument("Waltz: plane Z column exceeds the 45 KiB static shared-memory capacity");
+    const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    if (g_host_outlier_counts == nullptr)
+        cudaMallocHost(reinterpret_cast<void**>(&g_host_outlier_counts), 2U * sizeof(unsigned int));
 
-        const uint32_t reorder_bz = WALTZ::lossless::select_block_zband(data_dims, levels_z, use_dyadic != 0U);
+    uint8_t levels_xy = 0, levels_z = 0;
+    calculate_dwt_levels(data_dims, levels_xy, levels_z);
+    uint8_t use_dyadic = 0;
+    uint8_t dyadic_level = std::min(levels_xy, levels_z);
 
-        CDF97::dwt3d_split_prealloc<T>(data_dims, use_dyadic != 0U);
-        check_cuda(CDF97::idwt3d_prealloc<T>(data_dims, use_dyadic != 0U, false, cuda_stream),
-                   "compress idwt prealloc");
+    double tune_ms = 0.0;
+    const int mode = autotune_pick_mode_fast<T>(d_oridata, data_dims, real_error, config.relErrorBound,
+        cuda_stream, &tune_ms);
+    use_dyadic = mode == 0 ? 1 : 0;
 
-        const char* const wzp_env = std::getenv("WALTZ_WZP");
-        const uint8_t expected_mag_coder = wzp_env == nullptr || std::atoi(wzp_env) != 0 ? 7U : 0U;
+    if (!use_dyadic && levels_z > 0 &&
+        data_dims.z > CDF97::DWT_Z_STATIC_BYTES / (2U * sizeof(T)))
+        throw std::invalid_argument("Waltz: plane Z column exceeds the 45 KiB static shared-memory capacity");
 
-        T* d_data;
-        T* tmp_data = nullptr;
-        T* d_q = nullptr;
-        uint16_t* d_q_abs = nullptr;
-        uint32_t* d_q_sign = nullptr;
-        unsigned char* d_mk = nullptr;
-        uint32_t* d_qoi = nullptr;
-        int32_t* d_qov = nullptr;
-        uint32_t* d_poi = nullptr;
-        T* d_poe = nullptr;
-        uint16_t* d_tb = nullptr;
-        unsigned int* d_cnt = nullptr;
-        unsigned int* d_qoc = nullptr;
-        const size_t bytes = static_cast<size_t>(datasize) * sizeof(T);
-        const uint32_t qout_cap = 1U << 20U;
-        const uint32_t pout_cap = 1U << 22U;
-        const size_t mag_bytes = static_cast<size_t>(datasize) * sizeof(uint16_t);
-        const size_t sb_bytes = ((static_cast<size_t>(datasize) + 8191) / 8192) * 1024;
-        const size_t mk_bytes = ((static_cast<size_t>(datasize) + 63) / 64) * 8;
-        const bool plane_z_direct = !use_dyadic;
-        const uint32_t fused_bz = reorder_bz;
-        GPUTimer block_rank_timer;
+    const uint32_t reorder_bz = WALTZ::lossless::select_block_zband(data_dims, levels_z, use_dyadic != 0U);
+    const uint32_t rank_shapes = (data_dims.x % 16U || data_dims.y % 16U || data_dims.z % reorder_bz) ? 8U : 1U;
 
-        cudaMalloc(reinterpret_cast<void**>(&d_data), bytes);
-        cudaMalloc(reinterpret_cast<void**>(&tmp_data), bytes);
+    CDF97::dwt3d_split_prealloc<T>(data_dims, use_dyadic != 0U);
+    CDF97::idwt3d_prealloc<T>(data_dims, use_dyadic != 0U, false, cuda_stream);
+    // Plane reconstruction and fused PWE use the same dynamic Z workspace.
+    // Validate its actual capacity, not the unrelated dyadic static allocation.
+    if (!use_dyadic && CDF97::idwt3d_plane_prealloc<T>(data_dims) != cudaSuccess)
+        throw std::runtime_error("Waltz: cannot configure plane IDWT workspace");
+
+    T* d_data = nullptr;
+    T* tmp_data = nullptr;
+    T* d_q = nullptr;
+    uint16_t* d_q_abs = nullptr;
+    uint32_t* d_q_sign = nullptr;
+    uint32_t* d_qoi = nullptr;
+    int32_t* d_qov = nullptr;
+    uint32_t* d_poi = nullptr;
+    T* d_poe = nullptr;
+    uint16_t* d_tb = nullptr;
+    unsigned int* d_cnt = nullptr;
+    unsigned int* d_qoc = nullptr;
+    const size_t bytes = static_cast<size_t>(datasize) * sizeof(T);
+    const uint32_t qout_cap = std::min(datasize, 1U << 20U);
+    const uint32_t pout_cap = std::min(datasize, 1U << 22U);
+    const size_t mag_bytes = static_cast<size_t>(datasize) * sizeof(uint16_t);
+    const size_t sb_bytes = ((static_cast<size_t>(datasize) + 8191) / 8192) * 1024;
+    const bool plane_z_direct = !use_dyadic;
+    GPUTimer block_rank_timer;
+
+    cudaMalloc(reinterpret_cast<void**>(&d_data), bytes);
+    cudaMalloc(reinterpret_cast<void**>(&tmp_data), bytes);
+
+    if (use_dyadic)
+        d_q = d_data;
+    else
         cudaMalloc(reinterpret_cast<void**>(&d_q), bytes);
-        cudaMalloc(reinterpret_cast<void**>(&d_q_abs), mag_bytes);
-        cudaMalloc(reinterpret_cast<void**>(&d_q_sign), sb_bytes);
-        cudaMalloc(reinterpret_cast<void**>(&d_mk), mk_bytes);
-        cudaMalloc(reinterpret_cast<void**>(&d_qoi), qout_cap * sizeof(uint32_t));
-        cudaMalloc(reinterpret_cast<void**>(&d_qov), qout_cap * sizeof(int32_t));
-        cudaMalloc(reinterpret_cast<void**>(&d_poi), pout_cap * sizeof(uint32_t));
-        cudaMalloc(reinterpret_cast<void**>(&d_poe), pout_cap * sizeof(T));
-        cudaMalloc(reinterpret_cast<void**>(&d_tb), 32U * 32U * 32U * sizeof(uint16_t));
-        cudaMalloc(reinterpret_cast<void**>(&d_cnt), sizeof(unsigned int));
-        cudaMalloc(reinterpret_cast<void**>(&d_qoc), sizeof(unsigned int));
+    cudaMalloc(reinterpret_cast<void**>(&d_q_abs), mag_bytes);
+    cudaMalloc(reinterpret_cast<void**>(&d_q_sign), sb_bytes);
 
-        if (!plane_z_direct)
-            cudaMemcpyAsync(d_data, d_oridata, bytes, cudaMemcpyDeviceToDevice, cuda_stream);
+    cudaMalloc(reinterpret_cast<void**>(&d_qoi),
+                static_cast<size_t>(qout_cap) * (sizeof(uint32_t) + sizeof(int32_t)));
+    d_qov = reinterpret_cast<int32_t*>(d_qoi + qout_cap);
+    cudaMalloc(reinterpret_cast<void**>(&d_poe),
+                static_cast<size_t>(pout_cap) * (sizeof(T) + sizeof(uint32_t)));
+    d_poi = reinterpret_cast<uint32_t*>(d_poe + pout_cap);
+    cudaMalloc(reinterpret_cast<void**>(&d_tb), rank_shapes * 16U * 16U * reorder_bz * sizeof(uint16_t));
+    cudaMalloc(reinterpret_cast<void**>(&d_cnt), 2U * sizeof(unsigned int));
+    d_qoc = d_cnt + 1;
 
-        block_rank_timer.start(stream);
-        WALTZ::lossless::d_build_block_rank<<<(16U * 16U * fused_bz + 255U) / 256U, 256, 0, cuda_stream>>>(d_tb, 16U, 16U, fused_bz);
-        block_rank_timer.record_stop(stream);
+    if (!plane_z_direct)
+        cudaMemcpyAsync(d_data, d_oridata, bytes, cudaMemcpyDeviceToDevice, cuda_stream);
 
+    block_rank_timer.start(stream);
+    WALTZ::lossless::d_build_block_rank<<<dim3(reorder_bz, rank_shapes), 256, 0, cuda_stream>>>
+        (d_tb, 16U, 16U, reorder_bz, data_dims);
+    block_rank_timer.record_stop(stream);
+
+    if (!use_dyadic)
         cudaMemsetAsync(d_q, 0, bytes, cuda_stream);
-        cudaMemsetAsync(d_q_abs, 0, mag_bytes, cuda_stream);
-        cudaMemsetAsync(d_q_sign, 0, sb_bytes, cuda_stream);
-        cudaMemsetAsync(d_qoc, 0, sizeof(unsigned int), cuda_stream);
+    cudaMemsetAsync(d_q_abs, 0, mag_bytes, cuda_stream);
+    cudaMemsetAsync(d_q_sign, 0, sb_bytes, cuda_stream);
+    cudaMemsetAsync(d_qoc, 0, sizeof(unsigned int), cuda_stream);
 
-        CDF97::set_quant_params<T>(d_q_abs, d_q_sign, reinterpret_cast<T*>(d_q), d_tb,
-            data_dims, fused_bz, quantity, d_qoi, d_qov, d_qoc, qout_cap, cuda_stream);
-        cudaStreamSynchronize(cuda_stream);
+    CDF97::set_quant_params<T>(d_q_abs, d_q_sign, reinterpret_cast<T*>(d_q), d_tb,
+        data_dims, reorder_bz, quantity, d_qoi, d_qov, d_qoc, qout_cap, cuda_stream);
+    cudaStreamSynchronize(cuda_stream);
 
-        double gpu_predict_ms;
-        size_t blob_bytes = 0; // assembled compressed-blob size (returned)
-        GPUTimer timer;
-        timer.start(stream);
-        CDF97::d_reset<<<1, 1, 0, cuda_stream>>>();
-        if (use_dyadic) {
-            CDF97::dwt3d_xy_halo_z<T>(d_data, tmp_data, data_dims, dyadic_level, fused_bz, cuda_stream);
-        } else {
-            CDF97::dwt3d_plane_xy_halo_z<T>(
-                d_data, tmp_data, data_dims, levels_xy, levels_z, d_oridata, fused_bz, cuda_stream);
-        }
-        timer.record_stop(stream);
-
-        std::printf("[WALTZ] MODE mode=%s lossless=%s reorder_bz=%u levels_xy=%u levels_z=%u\n",
-                    use_dyadic ? "dyadic" : "plane",
-                    expected_mag_coder == 7U ? "wzp" : "lc",
-                    static_cast<unsigned>(reorder_bz),
-                    static_cast<unsigned>(levels_xy),
-                    static_cast<unsigned>(levels_z));
-
-        // Error-bounded compression: lossless magnitude/sign runs on the main
-        // stream while reconstruction runs on an independent stream.
-        GPUTimer lc_timer, outlier_timer;
-        const double t_quant = 0.0;
-        cudaStream_t cuda_stream1;
-        cudaEvent_t overlap_done, overlap_begin;
-        const bool plane_pwe_fused =
-            !use_dyadic && levels_z > 0 &&
-            data_dims.z * 2U <= WALTZ::IDWT_SHARED_BYTES / sizeof(T);
-        long long magc;
-        uint32_t nnz;
-        double t_mag;
-
-        lc_timer.start(stream);
-        if (expected_mag_coder == 7)
-            WALTZ::lossless::wzp_encode_with_sign_launch(d_q_abs, d_q_sign, datasize, cuda_stream);
-        else
-            WALTZ::lossless::lc_compress_bit2_rze1_with_sign_launch(d_q_abs, static_cast<long long>(mag_bytes),
-            d_q_sign, d_mk, datasize, cuda_stream);
-        lc_timer.record_stop(stream);
-
-        cudaStreamCreateWithFlags(&cuda_stream1, cudaStreamNonBlocking);
-        cudaStreamWaitEvent(cuda_stream1, timer.end, 0);
-        cudaEventCreate(&overlap_begin);
-        cudaEventCreate(&overlap_done);
-        cudaMemsetAsync(d_cnt, 0, sizeof(unsigned int), cuda_stream1);
-        cudaEventRecord(overlap_begin, cuda_stream1);
-        if (use_dyadic) {
-            CDF97::idwt3d_xy_halo_z<T>(d_q, tmp_data, data_dims, dyadic_level,
-                d_oridata, real_error, d_cnt, d_poi, d_poe, pout_cap, cuda_stream1);
-        } else {
-            CDF97::idwt3d_plane_xy_halo_z<T>(
-                d_q, tmp_data, data_dims, levels_xy, levels_z, plane_pwe_fused ? d_oridata : nullptr,
-                real_error, d_cnt, d_poi, d_poe, pout_cap, false, cuda_stream1);
-        }
-        cudaEventRecord(overlap_done, cuda_stream1);
-
-        // Fused magnitude+sign backends pack negative bits while each
-        // magnitude chunk is resident; WZP additionally keeps sign
-        // ranks local to independently decodable groups.
-        if (expected_mag_coder == 7)
-            magc = static_cast<long long>(WALTZ::lossless::wzp_encode_with_sign_finish(&nnz, &t_mag));
-        else
-            nnz = WALTZ::lossless::lc_compress_bit2_rze1_with_sign_finish(&magc, cuda_stream);
-        const long long sign_bytes = expected_mag_coder == 7 ? 0 : (static_cast<long long>(nnz) + 7) / 8;
-
-        cudaEventSynchronize(overlap_done);
-        float overlap_ms = 0.0f;
-        cudaEventElapsedTime(&overlap_ms, overlap_begin, overlap_done);
-        const double t_idwt = overlap_ms;
-        double t_out = 0.0; // dyadic: fused into IDWT above
-        const bool needs_pwe_scan = !use_dyadic && !plane_pwe_fused;
-        if (needs_pwe_scan) {
-            outlier_timer.start(stream);
-            const int tbo = 256;
-            const int gbo = static_cast<int>((static_cast<size_t>(datasize) + tbo - 1) / tbo);
-            count_outliers<T><<<gbo, tbo, 0, cuda_stream>>>(d_q, d_oridata, datasize, real_error, d_cnt, d_poi, d_poe, pout_cap);
-            outlier_timer.record_stop(stream);
-        }
-        cudaMemcpyAsync(g_host_outlier_counts, d_cnt, sizeof(unsigned int), cudaMemcpyDeviceToHost, cuda_stream);
-        cudaMemcpyAsync(g_host_outlier_counts + 1, d_qoc, sizeof(unsigned int), cudaMemcpyDeviceToHost, cuda_stream);
-        cudaStreamSynchronize(cuda_stream);
-        const unsigned int no = g_host_outlier_counts[0];
-        const unsigned int nqo = g_host_outlier_counts[1];
-        // Both result-count copies above are synchronization points.
-        // Querying the already-complete events here preserves the
-        // per-stage kernel timings without inserting bubbles between
-        // dependent stages in the actual cE2E path.
-        gpu_predict_ms = timer.elapsed_ready();
-        if (expected_mag_coder != 7)
-            t_mag = lc_timer.elapsed_ready();
-        if (needs_pwe_scan)
-            t_out = outlier_timer.elapsed_ready();
-        cudaEventDestroy(overlap_begin);
-        cudaEventDestroy(overlap_done);
-        cudaStreamDestroy(cuda_stream1);
-        if (nqo > qout_cap)
-            std::printf("[WALTZ] WARNING: q-outliers %u exceed cap %u (records dropped)\n", nqo, qout_cap);
-        if (no > pout_cap)
-            std::printf("[WALTZ] WARNING: PWE outliers %u exceed cap %u (records dropped)\n", no, pout_cap);
-        const uint32_t pwe_count = min(no, pout_cap);
-        const uint32_t qout_count = min(nqo, qout_cap);
-        const size_t pwe_error_bytes = static_cast<size_t>(pwe_count) * sizeof(T);
-        const long long pwe_index_bytes = static_cast<long long>(pwe_count) * sizeof(uint32_t);
-        const long long out_bytes = pwe_index_bytes + static_cast<long long>(pwe_error_bytes);
-        const long long qout_bytes = static_cast<long long>(qout_count) * 8; // idx(4)+true mag(4)
-        const long long payload_bytes = magc + sign_bytes + out_bytes + qout_bytes;
-
-        // ---- assemble the compressed blob into d_cmpData (header + sections) ----
-        if (d_cmpData != nullptr)
-            blob_bytes = Waltz_gather<T>(d_cmpData, data_dims, datasize, use_dyadic, fused_bz,
-                levels_xy, levels_z, nnz, quantity, real_error, expected_mag_coder,
-                static_cast<size_t>(magc), d_mk, pwe_count, d_poi, d_poe,
-                qout_count, d_qoi, d_qov, cuda_stream);
-
-        const double orig = static_cast<double>(datasize) * sizeof(T);
-        const double t_block_rank = block_rank_timer.elapsed_ready();
-        const double t_codec_overlap = max(t_mag, t_idwt);
-        const double t_tot = tune_ms + t_block_rank + gpu_predict_ms + t_quant + t_codec_overlap + t_out;
-        const double GiB = 1024.0 * 1024.0 * 1024.0;
-        const long long stored_bytes = blob_bytes != 0U ? static_cast<long long>(blob_bytes) : payload_bytes;
-
-        auto th = [&](double tms) {
-            return tms > 0.0 ? orig / GiB / tms * 1000.0 : 0.0;
-        };
-        std::printf("\n  \033[1m%-12s %-12s %-20s\033[0m\n", "type", "time (ms)", "throughput (GB/s)");
-        std::printf("  %-12s %-12.6f %-10.4f\n", "autotune", tune_ms, th(tune_ms));
-        std::printf("  %-12s %-12.6f %-10.4f\n", "block-rank", t_block_rank, th(t_block_rank));
-        std::printf("  %-12s %-12.6f %-10.4f\n", "DWT", gpu_predict_ms, th(gpu_predict_ms));
-        std::printf("  %-12s %-12.6f %-10.4f\n", "quant", t_quant, th(t_quant));
-        std::printf("  %-12s %-12.6f %-10.4f   (sign fused in)\n", expected_mag_coder == 7 ? "mag+sign-WZP" : "mag+sign-LC", t_mag, th(t_mag));
-        std::printf("  %-12s %-12.6f %-10.4f\n", "IDWT", t_idwt, th(t_idwt));
-        std::printf("  %-12s %-12.6f %-10.4f\n", "outlier", t_out, th(t_out));
-        std::printf("  \033[1m%-12s %-12.6f %-10.4f\033[0m\n\n", "total", t_tot, th(t_tot));
-        std::printf("[WALTZ]   size: mag(u16,%s) %lld + sign %lld + ""outlier(%u,u32+%s) %lld(%lld+%zu) + q_outlier(%u x8B) %lld "
-            "= %lld B | CR=%.2fx\n",
-            expected_mag_coder == 7 ? "WZP" : "BIT2",
-            magc,
-            sign_bytes,
-            pwe_count,
-            "raw-T",
-            out_bytes,
-            pwe_index_bytes,
-            pwe_error_bytes,
-            qout_count,
-            qout_bytes,
-            stored_bytes,
-            orig / static_cast<double>(stored_bytes));
-
-        check_cuda(cudaFree(d_q), "cudaFree d_q");
-        check_cuda(cudaFree(d_q_abs), "cudaFree d_q_abs");
-        check_cuda(cudaFree(d_q_sign), "cudaFree d_q_sign");
-        check_cuda(cudaFree(d_mk), "cudaFree mk");
-        check_cuda(cudaFree(d_qoi), "cudaFree qoi");
-        check_cuda(cudaFree(d_qov), "cudaFree qov");
-        check_cuda(cudaFree(d_poi), "cudaFree poi");
-        check_cuda(cudaFree(d_poe), "cudaFree poe");
-        check_cuda(cudaFree(d_tb), "cudaFree tb");
-        check_cuda(cudaFree(d_cnt), "cudaFree cnt");
-        check_cuda(cudaFree(d_qoc), "cudaFree qoc");
-        check_cuda(cudaFree(tmp_data), "cudaFree tmp");
-        check_cuda(cudaFree(d_data), "cudaFree d_data");
-        return blob_bytes;
+    double gpu_predict_ms;
+    size_t blob_bytes = 0; // assembled compressed-cmpdata size (returned)
+    GPUTimer timer;
+    timer.start(stream);
+    CDF97::d_reset<<<1, 1, 0, cuda_stream>>>();
+    if (use_dyadic) {
+        CDF97::dwt3d_xy_halo_z<T>(d_data, tmp_data, data_dims, dyadic_level, reorder_bz, cuda_stream);
+    } else {
+        CDF97::dwt3d_plane_xy_halo_z<T>(
+            d_data, tmp_data, data_dims, levels_xy, levels_z, d_oridata, reorder_bz, cuda_stream);
     }
+    timer.record_stop(stream);
+
+    // Error-bounded compression: lossless magnitude/sign runs on the main
+    // stream while reconstruction runs on an independent stream.
+    GPUTimer outlier_timer;
+    const double t_quant = 0.0;
+    cudaStream_t cuda_stream1;
+    cudaEvent_t overlap_done, overlap_begin;
+    const bool plane_pwe_fused = !use_dyadic && levels_z > 0;
+    long long magc;
+    double t_mag;
+
+    WALTZ::lossless::wzp_encode(d_q_abs, d_q_sign, datasize, cuda_stream);
+
+    cudaStreamCreateWithFlags(&cuda_stream1, cudaStreamNonBlocking);
+    cudaStreamWaitEvent(cuda_stream1, timer.end, 0);
+    cudaEventCreate(&overlap_begin);
+    cudaEventCreate(&overlap_done);
+    cudaMemsetAsync(d_cnt, 0, sizeof(unsigned int), cuda_stream1);
+    cudaEventRecord(overlap_begin, cuda_stream1);
+    if (use_dyadic) {
+        CDF97::idwt3d_xy_halo_z<T>(d_q, tmp_data, data_dims, dyadic_level,
+            d_oridata, real_error, d_cnt, d_poi, d_poe, pout_cap, cuda_stream1);
+    } else {
+        CDF97::idwt3d_plane_xy_halo_z<T>(
+            d_q, tmp_data, data_dims, levels_xy, levels_z, plane_pwe_fused ? d_oridata : nullptr,
+            real_error, d_cnt, d_poi, d_poe, pout_cap, false, cuda_stream1);
+    }
+    cudaEventRecord(overlap_done, cuda_stream1);
+
+    // WZP packs magnitude and sign together in independently decodable groups.
+    magc = static_cast<long long>(WALTZ::lossless::wzp_encode_with_sign_finish(nullptr, &t_mag));
+
+    cudaEventSynchronize(overlap_done);
+    float overlap_ms = 0.0f;
+    cudaEventElapsedTime(&overlap_ms, overlap_begin, overlap_done);
+    const double t_idwt = overlap_ms;
+    double t_out = 0.0; // dyadic: fused into IDWT above
+    const bool needs_pwe_scan = !use_dyadic && !plane_pwe_fused;
+    if (needs_pwe_scan) {
+        outlier_timer.start(stream);
+        const int tbo = 256;
+        const int gbo = static_cast<int>((static_cast<size_t>(datasize) + tbo - 1) / tbo);
+        count_outliers<T><<<gbo, tbo, 0, cuda_stream>>>(d_q, d_oridata, datasize, real_error, d_cnt, d_poi, d_poe, pout_cap);
+        outlier_timer.record_stop(stream);
+    }
+    cudaMemcpyAsync(g_host_outlier_counts, d_cnt, sizeof(unsigned int), cudaMemcpyDeviceToHost, cuda_stream);
+    cudaMemcpyAsync(g_host_outlier_counts + 1, d_qoc, sizeof(unsigned int), cudaMemcpyDeviceToHost, cuda_stream);
+    cudaStreamSynchronize(cuda_stream);
+    const unsigned int no = g_host_outlier_counts[0];
+    const unsigned int nqo = g_host_outlier_counts[1];
+    // Both result-count copies above are synchronization points.
+    // Querying the already-complete events here preserves the
+    // per-stage kernel timings without inserting bubbles between
+    // dependent stages in the actual cE2E path.
+    gpu_predict_ms = timer.elapsed_ready();
+    if (needs_pwe_scan)
+        t_out = outlier_timer.elapsed_ready();
+    cudaEventDestroy(overlap_begin);
+    cudaEventDestroy(overlap_done);
+    cudaStreamDestroy(cuda_stream1);
+    const uint32_t pwe_count = min(no, pout_cap);
+    const uint32_t qout_count = min(nqo, qout_cap);
+    // ---- assemble the compressed blob into d_cmpData (header + sections) ----
+    if (d_cmpData != nullptr)
+        blob_bytes = Waltz_gather<T>(d_cmpData, use_dyadic, reorder_bz,
+            levels_xy, levels_z, quantity,
+            static_cast<size_t>(magc), pwe_count, d_poi, d_poe,
+            qout_count, d_qoi, d_qov, cuda_stream);
+
+    Waltz_print_compression<T>(bytes,
+        {tune_ms, block_rank_timer.elapsed_ready(), gpu_predict_ms, t_quant, t_mag, t_idwt, t_out},
+        static_cast<size_t>(magc), pwe_count, qout_count, blob_bytes);
+
+    if (!use_dyadic)
+        cudaFree(d_q);
+    cudaFree(d_q_abs);
+    cudaFree(d_q_sign);
+    cudaFree(d_qoi);
+    cudaFree(d_poe);
+    cudaFree(d_tb);
+    cudaFree(d_cnt);
+    cudaFree(tmp_data);
+    cudaFree(d_data);
+    return blob_bytes;
+
     return 0;
 }
 
-// ===========================================================================
-// Decompression: parse the blob header, then
-//   LC-decode (BIT_2+RZE_1 inverse) -> u16 z-order magnitudes
-//   sign_unpack                      -> 3-state sign bytes
-//   unquant (un-reorder + dequant)   -> row-major coefficients in d_decData
-//   q-outlier patches                -> exact magnitudes for the clamped few
-//   IDWT (in place on d_decData)     -> reconstruction
-//   PWE outlier corrections          -> point-wise error bound guaranteed
-// ===========================================================================
+
 template <typename T, int NDIMS>
 size_t d_WALTZ_decompress(
     char* d_cmpData, T* d_decData, const WALTZ::Config& config, const char* decPath, void* stream) {
-    (void)config;
     if constexpr (NDIMS != 3) {
         throw std::runtime_error("decompress currently only supports 3D");
     }
@@ -787,258 +649,105 @@ size_t d_WALTZ_decompress(
     if (g_pipeline_host_header == nullptr)
         cudaMallocHost(reinterpret_cast<void**>(&g_pipeline_host_header),
                        sizeof(WaltzBlobHeader));
-    check_cuda(cudaMemcpyAsync(g_pipeline_host_header,
-                               d_cmpData,
-                               sizeof(hdr),
-                               cudaMemcpyDeviceToHost,
-                               cuda_stream),
-               "hdr D2H");
-    check_cuda(cudaStreamSynchronize(cuda_stream), "hdr D2H sync");
+    cudaMemcpyAsync(g_pipeline_host_header, d_cmpData, sizeof(hdr),
+                    cudaMemcpyDeviceToHost, cuda_stream);
+    cudaStreamSynchronize(cuda_stream);
     hdr = *g_pipeline_host_header;
-    if (hdr.mag_coder != 0U && hdr.mag_coder != 7U)
-        throw std::runtime_error("unsupported Waltz magnitude codec");
-    if (hdr.dtype != sizeof(T))
-        throw std::runtime_error("waltz blob dtype mismatch");
-    if (hdr.pwe_format != 2U)
-        throw std::runtime_error("unsupported Waltz PWE record format");
-    if ((hdr.transform_flags & TRANSFORM_P4) != 0U)
-        throw std::runtime_error("P4 transform support is disabled");
-    if (hdr.sep_xy != 0U)
-        throw std::runtime_error("unsupported legacy transform mode");
-    const uint32_t N = hdr.datasize;
-    dim3 dims(hdr.dimx, hdr.dimy, hdr.dimz);
-    const bool dec_use_dyadic = (hdr.use_dyadic & 1U) != 0U;
-    const uint32_t stored_quant_bz = hdr.use_dyadic >> 1U;
-    const uint32_t dec_quant_bz = stored_quant_bz != 0U
-                                      ? stored_quant_bz
-                                      : WALTZ::lossless::block_zband(dims.z, hdr.levels_z);
+    const uint32_t N = config.num;
+    dim3 dims(config.dimx, config.dimy, config.dimz);
+    const bool dec_use_dyadic = hdr.use_dyadic != 0U;
+    const uint32_t dec_quant_bz = hdr.reorder_bz;
     if (dec_quant_bz < 1U || dec_quant_bz > 32U)
         throw std::runtime_error("invalid Waltz reorder z-band");
-    const BlobView sections = Waltz_scatter(d_cmpData, hdr);
+    const BlobView sections = Waltz_scatter<T>(d_cmpData, hdr);
 
-    // scratch buffers: u16 magnitudes + negative-bit bitmap + iperm table
-    const size_t mag_bytes = static_cast<size_t>(N) * sizeof(uint16_t);
-    const size_t sb_bytes = ((static_cast<size_t>(N) + 8191) / 8192) *
-                            1024; // 1-bit sign bitmap, 1KB per 8192-elem chunk
-    uint16_t* d_q16 = nullptr;
-    uint32_t* d_q_sign = nullptr;
-    uint16_t* d_tb = nullptr;
-    check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_q16), mag_bytes), "dec malloc q16");
-    check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_q_sign), sb_bytes),
-               "dec malloc sb");
-    check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_tb),
-                         32 * 32 * 32 * sizeof(uint16_t)),
-               "dec malloc tb");
-    check_cuda(cudaMemsetAsync(d_q16, 0, mag_bytes, cuda_stream), "dec premap q16");
-    check_cuda(cudaMemsetAsync(d_q_sign, 0, sb_bytes, cuda_stream), "dec premap sb");
-    check_cuda(cudaMemsetAsync(d_tb, 0, 32 * 32 * 32 * sizeof(uint16_t), cuda_stream),
-               "dec premap tb");
-    check_cuda(CDF97::idwt3d_prealloc<T>(dims, dec_use_dyadic, true, cuda_stream),
-               "dec idwt prealloc");
-    if (!dec_use_dyadic) {
-        check_cuda(CDF97::idwt3d_plane_prealloc<T>(dims), "dec prealloc plane IDWT");
-    }
-    GPUTimer lc_timer, block_iperm_timer, unquant_timer, idwt_timer, pwe_timer;
-    bool block_iperm_timed = false;
-    double wzp_decode_kernel_ms = 0.0;
-    T* const d_coeff = d_decData;
-    const bool wzp_fuse_force = std::getenv("WALTZ_WZP_DEQUANT_FUSE") != nullptr;
     const bool full_reorder_bricks = dims.x % 16U == 0U && dims.y % 16U == 0U &&
                                       dims.z % dec_quant_bz == 0U;
-    // Complete bricks through z=16 use the rank-contiguous fused WZP store.
-    // Shallow float bricks (z <= 4) also use the edge-capable fused mapping.
-    // Both paths remove the intermediate uint16 magnitude and sign-bitmap traffic.
-    const bool automatic_wzp_dequant_fuse =
-        (std::is_same_v<T, float> && dec_quant_bz <= 4U) ||
-        ((std::is_same_v<T, float> || std::is_same_v<T, double>) &&
-         full_reorder_bricks && dec_quant_bz <= 16U);
-    const bool wzp_dequant_fused = hdr.mag_coder == 7 &&
-                                   (automatic_wzp_dequant_fuse || wzp_fuse_force) &&
-                                   std::getenv("WALTZ_WZP_DEQUANT_FUSE_OFF") == nullptr;
-    const bool complete_bz2_layout = dec_quant_bz == 2U && dims.x % 16U == 0U &&
-                                     dims.y % 16U == 0U && dims.z % 2U == 0U;
-    if (wzp_dequant_fused && !complete_bz2_layout) {
-        const uint32_t entries = 16U * 16U * dec_quant_bz;
-        WALTZ::quantizer::d_build_block_ioffset<<<(entries + 255U) / 256U, 256, 0, cuda_stream>>>(
-            reinterpret_cast<uint32_t*>(d_tb),
+    const bool complete_bz2_layout = dec_quant_bz == 2U && full_reorder_bricks;
+
+    // WZP always writes dequantized row-major coefficients directly, including edges.
+    uint32_t* d_tb = nullptr;
+    const uint32_t entries = 16U * 16U * dec_quant_bz;
+    const uint32_t offset_shapes = full_reorder_bricks ? 1U : 8U;
+    if (!complete_bz2_layout)
+        cudaMalloc(reinterpret_cast<void**>(&d_tb), offset_shapes * entries * sizeof(uint32_t));
+    CDF97::idwt3d_prealloc<T>(dims, dec_use_dyadic, true, cuda_stream);
+    if (!dec_use_dyadic && CDF97::idwt3d_plane_prealloc<T>(dims) != cudaSuccess)
+        throw std::runtime_error("Waltz: cannot configure plane IDWT workspace");
+    GPUTimer block_offset_timer, unquant_timer, idwt_timer, pwe_timer;
+    double wzp_decode_kernel_ms = 0.0;
+    T* const d_coeff = d_decData;
+    if (!complete_bz2_layout) {
+        block_offset_timer.start(stream);
+        WALTZ::lossless::d_build_block_ioffset<<<dim3(dec_quant_bz, offset_shapes), 256, 0, cuda_stream>>>(
+            d_tb,
             16U,
             16U,
             dec_quant_bz,
             dims.x,
-            static_cast<size_t>(dims.x) * dims.y);
+            static_cast<size_t>(dims.x) * dims.y, dims);
+        block_offset_timer.record_stop(stream);
     }
-    lc_timer.start(stream); // 1+2) mag decode + sign unpack -> u16 z-order mags + negative bitmap
-    if (hdr.mag_coder == 7) {
-        if (wzp_dequant_fused) {
-            if constexpr (std::is_same_v<T, float>) {
-                WALTZ::lossless::wzp_decode_reordered_float(
-                    sections.magnitude,
-                    N,
-                    reinterpret_cast<float*>(d_coeff),
-                    reinterpret_cast<const uint32_t*>(d_tb),
-                    static_cast<float>(hdr.q),
-                    dims,
-                    dec_quant_bz,
-                    &wzp_decode_kernel_ms,
-                    cuda_stream);
-            } else if constexpr (std::is_same_v<T, double>) {
-                WALTZ::lossless::wzp_decode_reordered_double(
-                    sections.magnitude,
-                    N,
-                    reinterpret_cast<double*>(d_coeff),
-                    reinterpret_cast<const uint32_t*>(d_tb),
-                    hdr.q,
-                    dims,
-                    dec_quant_bz,
-                    &wzp_decode_kernel_ms,
-                    cuda_stream);
-            }
-        } else {
-            WALTZ::lossless::wzp_decode_with_sign(
-                sections.magnitude, N, d_q16, d_q_sign, &wzp_decode_kernel_ms, cuda_stream);
-        }
-    } else {
-        WALTZ::lossless::lc_decompress_with_sign_launch(sections.magnitude,
-                                                        d_q16,
-                                                        static_cast<long long>(mag_bytes),
-                                                        sections.sign,
-                                                        d_q_sign,
-                                                        cuda_stream);
-        lc_timer.record_stop(stream);
-        const long long dec_bytes = WALTZ::lossless::lc_decompress_with_sign_finish(cuda_stream);
-        if (dec_bytes != static_cast<long long>(mag_bytes)) {
-            cudaFree(d_q16);
-            cudaFree(d_q_sign);
-            cudaFree(d_tb);
-            throw std::runtime_error("waltz: LC decode size mismatch");
-        }
+    if constexpr (std::is_same_v<T, float>) {
+        WALTZ::lossless::wzp_decode_reordered_float(sections.magnitude,
+            N, d_coeff, d_tb, static_cast<float>(hdr.q), dims,
+            dec_quant_bz, &wzp_decode_kernel_ms, cuda_stream);
+    } else if constexpr (std::is_same_v<T, double>) {
+        WALTZ::lossless::wzp_decode_reordered_double(
+            sections.magnitude, N, d_coeff, d_tb,
+            hdr.q, dims, dec_quant_bz, &wzp_decode_kernel_ms, cuda_stream);
     }
-    if (hdr.mag_coder != 0)
-        lc_timer.record_stop(stream);
-    double t_lc = 0.0;
-    const double t_su = 0.0; // fused into the decode kernel
-    unquant_timer.start(
-        stream); // 3) un-reorder + dequant -> row-major coeffs, 4) q-outlier patches
-    if (wzp_dequant_fused) {
-        // Magnitude decode, compact-sign expansion, dequantization and inverse
-        // Morton placement were emitted directly by the WZP kernel.
-    } else {
-        const uint32_t bz = dec_quant_bz;
-        const uint32_t nbx = (dims.x + 15U) / 16U;
-        const uint32_t nby = (dims.y + 15U) / 16U;
-        const uint32_t nbz = (dims.z + bz - 1U) / bz;
-        const uint32_t blocks = nbx * nby * nbz;
-        const uint32_t entries = 16U * 16U * bz;
-        WALTZ::quantizer::
-            d_build_block_ioffset<<<(entries + 255U) / 256U, 256, 0, cuda_stream>>>(
-                reinterpret_cast<uint32_t*>(d_tb),
-                16U,
-                16U,
-                bz,
-                dims.x,
-                static_cast<size_t>(dims.x) * dims.y);
-        WALTZ::quantizer::d_unquant_reorder_kernel<T, true>
-            <<<blocks, 256, 0, cuda_stream>>>(d_q16,
-                                              d_q_sign,
-                                              d_coeff,
-                                              dims.x,
-                                              dims.y,
-                                              dims.z,
-                                              16U,
-                                              16U,
-                                              bz,
-                                              nbx,
-                                              nby,
-                                              d_tb,
-                                              hdr.q);
-    }
+    unquant_timer.start(stream); // Only quantization-outlier patches remain separate.
     if (hdr.n_qo) {
         const int tb2 = 256, gb2 = static_cast<int>((hdr.n_qo + tb2 - 1) / tb2);
-        apply_q_outliers<T>
-            <<<gb2, tb2, 0, cuda_stream>>>(d_coeff,
-                                           reinterpret_cast<const uint32_t*>(sections.quant_index),
-                                           reinterpret_cast<const int32_t*>(sections.quant_value),
-                                           hdr.n_qo,
-                                           hdr.q);
+        apply_q_outliers<T><<<gb2, tb2, 0, cuda_stream>>>(d_coeff,
+            reinterpret_cast<const uint32_t*>(sections.quant_index),
+            reinterpret_cast<const int32_t*>(sections.quant_value), hdr.n_qo, hdr.q);
     }
     unquant_timer.record_stop(stream);
-    double t_uq = 0.0;
     idwt_timer.start(stream); // 5) IDWT (in place)
     if (dec_use_dyadic) {
         const int level = std::min(hdr.levels_xy, hdr.levels_z);
-        check_cuda(CDF97::idwt3d_xy_halo_z<T>(
-                       d_decData, static_cast<T*>(WALTZ::IDWTConfig<T>::tmp), dims, level,
-                       nullptr, 0.0, nullptr, nullptr, nullptr, 0, cuda_stream),
-                   "dec selected dyadic idwt");
+        CDF97::idwt3d_xy_halo_z<T>(
+            d_decData, static_cast<T*>(WALTZ::IDWTConfig<T>::tmp), dims, level,
+            nullptr, 0.0, nullptr, nullptr, nullptr, 0, cuda_stream);
     } else {
-        check_cuda(CDF97::idwt3d_plane_xy_halo_z<T>(d_decData,
-                                                    nullptr,
-                                                    dims,
-                                                    hdr.levels_xy,
-                                                    hdr.levels_z,
-                                                    nullptr, 0.0, nullptr, nullptr, nullptr, 0,
-                                                    false, cuda_stream),
-                   "dec plane IDWT hybrid");
+        CDF97::idwt3d_plane_xy_halo_z<T>(
+            d_decData, nullptr, dims, hdr.levels_xy, hdr.levels_z,
+            nullptr, 0.0, nullptr, nullptr, nullptr, 0, false, cuda_stream);
     }
     idwt_timer.record_stop(stream);
-    double t_idwt = 0.0;
     pwe_timer.start(stream); // 6) PWE outlier corrections
     if (hdr.n_pwe) {
         const int tb2 = 256;
         const int gb2 = static_cast<int>((hdr.n_pwe + tb2 - 1) / tb2);
-        apply_pwe_outliers<T>
-            <<<gb2, tb2, 0, cuda_stream>>>(d_decData,
+        apply_pwe_outliers<T><<<gb2, tb2, 0, cuda_stream>>>(d_decData,
                                            reinterpret_cast<const uint32_t*>(sections.pwe_index),
                                            reinterpret_cast<const T*>(sections.pwe_error),
                                            hdr.n_pwe);
     }
     pwe_timer.record_stop(stream);
-    check_cuda(cudaStreamSynchronize(cuda_stream), "dec sync");
+    cudaStreamSynchronize(cuda_stream);
     // The final stream synchronization above is required by the public decode
     // contract.  Read all interval events only now, so timing instrumentation
     // adds no submission bubbles between decode stages.
-    t_lc = lc_timer.elapsed_ready();
-    if (hdr.mag_coder == 7)
-        t_lc = wzp_decode_kernel_ms;
-    const double t_block_iperm =
-        block_iperm_timed ? block_iperm_timer.elapsed_ready() : 0.0;
-    const double t_uq_with_iperm = unquant_timer.elapsed_ready();
-    t_uq = t_uq_with_iperm > t_block_iperm ? t_uq_with_iperm - t_block_iperm : 0.0;
-    t_idwt = idwt_timer.elapsed_ready();
+    const double t_offset = complete_bz2_layout ? 0.0 : block_offset_timer.elapsed_ready();
+    const double t_wzp = wzp_decode_kernel_ms;
+    const double t_uq = unquant_timer.elapsed_ready();
+    const double t_idwt = idwt_timer.elapsed_ready();
     const double t_pw = pwe_timer.elapsed_ready();
-    check_cuda(cudaFree(d_q16), "dec free q16");
-    check_cuda(cudaFree(d_q_sign), "dec free d_q_sign");
-    check_cuda(cudaFree(d_tb), "dec free tb");
-    const double t_tot = t_lc + t_su + t_block_iperm + t_uq + t_idwt + t_pw;
-    const double orig = static_cast<double>(N) * sizeof(T);
-    const double GiB = 1024.0 * 1024.0 * 1024.0;
-    auto th = [&](double tms) { return tms > 0.0 ? orig / GiB / tms * 1000.0 : 0.0; };
-    std::printf("\n  \033[1m%-12s %-12s %-20s\033[0m  [decompress]\n",
-                "type",
-                "time (ms)",
-                "throughput (GB/s)");
-    (void)t_su;
-    const char* const decode_codec =
-        hdr.mag_coder == 7
-            ? "WZP+sign"
-            : "mag+sign-iLC";
-    std::printf("  %-12s %-12.6f %-10.4f   (sign fused in)\n", decode_codec, t_lc, th(t_lc));
-    std::printf("  %-12s %-12.6f %-10.4f\n", "block-iperm", t_block_iperm, th(t_block_iperm));
-    std::printf("  %-12s %-12.6f %-10.4f\n", "unquant", t_uq, th(t_uq));
-    std::printf("  %-12s %-12.6f %-10.4f\n", "IDWT", t_idwt, th(t_idwt));
-    std::printf("  %-12s %-12.6f %-10.4f\n", "outlier-fix", t_pw, th(t_pw));
-    std::printf("  \033[1m%-12s %-12.6f %-10.4f\033[0m\n\n", "total", t_tot, th(t_tot));
+    if (d_tb)
+        cudaFree(d_tb);
+    const size_t orig = static_cast<size_t>(N) * sizeof(T);
+    Waltz_print_decompression(orig, sections.bytes, {t_offset, t_wzp, t_uq, t_idwt, t_pw});
 
     if (decPath != nullptr) { // optional host-side dump of the reconstruction
         T* h = new T[N];
-        check_cuda(cudaMemcpy(h, d_decData, orig, cudaMemcpyDeviceToHost), "dec D2H");
+        cudaMemcpy(h, d_decData, orig, cudaMemcpyDeviceToHost);
         FILE* f = std::fopen(decPath, "wb");
         if (f != nullptr) {
             std::fwrite(h, sizeof(T), N, f);
             std::fclose(f);
-            std::printf("[WALTZ] wrote decompressed data: %s (%zu bytes)\n",
-                        decPath,
-                        static_cast<size_t>(orig));
         }
         delete[] h;
     }
@@ -1058,40 +767,6 @@ template void d_extrema<float>(float*, uint64_t, double&, double&, void*);
 template void d_extrema<double>(double*, uint64_t, double&, double&, void*);
 template void d_pipeline_prealloc<float>(const WALTZ::Config&, void*);
 template void d_pipeline_prealloc<double>(const WALTZ::Config&, void*);
-
-// Standalone fast-tuner entry (for the tune_demo validation harness): runs the same
-// autotune_pick_mode_fast as the pipeline.  Returns 0 = dyadic, 1 = XY+Z; out_ms
-// optionally receives the tuner kernel time.
-template <typename T>
-int d_autotune_fast(T* d_data,
-                    uint32_t dimx,
-                    uint32_t dimy,
-                    uint32_t dimz,
-                    double absBound,
-                    double relHint,
-                    void* stream,
-                    double* out_ms) {
-    dim3 dims(dimx, dimy, dimz);
-    uint8_t levels_xy = 0, levels_z = 0;
-    calculate_dwt_levels(dims, levels_xy, levels_z);
-    double ms = 0.0;
-    const int mode = autotune_pick_mode_fast<T>(
-        d_data,
-        dims,
-        levels_xy,
-        levels_z,
-        absBound,
-        relHint,
-        reinterpret_cast<cudaStream_t>(stream),
-        &ms);
-    if (out_ms != nullptr)
-        *out_ms = ms;
-    return mode;
-}
-template int
-d_autotune_fast<float>(float*, uint32_t, uint32_t, uint32_t, double, double, void*, double*);
-template int
-d_autotune_fast<double>(double*, uint32_t, uint32_t, uint32_t, double, double, void*, double*);
 
 template size_t d_WALTZ_compress<float, 3>(float*, char*, const WALTZ::Config&, const char*, void*);
 template size_t

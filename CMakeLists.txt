@@ -10,7 +10,7 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 option(BUILD_SHARED_LIBS "Build Waltz as a shared library" ON)
-option(WALTZ_BUILD_EXAMPLES "Build the command-line driver and tuner" ON)
+option(WALTZ_BUILD_EXAMPLES "Build the command-line driver" ON)
 option(WALTZ_BUILD_TOOLS "Build optional research/diagnostic tools" OFF)
 option(WALTZ_BUILD_TESTS "Build CUDA regression tests (requires a GPU to run)" OFF)
 
@@ -26,7 +26,7 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
-add_library(waltz_shared src/waltz.cu src/lossless/lc.cu src/lossless/wzp.cu)
+add_library(waltz_shared src/waltz.cu src/lossless/wzp.cu)
 add_library(Waltz::waltz ALIAS waltz_shared)
 
 set_target_properties(waltz_shared PROPERTIES OUTPUT_NAME waltz EXPORT_NAME waltz)
@@ -64,6 +64,10 @@ if(WALTZ_BUILD_TESTS)
     target_link_libraries(wzp_single_kernel_test PRIVATE Waltz::waltz CUDA::cudart)
     add_test(NAME wzp_roundtrip COMMAND wzp_single_kernel_test)
     set_tests_properties(wzp_roundtrip PROPERTIES TIMEOUT 180)
+    add_executable(wzp_fused_decode_test tools/wzp_fused_decode_test.cu)
+    target_link_libraries(wzp_fused_decode_test PRIVATE Waltz::waltz CUDA::cudart)
+    add_test(NAME wzp_fused_decode COMMAND wzp_fused_decode_test)
+    set_tests_properties(wzp_fused_decode PROPERTIES TIMEOUT 180)
 endif()
 
 install(

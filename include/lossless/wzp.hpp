@@ -18,21 +18,22 @@ size_t wzp_encode_with_sign(const uint16_t* input,
                             double* ms,
                             cudaStream_t stream = 0);
 // Call finish before another WZP operation reuses the workspace/timing events.
-void wzp_encode_with_sign_launch(const uint16_t* input,
+void wzp_encode(const uint16_t* input,
                                  const uint32_t* sign_bitmap,
                                  uint32_t n,
                                  cudaStream_t stream = 0);
 size_t wzp_encode_with_sign_finish(uint32_t* nnz, double* ms);
 const void* wzp_encoded_buf();
-void wzp_decode(
-    const void* blob, uint32_t n, uint16_t* output, double* ms, cudaStream_t stream = 0);
-void wzp_decode_with_sign(const void* blob,
+void wzp_decode_with_sign(const void* cmpdata,
                           uint32_t n,
                           uint16_t* output,
                           uint32_t* sign_bitmap,
                           double* ms,
                           cudaStream_t stream = 0);
-void wzp_decode_reordered_float(const void* blob,
+// offset_table is rank -> row-major offset: slot 0 for regular bricks, slots
+// 1..7 for short X/Y/Z combinations, each with stride 256*block_z entries.
+// Edge-capable calls require the matching edge slots to have been built.
+void wzp_decode_reordered_float(const void* cmpdata,
                                 uint32_t n,
                                 float* output,
                                 const uint32_t* offset_table,
@@ -41,7 +42,7 @@ void wzp_decode_reordered_float(const void* blob,
                                 uint32_t block_z,
                                 double* ms,
                                 cudaStream_t stream = 0);
-void wzp_decode_reordered_double(const void* blob,
+void wzp_decode_reordered_double(const void* cmpdata,
                                  uint32_t n,
                                  double* output,
                                  const uint32_t* offset_table,

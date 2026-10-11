@@ -118,7 +118,7 @@ namespace WALTZ {
 inline thread_local bool Waltz_report_enabled = true;
 
 struct CompressionTimes {
-    double autotune, block_rank, dwt, quant, wzp, idwt, outlier;
+    double block_rank, dwt, quant, wzp, idwt, outlier;
 };
 
 struct DecompressionTimes {
@@ -167,7 +167,6 @@ inline void Waltz_print_compression(size_t bytes, const CompressionTimes& t,
     if (!Waltz_report_enabled)
         return;
     Waltz_print_header();
-    Waltz_print_stage("autotune", bytes, t.autotune);
     Waltz_print_stage("block-rank", bytes, t.block_rank);
     Waltz_print_stage("DWT", bytes, t.dwt);
     Waltz_print_stage("quant", bytes, t.quant);
@@ -175,7 +174,7 @@ inline void Waltz_print_compression(size_t bytes, const CompressionTimes& t,
     Waltz_print_stage("IDWT", bytes, t.idwt);
     Waltz_print_stage("outlier", bytes, t.outlier);
     // WZP and reconstruction overlap; this is the existing stage total, not API e2e.
-    Waltz_print_total(bytes, t.autotune + t.block_rank + t.dwt + t.quant +
+    Waltz_print_total(bytes, t.block_rank + t.dwt + t.quant +
                                 std::max(t.wzp, t.idwt) + t.outlier);
 
     const size_t index_bytes = static_cast<size_t>(pwe_count) * sizeof(uint32_t);

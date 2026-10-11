@@ -7,22 +7,38 @@ reconstruction-error correction.
 
 ## Current implementation
 
-The source synchronized on 2026-09-17 includes:
+The source synchronized on 2026-10-11 includes:
 
-- A data-driven tuner selecting dyadic or plane (XY + Z) transforms.
+- SPERR-style, dimension-only transform selection: compute the XY level count
+  from `min(nx, ny)` and the Z level count from `nz`, repeatedly rounding up
+  after halving until the length is at most 8, with at most 5 levels. Equal
+  level counts use dyadic; otherwise use plane (XY + Z). The old sampling
+  tuner and its timing row are removed. Neither data values nor a REL hint
+  select the transform mode.
 - Quantization and forward reordering fused into DWT coefficient writes.
+- DWT reads the original input directly on its first pass, avoiding a
+  whole-volume device copy. Zero coefficients bypass unnecessary reorder/sign
+  work while still writing the reconstruction coefficients.
 - Plane float/double IDWT sharing `idwt_yx_plane<T>` and
   `idwt_z_all_dynamic<T>`. The latter calls `idwt_z_columns_all<T>`:
   original detail bands stay fixed while reconstructed low bands use two
   scratch regions, avoiding per-level copies of untouched high-frequency data.
   Float retains its float4 path. Inverse plane Z uses dynamic shared memory.
+- Capacity-based Z tiles with aligned float4/double2 accesses and fixed-column
+  kernel variants, with general fallbacks. Eligible inverse tiles use exact
+  zero/high-band-zero fast paths based on current quantized coefficients or
+  WZP metadata. These dispatch rules do not identify individual datasets.
 - Signed WZP encoding and group packing in one kernel with a fixed grid of
   512 blocks and dynamic chunk scheduling. WZP is the only lossless backend;
   experimental LC selection and old-format compatibility paths are removed.
 - WZP decoding fused with reordering and dequantization. Quantization-outlier
-  restoration remains a separate step when required.
+  restoration remains a separate step when required. Vectorized bit-plane
+  transfers and zero-chunk stores reduce decode work; decode timing is read
+  after the pipeline's final synchronization instead of blocking the next stage.
 - Regular/edge lookup tables, including a timed decode `block-offset` stage.
-- Reusable compression workspace and the `dwt3d_prealloc`,
+  Decode offset tables are reused for the same device, dimensions and reorder
+  band, and omitted for supported direct-index layouts.
+- Reusable compression workspace, CUDA timing events, and the `dwt3d_prealloc`,
   `idwt3d_prealloc`, and `wzp_prealloc` resource setup entries.
 - Shared file I/O in `utils/io.hpp` and reporting in `utils/Statistics.hpp`.
 
@@ -152,6 +168,9 @@ CUDA_VISIBLE_DEVICES=0 WALTZ_WARMUP=1 WALTZ_REPORT_CE2E=1 \
 - Stage timings and API wall time are different measurements. Compression's
   printed stage total uses `max(WZP, IDWT)` for the overlapping stages, not their
   sum; it is not a complete GPU timeline or process wall time.
+- A cached or unnecessary decode offset table reports `block-offset = 0`.
+  `unquant = 0` when there are no quantization outliers to restore; normal
+  dequantization is already included in WZP decoding.
 - Throughput labels currently say GB/s but use GiB/s (bytes divided by
   `1024^3`, then divided by seconds).
 - The obsolete `WALTZ_ASYNC_ALLOC` warm-up switch is no longer used.
@@ -166,7 +185,7 @@ The caller must resolve REL to an absolute bound before calling
 #include <waltz.hpp>
 
 WALTZ::Config conf(nx, ny, nz);
-conf.relErrorBound = 1e-3;  // Also retained as the autotuner's relative hint.
+conf.relErrorBound = 1e-3;  // Used here only to compute the absolute bound.
 conf.errorBoundMode = WALTZ::EB_ABS;
 
 cudaStream_t stream;

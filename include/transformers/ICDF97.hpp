@@ -69,10 +69,14 @@ __device__ __forceinline__ uint32_t sym_idx(int64_t idx, int64_t last) {
     return static_cast<uint32_t>(idx);
 }
 
-// Z shared float4 boundary reflection: idx/last are bounded by the shared
-// tile capacity, so use 32-bit signed coordinates.
-// The while/mirror recurrence is intentionally identical to sym_idx above.
+// Local synthesis windows reach at most seven samples beyond either edge.
+// For lengths >= 9 a single mirror fold suffices; shorter axes may need
+// repeated folds. Global buffer offsets remain 64-bit.
 __device__ __forceinline__ uint32_t sym_idx32(int idx, int last) {
+    if (last >= 8) {
+        const int u = abs(idx);
+        return static_cast<uint32_t>(min(u, 2 * last - u));
+    }
     while (idx < 0 || idx > last) {
         if (idx < 0)
             idx = -idx;
@@ -80,6 +84,21 @@ __device__ __forceinline__ uint32_t sym_idx32(int idx, int last) {
             idx = 2 * last - idx;
     }
     return static_cast<uint32_t>(idx);
+}
+
+// Reflect directly in the deinterleaved low/high arrays. Whole-sample mirror
+// reflection preserves parity, so the tap's phase need not be recovered from
+// the folded full-rate coordinate. Keep repeated folding for short axes.
+__device__ __forceinline__ uint32_t idwt_phase_index(int idx, int last, uint32_t low) {
+    if (last >= 8) {
+        const bool high = (idx & 1) != 0;
+        const int j = idx >> 1;
+        const int u = high ? max(j, -j - 1) : abs(j);
+        const int p = min(u, last - int(high) - u);
+        return static_cast<uint32_t>(p) + (high ? low : 0U);
+    }
+    const uint32_t pos = sym_idx32(idx, last);
+    return (pos & 1U) ? low + (pos >> 1U) : pos >> 1U;
 }
 
 // PAIR-FUSED synthesis: emit the two adjacent outputs at positions 2i (even) and 2i+1
@@ -220,7 +239,7 @@ __device__ void idwt_z_pass(const T* __restrict__ src, T* __restrict__ dst,
                 continue;
             }
             auto C = [&](long long idx) -> T {
-                const uint32_t pos = sym_idx(idx, last);
+                const uint32_t pos = sym_idx32(static_cast<int>(idx), static_cast<int>(last));
                 return src[xy +
                            static_cast<size_t>((pos & 1u) ? (low_lz + (pos >> 1)) : (pos >> 1)) *
                                leap_z];
@@ -250,7 +269,7 @@ __device__ void idwt_z_pass(const T* __restrict__ src, T* __restrict__ dst,
             const uint32_t i = static_cast<uint32_t>(r / ly);
             const size_t xy = x + static_cast<size_t>(y) * nx;
             auto C = [&](long long idx) -> T {
-                const uint32_t pos = sym_idx(idx, last);
+                const uint32_t pos = sym_idx32(static_cast<int>(idx), static_cast<int>(last));
                 return src[xy +
                            static_cast<size_t>((pos & 1u) ? (low_lz + (pos >> 1)) : (pos >> 1)) *
                                leap_z];
@@ -265,13 +284,34 @@ __device__ void idwt_z_pass(const T* __restrict__ src, T* __restrict__ dst,
 }
 
 template <typename T>
+inline constexpr uint32_t IDWT_Z_STATIC_TPB = std::is_same_v<T, float> ? TPB : 256U;
+
+template <typename T>
+inline uint32_t idwt_z_shared_bytes() {
+    if constexpr (std::is_same_v<T, double>) {
+        // Wider column tiles improve coalescing only when shared memory can
+        // still accommodate three CTAs. Keep the original tile elsewhere.
+        const auto& prop = WALTZ::gpu_config().properties;
+        if (prop.sharedMemPerBlockOptin >= 65536U &&
+            prop.sharedMemPerMultiprocessor >= 3U * 65536U)
+            return 65536U;
+    }
+    return WALTZ::IDWT_SHARED_BYTES;
+}
+
+template <typename T, bool ZeroColumns = false>
 __device__ void idwt_z_level_shared(const T* src, T* dst, T* s_data, uint32_t cap, uint32_t nx, uint32_t ny,
-    uint32_t lx, uint32_t ly, uint32_t lz, bool vector_z) {
+    uint32_t lx, uint32_t ly, uint32_t lz, bool vector_z, const uint32_t* xy_nonzero = nullptr) {
     if (lz < 2)
         return;
     const size_t leap_z = static_cast<size_t>(nx) * ny;
     const uint32_t low_lz = lz - (lz >> 1);
-    const uint32_t TX = cap / lz;
+    uint32_t TX = cap / lz;
+    // Retain vector alignment across every tile origin, not just its first row.
+    // The shared-memory budget bounds TX; rounding down cannot increase it.
+    constexpr uint32_t vector_width = std::is_same_v<T, float> ? 4U : 2U;
+    if (vector_z && TX >= vector_width)
+        TX &= ~(vector_width - 1U);
     if (TX == 0)
         return;
     const uint32_t nxt = (lx + TX - 1) / TX;
@@ -283,7 +323,69 @@ __device__ void idwt_z_level_shared(const T* src, T* dst, T* s_data, uint32_t ca
         const uint32_t x0 = (t % nxt) * TX;
         const uint32_t txn = min(TX, lx - x0);
         const size_t base = x0 + static_cast<size_t>(y) * nx;
-        for (uint32_t e = threadIdx.x; e < lz * txn; e += TPB) { // stage deinterleaved column
+        if constexpr (ZeroColumns) {
+            // Metadata prepass already includes the conservative low-XY guard
+            // and uses this same tile order, so no geometry proof is repeated.
+            if (xy_nonzero[t] == 0U) {
+                if (vector_z && (txn & (vector_width - 1U)) == 0U &&
+                    (reinterpret_cast<uintptr_t>(dst + base) & 15U) == 0U) {
+                    const uint32_t nv = txn / vector_width;
+                    for (uint32_t e = threadIdx.x; e < lz * nv; e += IDWT_Z_STATIC_TPB<T>) {
+                        const uint32_t z = e / nv, vc = e - z * nv;
+                        *reinterpret_cast<uint4*>(dst + base + vc * vector_width +
+                            static_cast<size_t>(z) * leap_z) = make_uint4(0U, 0U, 0U, 0U);
+                    }
+                } else {
+                    for (uint32_t e = threadIdx.x; e < lz * txn; e += IDWT_Z_STATIC_TPB<T>) {
+                        const uint32_t z = e / txn, tx = e - z * txn;
+                        dst[base + tx + static_cast<size_t>(z) * leap_z] = T(0);
+                    }
+                }
+                continue;
+            }
+        }
+        if constexpr (ZeroColumns && std::is_same_v<T, double>) {
+            // A zero high-Z band contributes exactly zero to the synthesis.
+            // Retain the same filter expressions, substituting the proven
+            // zeros, and stage only the low half of each aligned column.
+            if (xy_nonzero[t] == 1U && vector_z && (txn & 1U) == 0U &&
+                (reinterpret_cast<uintptr_t>(dst + base) & 15U) == 0U) {
+                for (uint32_t e = threadIdx.x; e < low_lz * txn; e += IDWT_Z_STATIC_TPB<T>) {
+                    const uint32_t z = e / txn, tx = e - z * txn;
+                    s_data[e] = src[base + tx + static_cast<size_t>(z) * leap_z];
+                }
+                __syncthreads();
+                const uint32_t nv = txn >> 1U;
+                const uint32_t groups = (low_lz + 1U) >> 1U;
+                for (uint32_t e = threadIdx.x; e < groups * nv; e += IDWT_Z_STATIC_TPB<T>) {
+                    const uint32_t group = e / nv, vc = e - group * nv;
+                    const uint32_t i = group * 2U, tx = vc << 1U;
+                    const auto low = [&](int p) {
+                        const uint32_t k = idwt_phase_index(2 * p, static_cast<int>(lz) - 1, low_lz);
+                        return *reinterpret_cast<const double2*>(s_data + k * txn + tx);
+                    };
+                    const double2 z = make_double2(0.0, 0.0);
+                    const double2 c1 = low(static_cast<int>(i) - 1), c3 = low(i),
+                        c5 = low(i + 1U), c7 = low(i + 2U);
+                    const auto emit = [&](uint32_t pair, double2 oe, double2 oo) {
+                        *reinterpret_cast<double2*>(dst + base + tx +
+                            static_cast<size_t>(2U * pair) * leap_z) = oe;
+                        if (2U * pair + 1U < lz)
+                            *reinterpret_cast<double2*>(dst + base + tx +
+                                static_cast<size_t>(2U * pair + 1U) * leap_z) = oo;
+                    };
+                    emit(i, idwt_even2(z,c1,z,c3,z,c5,z), idwt_odd2(z,c1,z,c3,z,c5,z,c7,z));
+                    if (i + 1U < low_lz) {
+                        const double2 c9 = low(i + 3U);
+                        emit(i + 1U, idwt_even2(z,c3,z,c5,z,c7,z),
+                            idwt_odd2(z,c3,z,c5,z,c7,z,c9,z));
+                    }
+                }
+                __syncthreads();
+                continue;
+            }
+        }
+        for (uint32_t e = threadIdx.x; e < lz * txn; e += IDWT_Z_STATIC_TPB<T>) { // stage deinterleaved column
             const uint32_t z = e / txn, tx = e - z * txn;
             s_data[z * txn + tx] = src[base + tx + static_cast<size_t>(z) * leap_z];
         }
@@ -304,7 +406,7 @@ __device__ void idwt_z_level_shared(const T* src, T* dst, T* s_data, uint32_t ca
             if constexpr (std::is_same_v<T, float>) {
                 const int last32 = static_cast<int>(lz) - 1;
                 const uint32_t nv = txn >> 2U;
-                for (uint32_t e = threadIdx.x; e < low_lz * nv; e += TPB) {
+                for (uint32_t e = threadIdx.x; e < low_lz * nv; e += IDWT_Z_STATIC_TPB<T>) {
                     const uint32_t i = e / nv, vc = e - i * nv;
                     const uint32_t tx = vc << 2U;
                     // The staged tile is bounded by IDWT_SHARED_BYTES (32 KiB for
@@ -313,8 +415,7 @@ __device__ void idwt_z_level_shared(const T* src, T* dst, T* s_data, uint32_t ca
                     // rows use the full-volume 64-bit stride.
                     float4 oe;
                     auto C4 = [&](int idx) -> float4 {
-                        const uint32_t pos = sym_idx32(idx, last32);
-                        const uint32_t k = (pos & 1u) ? (low_lz + (pos >> 1)) : (pos >> 1);
+                        const uint32_t k = idwt_phase_index(idx, last32, low_lz);
                         return *reinterpret_cast<const float4*>(
                             s_data + k * txn + tx);
                     };
@@ -493,67 +594,39 @@ __device__ void idwt_z_level_shared(const T* src, T* dst, T* s_data, uint32_t ca
                 }
             } else if constexpr (std::is_same_v<T, double>) {
                 const uint32_t nv = txn >> 1U;
-                for (uint32_t e = threadIdx.x; e < low_lz * nv; e += TPB) {
-                    const uint32_t i = e / nv, vc = e - i * nv;
-                    const uint32_t tx = vc << 1U;
-                    double2 oe, oo;
-                    // Shared-capacity-limited Z indices fit in int; avoid the sm120 64-bit reflection anomaly.
+                const uint32_t groups = (low_lz + 1U) >> 1U;
+                for (uint32_t e = threadIdx.x; e < groups * nv; e += IDWT_Z_STATIC_TPB<T>) {
+                    const uint32_t group = e / nv, vc = e - group * nv;
+                    const uint32_t i = group * 2U, tx = vc << 1U;
                     auto C2 = [&](int idx) -> double2 {
-                        const uint32_t pos = sym_idx32(idx, static_cast<int>(lz) - 1);
-                        const uint32_t k = (pos & 1u) ? (low_lz + (pos >> 1)) : (pos >> 1);
-                        return *reinterpret_cast<const double2*>(
-                            s_data + static_cast<size_t>(k) * txn + tx);
+                        const uint32_t k = idwt_phase_index(idx, static_cast<int>(lz) - 1, low_lz);
+                        return *reinterpret_cast<const double2*>(s_data + k * txn + tx);
                     };
-                    if (i >= 2u && i <= hi_i) {
-                        const double2 c0 = *reinterpret_cast<const double2*>(
-                            s_data + static_cast<size_t>(low_lz + i - 2U) * txn + tx);
-                        const double2 c1 = *reinterpret_cast<const double2*>(
-                            s_data + static_cast<size_t>(i - 1U) * txn + tx);
-                        const double2 c2 = *reinterpret_cast<const double2*>(
-                            s_data + static_cast<size_t>(low_lz + i - 1U) * txn + tx);
-                        const double2 c3 = *reinterpret_cast<const double2*>(
-                            s_data + static_cast<size_t>(i) * txn + tx);
-                        const double2 c4 = *reinterpret_cast<const double2*>(
-                            s_data + static_cast<size_t>(low_lz + i) * txn + tx);
-                        const double2 c5 = *reinterpret_cast<const double2*>(
-                            s_data + static_cast<size_t>(i + 1U) * txn + tx);
-                        const double2 c6 = *reinterpret_cast<const double2*>(
-                            s_data + static_cast<size_t>(low_lz + i + 1U) * txn + tx);
-                        const double2 c7 = *reinterpret_cast<const double2*>(
-                            s_data + static_cast<size_t>(i + 2U) * txn + tx);
-                        const double2 c8 = *reinterpret_cast<const double2*>(
-                            s_data + static_cast<size_t>(low_lz + i + 2U) * txn + tx);
-                        oe = idwt_even2(c0, c1, c2, c3, c4, c5, c6);
-                        oo = idwt_odd2(c0, c1, c2, c3, c4, c5, c6, c7, c8);
-                    } else {
-                        const int b = 2 * static_cast<int>(i) - 3;
-                        oe = idwt_even2(C2(b + 0),
-                                        C2(b + 1),
-                                        C2(b + 2),
-                                        C2(b + 3),
-                                        C2(b + 4),
-                                        C2(b + 5),
-                                        C2(b + 6));
-                        oo = idwt_odd2(C2(b + 0),
-                                       C2(b + 1),
-                                       C2(b + 2),
-                                       C2(b + 3),
-                                       C2(b + 4),
-                                       C2(b + 5),
-                                       C2(b + 6),
-                                       C2(b + 7),
-                                       C2(b + 8));
+                    auto emit = [&](uint32_t pair, double2 oe, double2 oo) {
+                        *reinterpret_cast<double2*>(dst + base + tx +
+                            static_cast<size_t>(2U * pair) * leap_z) = oe;
+                        if (2U * pair + 1U < lz)
+                            *reinterpret_cast<double2*>(dst + base + tx +
+                                static_cast<size_t>(2U * pair + 1U) * leap_z) = oo;
+                    };
+                    const int b = 2 * static_cast<int>(i) - 3;
+                    const double2 c2 = C2(b + 2), c3 = C2(b + 3), c4 = C2(b + 4),
+                        c5 = C2(b + 5), c6 = C2(b + 6), c7 = C2(b + 7), c8 = C2(b + 8);
+                    {
+                        const double2 c0 = C2(b), c1 = C2(b + 1);
+                        emit(i, idwt_even2(c0,c1,c2,c3,c4,c5,c6),
+                            idwt_odd2(c0,c1,c2,c3,c4,c5,c6,c7,c8));
                     }
-                    *reinterpret_cast<double2*>(dst + base + tx +
-                                                static_cast<size_t>(2U * i) * leap_z) = oe;
-                    if (2U * i + 1U < lz)
-                        *reinterpret_cast<double2*>(
-                            dst + base + tx + static_cast<size_t>(2U * i + 1U) * leap_z) = oo;
+                    if (i + 1U < low_lz) {
+                        const double2 c9 = C2(b + 9), c10 = C2(b + 10);
+                        emit(i + 1U, idwt_even2(c2,c3,c4,c5,c6,c7,c8),
+                            idwt_odd2(c2,c3,c4,c5,c6,c7,c8,c9,c10));
+                    }
                 }
             }
         }
         if (!vector_tile)
-            for (uint32_t e = threadIdx.x; e < low_lz * txn; e += TPB) {
+            for (uint32_t e = threadIdx.x; e < low_lz * txn; e += IDWT_Z_STATIC_TPB<T>) {
                 const uint32_t i = e / txn, tx = e - i * txn;
                 const T* col = s_data + tx;
                 T oe, oo;
@@ -588,12 +661,31 @@ __device__ void idwt_z_level_shared(const T* src, T* dst, T* s_data, uint32_t ca
     }
 }
 
+struct IdwtXYDivisors {
+    uint32_t scalar, vector, xgroups;
+};
+
+template <typename T>
+inline IdwtXYDivisors idwt_xy_divisors(uint32_t lx) {
+    const auto multiplier = [](uint32_t d) {
+        return d > 1U ? uint32_t(((1ULL << 32U) + d - 1U) / d) : 0U;
+    };
+    return {multiplier(lx), multiplier(lx / (std::is_same_v<T, float> ? 4U : 2U)),
+            multiplier(((lx + 1U) / 2U + 1U) / 2U)};
+}
+
+// Exact for these shared-tile loops: n <= 12288, d <= 6144, so n*d < 2^32.
+// With m = ceil(2^32/d), floor(n*m/2^32) equals floor(n/d). m=0 encodes d=1.
+__device__ __forceinline__ uint32_t idwt_small_div(uint32_t n, uint32_t m) {
+    return m == 0U ? n : __umulhi(n, m);
+}
+
 // Double Y+X synthesis shared with the plane launcher. Aligned columns use
 // double2 loads; adjacent outputs reuse coefficient windows. PWE selects only
 // error recording at compile time; the vector-Y memory path is selected at runtime.
 template <PWE Mode = PWE::F, int KTPB = TPB>
 __device__ __forceinline__ void idwt_yx_tiled_double(const double* __restrict__ src, double* __restrict__ dst, double* rows,
-    uint32_t cap, uint32_t nx, uint32_t ny, uint32_t lx, uint32_t ly, uint32_t lz, const double* orig = nullptr,
+    uint32_t cap, IdwtXYDivisors div, uint32_t nx, uint32_t ny, uint32_t lx, uint32_t ly, uint32_t lz, const double* orig = nullptr,
     double bound = 0.0, unsigned int* ocnt = nullptr, uint32_t* oidx = nullptr, double* oerr = nullptr,
     uint32_t ocap = 0, bool vector_y = false) {
     if (lx < 2U || ly < 2U)
@@ -623,15 +715,13 @@ __device__ __forceinline__ void idwt_yx_tiled_double(const double* __restrict__ 
             const uint32_t vec_lx = lx >> 1U;
             const uint32_t ywork = groups * vec_lx;
             for (uint32_t e = threadIdx.x; e < ywork; e += KTPB) {
-                const uint32_t vx = e % vec_lx;
+                const uint32_t group = idwt_small_div(e, div.vector);
+                const uint32_t vx = e - group * vec_lx;
                 const uint32_t x = vx << 1U;
-                const uint32_t group = e / vec_lx;
                 const uint32_t i = pair0 + (group << 1U);
                 const size_t xz = static_cast<size_t>(x) + static_cast<size_t>(z) * leap_z;
                 auto C2 = [&](long long idx) -> double2 {
-                    const uint32_t pos = sym_idx(idx, last_y);
-                    const uint32_t sy =
-                        (pos & 1U) ? (low_ly + (pos >> 1U)) : (pos >> 1U);
+                    const uint32_t sy = idwt_phase_index(static_cast<int>(idx), static_cast<int>(last_y), low_ly);
                     return *reinterpret_cast<const double2*>(
                         src + xz + static_cast<size_t>(sy) * nx);
                 };
@@ -665,12 +755,12 @@ __device__ __forceinline__ void idwt_yx_tiled_double(const double* __restrict__ 
         } else {
             const uint32_t ywork = chains * lx;
             for (uint32_t e = threadIdx.x; e < ywork; e += KTPB) {
-                const uint32_t x = e % lx;
-                const uint32_t chain = e / lx;
+                const uint32_t chain = idwt_small_div(e, div.scalar);
+                const uint32_t x = e - chain * lx;
                 const uint32_t i = pair0 + (chain << 2U);
                 const size_t xz = static_cast<size_t>(x) + static_cast<size_t>(z) * leap_z;
                 auto C = [&](long long idx) -> double {
-                    const uint32_t pos = sym_idx(idx, last_y);
+                    const uint32_t pos = sym_idx32(static_cast<int>(idx), static_cast<int>(last_y));
                     const uint32_t sy =
                         (pos & 1U) ? (low_ly + (pos >> 1U)) : (pos >> 1U);
                     return src[xz + static_cast<size_t>(sy) * nx];
@@ -728,39 +818,23 @@ __device__ __forceinline__ void idwt_yx_tiled_double(const double* __restrict__ 
 
         const uint32_t xgroups = (low_lx + 1U) >> 1U;
         const uint32_t xwork = out_rows * xgroups;
-        const uint32_t half = lx >> 1U;
-        const uint32_t quad_hi = (half >= 4U) ? (half - 4U) : 0U;
         for (uint32_t e = threadIdx.x; e < xwork; e += KTPB) {
-            const uint32_t r = e / xgroups;
+            const uint32_t r = idwt_small_div(e, div.xgroups);
             const uint32_t group = e - r * xgroups;
             const uint32_t i = group << 1U;
             const double* sh = rows + r * lx;
             double e0, o0, e1 = 0.0, o1 = 0.0;
             const bool have_second = i + 1U < low_lx;
-            if (have_second && i >= 2U && i <= quad_hi) {
-                const uint32_t hb = low_lx + i;
-                const double c0 = sh[hb - 2U], c1 = sh[i - 1U], c2 = sh[hb - 1U],
-                             c3 = sh[i], c4 = sh[hb], c5 = sh[i + 1U], c6 = sh[hb + 1U],
-                             c7 = sh[i + 2U], c8 = sh[hb + 2U], c9 = sh[i + 3U],
-                             c10 = sh[hb + 3U];
-                e0 = double(IL0) * (c0 + c6) + double(IL1) * (c1 + c5) +
-                     double(IL2) * (c2 + c4) + double(IL3) * c3;
-                o0 = double(IH0) * (c0 + c8) + double(IH1) * (c1 + c7) +
-                     double(IH2) * (c2 + c6) + double(IH3) * (c3 + c5) + double(IH4) * c4;
-                e1 = double(IL0) * (c2 + c8) + double(IL1) * (c3 + c7) +
-                     double(IL2) * (c4 + c6) + double(IL3) * c5;
-                o1 = double(IH0) * (c2 + c10) + double(IH1) * (c3 + c9) +
-                     double(IH2) * (c4 + c8) + double(IH3) * (c5 + c7) + double(IH4) * c6;
-            } else {
-                auto C = [&](long long idx) -> double {
-                    const uint32_t pos = sym_idx(idx, last_x);
-                    return sh[(pos & 1U) ? (low_lx + (pos >> 1U)) : (pos >> 1U)];
-                };
-                if (have_second)
-                    synth_quad<double>(i, C, e0, o0, e1, o1);
-                else
-                    synth_pair<double>(i, C, e0, o0);
-            }
+            // Use one tap-mapping expression across the warp; the first/last
+            // few output pairs no longer execute a separate convolution branch.
+            auto C = [&](long long idx) -> double {
+                const uint32_t pos = sym_idx32(static_cast<int>(idx), static_cast<int>(last_x));
+                return sh[(pos & 1U) ? (low_lx + (pos >> 1U)) : (pos >> 1U)];
+            };
+            if (have_second)
+                synth_quad<double>(i, C, e0, o0, e1, o1);
+            else
+                synth_pair<double>(i, C, e0, o0);
 
             const uint32_t gy = 2U * pair0 + r;
             const size_t base = static_cast<size_t>(gy) * nx + static_cast<size_t>(z) * leap_z;
@@ -830,16 +904,30 @@ __global__ __launch_bounds__(TPB, 2) void idwt_3d_z_single_global(
     idwt_z_pass<T>(src, dst, data_dims.x, data_dims.y, chunk_dims.x, chunk_dims.y, chunk_dims.z);
 }
 
-template <typename T>
-__global__ __launch_bounds__(TPB,(std::is_same_v<T, float> ? 4 : CDF97_MIN_BLOCKS(T)))
-    void idwt_3d_z_single_static(const T* src, T* dst, dim3 data_dims, dim3 chunk_dims, bool vector_z) {
-    __shared__ alignas(128) T s_data[WALTZ::IDWT_SHARED_BYTES / sizeof(T)];
-    idwt_z_level_shared<T>(src,dst, s_data, WALTZ::IDWT_SHARED_BYTES / sizeof(T),
-    data_dims.x, data_dims.y, chunk_dims.x, chunk_dims.y, chunk_dims.z, vector_z);
+template <typename T, uint32_t SharedBytes = WALTZ::IDWT_SHARED_BYTES, bool ZeroColumns = false>
+__global__ __launch_bounds__(IDWT_Z_STATIC_TPB<T>,(std::is_same_v<T, float> ? 4 : CDF97_MIN_BLOCKS(T)))
+    void idwt_3d_z_single_static(const T* src, T* dst, dim3 data_dims, dim3 chunk_dims, bool vector_z,
+                               const uint32_t* xy_nonzero = nullptr) {
+    constexpr bool dynamic = SharedBytes > 48U * 1024U;
+    __shared__ alignas(128) T static_data[dynamic ? 1U : SharedBytes / sizeof(T)];
+    extern __shared__ __align__(128) unsigned char dynamic_data[];
+    T* const s_data = dynamic ? reinterpret_cast<T*>(dynamic_data) : static_data;
+    idwt_z_level_shared<T, ZeroColumns>(src,dst, s_data, SharedBytes / sizeof(T),
+    data_dims.x, data_dims.y, chunk_dims.x, chunk_dims.y, chunk_dims.z, vector_z, xy_nonzero);
 }
 
 __device__ __forceinline__ void idwt_pwe_record_float(float out, size_t g, const float* orig,
     double bound, float fast_bound, unsigned int* ocnt, uint32_t* oidx, float* oerr, uint32_t ocap);
+
+__device__ __forceinline__ void idwt_pwe_record_float_value(float out,
+                                                            float reference,
+                                                            size_t g,
+                                                            double bound,
+                                                            float fast_bound,
+                                                            unsigned int* ocnt,
+                                                            uint32_t* oidx,
+                                                            float* oerr,
+                                                            uint32_t ocap);
 
 // Float whole-row Y->X synthesis.  Y uses aligned float4 columns (or four-pair
 // scalar chains), while X synthesizes two adjacent coefficient pairs per item.
@@ -890,8 +978,7 @@ __global__ __launch_bounds__(TPB, 3) void idwt_yx_float(const float* __restrict_
                 const uint32_t i = pair0 + (group << 1U);
                 const size_t xz = static_cast<size_t>(x) + static_cast<size_t>(z) * leap_z;
                 auto C4 = [&](long long idx) -> float4 {
-                    const uint32_t pos = sym_idx(idx, last_y);
-                    const uint32_t sy = (pos & 1U) ? (low_ly + (pos >> 1U)) : (pos >> 1U);
+                    const uint32_t sy = idwt_phase_index(static_cast<int>(idx), static_cast<int>(last_y), low_ly);
                     return *reinterpret_cast<const float4*>(src + xz +
                                                             static_cast<size_t>(sy) * nx);
                 };
@@ -917,7 +1004,7 @@ __global__ __launch_bounds__(TPB, 3) void idwt_yx_float(const float* __restrict_
                 const uint32_t i = pair0 + (chain << 2U);
                 const size_t xz = x + static_cast<size_t>(z) * leap_z;
                 auto C = [&](long long idx) -> float {
-                    const uint32_t pos = sym_idx(idx, last_y);
+                    const uint32_t pos = sym_idx32(static_cast<int>(idx), static_cast<int>(last_y));
                     const uint32_t sy = (pos & 1U) ? (low_ly + (pos >> 1U)) : (pos >> 1U);
                     return src[xz + static_cast<size_t>(sy) * nx];
                 };
@@ -971,65 +1058,72 @@ __global__ __launch_bounds__(TPB, 3) void idwt_yx_float(const float* __restrict_
         __syncthreads();
 
         const uint32_t xgroups = (low_lx + 1U) >> 1U;
-        const uint32_t xwork = out_rows * xgroups;
         const uint32_t half = lx >> 1U;
         const uint32_t quad_hi = (half >= 4U) ? (half - 4U) : 0U;
-        for (uint32_t e = threadIdx.x; e < xwork; e += TPB) {
-            const uint32_t r = e / xgroups;
-            const uint32_t group = e - r * xgroups;
-            const uint32_t i = group << 1U;
-            const float* sh = rows + r * lx;
-            float e0, o0, e1 = 0.0f, o1 = 0.0f;
-            const bool have_second = i + 1U < low_lx;
-            if (have_second && i >= 2U && i <= quad_hi) {
-                const uint32_t hb = low_lx + i;
-                const float c0 = sh[hb - 2U], c1 = sh[i - 1U], c2 = sh[hb - 1U], c3 = sh[i],
-                            c4 = sh[hb], c5 = sh[i + 1U], c6 = sh[hb + 1U], c7 = sh[i + 2U],
-                            c8 = sh[hb + 2U], c9 = sh[i + 3U], c10 = sh[hb + 3U];
-                e0 = float(IL0) * (c0 + c6) + float(IL1) * (c1 + c5) + float(IL2) * (c2 + c4) +
-                     float(IL3) * c3;
-                o0 = float(IH0) * (c0 + c8) + float(IH1) * (c1 + c7) + float(IH2) * (c2 + c6) +
-                     float(IH3) * (c3 + c5) + float(IH4) * c4;
-                e1 = float(IL0) * (c2 + c8) + float(IL1) * (c3 + c7) + float(IL2) * (c4 + c6) +
-                     float(IL3) * c5;
-                o1 = float(IH0) * (c2 + c10) + float(IH1) * (c3 + c9) + float(IH2) * (c4 + c8) +
-                     float(IH3) * (c5 + c7) + float(IH4) * c6;
-            } else {
-                auto C = [&](long long idx) -> float {
-                    const uint32_t pos = sym_idx(idx, last_x);
-                    return sh[(pos & 1U) ? (low_lx + (pos >> 1U)) : (pos >> 1U)];
-                };
-                if (have_second)
-                    synth_quad<float>(i, C, e0, o0, e1, o1);
-                else
-                    synth_pair<float>(i, C, e0, o0);
-            }
-            const uint32_t gy = 2U * pair0 + r;
-            const size_t base = static_cast<size_t>(gy) * nx + static_cast<size_t>(z) * leap_z;
-            const uint32_t ox = 2U * i;
-            if constexpr (Mode == PWE::T) {
-                idwt_pwe_record_float(
-                    e0, base + ox, orig, bound, pwe_fast_bound, ocnt, oidx, oerr, ocap);
-                if (ox + 1U < lx)
-                    idwt_pwe_record_float(
-                        o0, base + ox + 1U, orig, bound, pwe_fast_bound, ocnt, oidx, oerr, ocap);
-                if (have_second && ox + 2U < lx)
-                    idwt_pwe_record_float(
-                        e1, base + ox + 2U, orig, bound, pwe_fast_bound, ocnt, oidx, oerr, ocap);
-                if (have_second && ox + 3U < lx)
-                    idwt_pwe_record_float(
-                        o1, base + ox + 3U, orig, bound, pwe_fast_bound, ocnt, oidx, oerr, ocap);
-            } else {
-                if (have_second && ox + 3U < lx && (nx & 3U) == 0U) {
-                    *reinterpret_cast<float4*>(dst + base + ox) = make_float4(e0, o0, e1, o1);
+        for (uint32_t r = threadIdx.x >> 5U; r < out_rows; r += TPB / 32U) {
+            for (uint32_t group = threadIdx.x & 31U; group < xgroups; group += 32U) {
+                const uint32_t i = group << 1U;
+                const float* sh = rows + r * lx;
+                float e0, o0, e1 = 0.0f, o1 = 0.0f;
+                const bool have_second = i + 1U < low_lx;
+                if (have_second && i >= 2U && i <= quad_hi) {
+                    const uint32_t hb = low_lx + i;
+                    const float c0 = sh[hb - 2U], c1 = sh[i - 1U], c2 = sh[hb - 1U], c3 = sh[i],
+                                c4 = sh[hb], c5 = sh[i + 1U], c6 = sh[hb + 1U], c7 = sh[i + 2U],
+                                c8 = sh[hb + 2U], c9 = sh[i + 3U], c10 = sh[hb + 3U];
+                    e0 = float(IL0) * (c0 + c6) + float(IL1) * (c1 + c5) + float(IL2) * (c2 + c4) +
+                         float(IL3) * c3;
+                    o0 = float(IH0) * (c0 + c8) + float(IH1) * (c1 + c7) + float(IH2) * (c2 + c6) +
+                         float(IH3) * (c3 + c5) + float(IH4) * c4;
+                    e1 = float(IL0) * (c2 + c8) + float(IL1) * (c3 + c7) + float(IL2) * (c4 + c6) +
+                         float(IL3) * c5;
+                    o1 = float(IH0) * (c2 + c10) + float(IH1) * (c3 + c9) + float(IH2) * (c4 + c8) +
+                         float(IH3) * (c5 + c7) + float(IH4) * c6;
                 } else {
-                    dst[base + ox] = e0;
-                    if (ox + 1U < lx)
-                        dst[base + ox + 1U] = o0;
-                    if (have_second && ox + 2U < lx)
-                        dst[base + ox + 2U] = e1;
-                    if (have_second && ox + 3U < lx)
-                        dst[base + ox + 3U] = o1;
+                    auto C = [&](long long idx) -> float {
+                        const uint32_t pos = sym_idx32(static_cast<int>(idx), static_cast<int>(last_x));
+                        return sh[(pos & 1U) ? (low_lx + (pos >> 1U)) : (pos >> 1U)];
+                    };
+                    if (have_second)
+                        synth_quad<float>(i, C, e0, o0, e1, o1);
+                    else
+                        synth_pair<float>(i, C, e0, o0);
+                }
+                const uint32_t gy = 2U * pair0 + r;
+                const size_t base = static_cast<size_t>(gy) * nx + static_cast<size_t>(z) * leap_z;
+                const uint32_t ox = 2U * i;
+                if constexpr (Mode == PWE::T) {
+                    if (have_second && ox + 3U < lx && (nx & 3U) == 0U) {
+                        const float4 ref = *reinterpret_cast<const float4*>(orig + base + ox);
+                        idwt_pwe_record_float_value(e0, ref.x, base + ox, bound, pwe_fast_bound, ocnt, oidx, oerr, ocap);
+                        idwt_pwe_record_float_value(o0, ref.y, base + ox + 1U, bound, pwe_fast_bound, ocnt, oidx, oerr, ocap);
+                        idwt_pwe_record_float_value(e1, ref.z, base + ox + 2U, bound, pwe_fast_bound, ocnt, oidx, oerr, ocap);
+                        idwt_pwe_record_float_value(o1, ref.w, base + ox + 3U, bound, pwe_fast_bound, ocnt, oidx, oerr, ocap);
+                    } else {
+                        idwt_pwe_record_float(
+                            e0, base + ox, orig, bound, pwe_fast_bound, ocnt, oidx, oerr, ocap);
+                        if (ox + 1U < lx)
+                            idwt_pwe_record_float(
+                                o0, base + ox + 1U, orig, bound, pwe_fast_bound, ocnt, oidx, oerr, ocap);
+                        if (have_second && ox + 2U < lx)
+                            idwt_pwe_record_float(
+                                e1, base + ox + 2U, orig, bound, pwe_fast_bound, ocnt, oidx, oerr, ocap);
+                        if (have_second && ox + 3U < lx)
+                            idwt_pwe_record_float(
+                                o1, base + ox + 3U, orig, bound, pwe_fast_bound, ocnt, oidx, oerr, ocap);
+                    }
+                } else {
+                    if (have_second && ox + 3U < lx && (nx & 3U) == 0U) {
+                        *reinterpret_cast<float4*>(dst + base + ox) = make_float4(e0, o0, e1, o1);
+                    } else {
+                        dst[base + ox] = e0;
+                        if (ox + 1U < lx)
+                            dst[base + ox + 1U] = o0;
+                        if (have_second && ox + 2U < lx)
+                            dst[base + ox + 2U] = e1;
+                        if (have_second && ox + 3U < lx)
+                            dst[base + ox + 3U] = o1;
+                    }
                 }
             }
         }
@@ -1042,10 +1136,11 @@ __global__ __launch_bounds__(TPB, 3) void idwt_yx_float(const float* __restrict_
 template <typename T, PWE Mode = PWE::F, int KTPB = 256>
 __global__ void idwt_yx_plane(const T* __restrict__ src, T* __restrict__ dst,
     dim3 data_dims, dim3 chunk_dims, uint32_t pairs, uint32_t next_lx, uint32_t next_ly, bool carry,
+    IdwtXYDivisors div,
     const T* __restrict__ orig = nullptr, double bound = 0.0, unsigned int* ocnt = nullptr, uint32_t* oidx = nullptr,
     T* oerr = nullptr, uint32_t ocap = 0U, bool vector_y = false) {
     if constexpr (std::is_same_v<T, float>) {
-        __shared__ alignas(128) float rows[32U * 1024U / sizeof(float)];
+        __shared__ alignas(128) float rows[48U * 1024U / sizeof(float)];
         const uint32_t nx = data_dims.x;
         const uint32_t ny = data_dims.y;
         const uint32_t nz = chunk_dims.z;
@@ -1088,8 +1183,7 @@ __global__ void idwt_yx_plane(const T* __restrict__ src, T* __restrict__ dst,
                     const uint32_t i = pair0 + (group << 1U);
                     const size_t xz = static_cast<size_t>(x) + static_cast<size_t>(z) * leap_z;
                     auto C4 = [&](long long idx) -> float4 {
-                        const uint32_t pos = sym_idx(idx, last_y);
-                        const uint32_t sy = (pos & 1U) ? (low_ly + (pos >> 1U)) : (pos >> 1U);
+                        const uint32_t sy = idwt_phase_index(static_cast<int>(idx), static_cast<int>(last_y), low_ly);
                         return *reinterpret_cast<const float4*>(src + xz +
                                                                 static_cast<size_t>(sy) * nx);
                     };
@@ -1118,7 +1212,7 @@ __global__ void idwt_yx_plane(const T* __restrict__ src, T* __restrict__ dst,
                     const uint32_t i = pair0 + (chain << 2U);
                     const size_t xz = x + static_cast<size_t>(z) * leap_z;
                     auto C = [&](long long idx) -> float {
-                        const uint32_t pos = sym_idx(idx, last_y);
+                        const uint32_t pos = sym_idx32(static_cast<int>(idx), static_cast<int>(last_y));
                         const uint32_t sy = (pos & 1U) ? (low_ly + (pos >> 1U)) : (pos >> 1U);
                         return src[xz + static_cast<size_t>(sy) * nx];
                     };
@@ -1197,7 +1291,7 @@ __global__ void idwt_yx_plane(const T* __restrict__ src, T* __restrict__ dst,
                          float(IH3) * (c5 + c7) + float(IH4) * c6;
                 } else {
                     auto C = [&](long long idx) -> float {
-                        const uint32_t pos = sym_idx(idx, last_x);
+                        const uint32_t pos = sym_idx32(static_cast<int>(idx), static_cast<int>(last_x));
                         return sh[(pos & 1U) ? (low_lx + (pos >> 1U)) : (pos >> 1U)];
                     };
                     if (have_second)
@@ -1332,6 +1426,7 @@ __global__ void idwt_yx_plane(const T* __restrict__ src, T* __restrict__ dst,
                              dst,
                              yx_double_rows,
                              2U * pairs * lx,
+                             div,
                              nx,
                              ny,
                              lx,
@@ -1696,6 +1791,7 @@ __global__ void idwt_yx_double(
     dim3 data_dims,
     dim3 chunk_dims,
     uint32_t pairs,
+    IdwtXYDivisors div,
     const double* orig,
     double bound,
     unsigned int* ocnt,
@@ -1713,6 +1809,7 @@ __global__ void idwt_yx_double(
                                       dst,
                                       yx_double_rows,
                                       2U * pairs * lx,
+                                      div,
                                       nx,
                                       ny,
                                       lx,
@@ -1734,7 +1831,8 @@ __global__ void idwt_yx_double(
 template <typename T>
 inline cudaError_t idwt3d_xy_halo_z(T* d_vol, T* d_tmp, dim3 data_dims, int levels, const T* d_orig = nullptr,
     double bound = 0.0, unsigned int* d_ocnt = nullptr, uint32_t* d_oidx = nullptr, T* d_oerr = nullptr,
-                                 uint32_t ocap = 0, cudaStream_t stream = 0) {
+                                 uint32_t ocap = 0, cudaStream_t stream = 0,
+                                 const uint32_t* xy_nonzero = nullptr) {
     if (levels > CDF97_MAX_LEVELS)
         return cudaErrorInvalidValue;
     dim3 level_dims[CDF97_MAX_LEVELS];
@@ -1745,20 +1843,25 @@ inline cudaError_t idwt3d_xy_halo_z(T* d_vol, T* d_tmp, dim3 data_dims, int leve
         dims.y -= dims.y >> 1U;
         dims.z -= dims.z >> 1U;
     }
-    constexpr uint32_t capacity = WALTZ::IDWT_SHARED_BYTES / sizeof(T);
+    const uint32_t z_shared_bytes = idwt_z_shared_bytes<T>();
+    const uint32_t capacity = z_shared_bytes / sizeof(T);
     for (int lev = levels - 1; lev >= 0; --lev) {
         const dim3 chunk_dims = level_dims[lev];
         const uint32_t lx = chunk_dims.x, ly = chunk_dims.y, lz = chunk_dims.z;
         const T* const original = lev == 0 ? d_orig : nullptr;
 
         // Z: data -> tmp. Limit the grid to useful tiles/items at coarse levels.
-        const bool use_static = lev == 0 && lz * 16U <= capacity;
+        // Preserve the original shared/global dispatch; only widen existing
+        // shared tiles, rather than changing the long-column algorithm.
+        const bool use_static = lev == 0 && lz * 16U <= WALTZ::IDWT_SHARED_BYTES / sizeof(T);
         constexpr uint32_t align_mask = std::is_same_v<T, float> ? 3U : 1U;
         const bool vector_z = (data_dims.x & align_mask) == 0U;
         size_t required_blocks;
         int full;
         if (use_static) {
-            const uint32_t columns_per_tile = capacity / lz;
+            uint32_t columns_per_tile = capacity / lz;
+            if (vector_z && columns_per_tile > align_mask)
+                columns_per_tile &= ~align_mask;
             const size_t tiles = static_cast<size_t>(ly) * ((static_cast<size_t>(lx) + columns_per_tile - 1U) / columns_per_tile);
             required_blocks = tiles;
             full = IDWTConfig<T>::z_static_blocks;
@@ -1771,8 +1874,18 @@ inline cudaError_t idwt3d_xy_halo_z(T* d_vol, T* d_tmp, dim3 data_dims, int leve
         }
         const int grid = required_blocks < static_cast<size_t>(full) ? static_cast<int>(required_blocks) : full;
         if (use_static) {
-            idwt_3d_z_single_static<T><<<grid, TPB, 0, stream>>>(
-                d_vol, d_tmp, data_dims, chunk_dims, vector_z);
+            if (xy_nonzero != nullptr && z_shared_bytes == 65536U)
+                idwt_3d_z_single_static<T, 65536U, true><<<grid, IDWT_Z_STATIC_TPB<T>, 65536U, stream>>>(
+                    d_vol, d_tmp, data_dims, chunk_dims, vector_z, xy_nonzero);
+            else if (xy_nonzero != nullptr)
+                idwt_3d_z_single_static<T, WALTZ::IDWT_SHARED_BYTES, true><<<grid, IDWT_Z_STATIC_TPB<T>, 0, stream>>>(
+                    d_vol, d_tmp, data_dims, chunk_dims, vector_z, xy_nonzero);
+            else if (z_shared_bytes == 65536U)
+                idwt_3d_z_single_static<T, 65536U><<<grid, IDWT_Z_STATIC_TPB<T>, 65536U, stream>>>(
+                    d_vol, d_tmp, data_dims, chunk_dims, vector_z, xy_nonzero);
+            else
+                idwt_3d_z_single_static<T><<<grid, IDWT_Z_STATIC_TPB<T>, 0, stream>>>(
+                    d_vol, d_tmp, data_dims, chunk_dims, vector_z, xy_nonzero);
         } else {
             idwt_3d_z_single_global<T><<<grid, TPB, 0, stream>>>(
                 d_vol, d_tmp, data_dims, chunk_dims);
@@ -1791,11 +1904,11 @@ inline cudaError_t idwt3d_xy_halo_z(T* d_vol, T* d_tmp, dim3 data_dims, int leve
             const bool vector_y = (data_dims.x & 1U) == 0U && (lx & 1U) == 0U;
             if (original != nullptr) {
                 idwt_yx_double<PWE::T><<<grid, TPB, 0, stream>>>(
-                    d_tmp, nullptr, data_dims, chunk_dims, pairs, original, bound, d_ocnt,
+                    d_tmp, nullptr, data_dims, chunk_dims, pairs, idwt_xy_divisors<T>(lx), original, bound, d_ocnt,
                     d_oidx, d_oerr, ocap, vector_y);
             } else {
                 idwt_yx_double<PWE::F><<<grid, TPB, 0, stream>>>(
-                    d_tmp, d_vol, data_dims, chunk_dims, pairs, nullptr, 0.0, nullptr, nullptr,
+                    d_tmp, d_vol, data_dims, chunk_dims, pairs, idwt_xy_divisors<T>(lx), nullptr, 0.0, nullptr, nullptr,
                     nullptr, 0, vector_y);
             }
         } else if constexpr (std::is_same_v<T, float>) {
@@ -1896,7 +2009,7 @@ __device__ __forceinline__ void idwt_pwe_record_error_float(float error,
 // Keep original detail bands immutable; ping-pong only the reconstructed low band.
 // Scratch lengths ceil(nz/2) and ceil(nz/4) suffice because the last level writes
 // directly to global memory (or records PWE). No finer-band carry copy is needed.
-template <typename T>
+template <typename T, bool DecodeOnly = false, uint32_t FixedColumns = 0U>
 __device__ __forceinline__ void idwt_z_columns_all(const T* src, T* dst,
     uint32_t nx, uint32_t ny, uint32_t nz, int levels_z, T* s_data, uint32_t cap, const T* orig,
     double bound, unsigned int* ocnt, uint32_t* oidx, T* oerr, uint32_t ocap, bool direct_error = false) {
@@ -1907,10 +2020,14 @@ __device__ __forceinline__ void idwt_z_columns_all(const T* src, T* dst,
     const uint32_t total_columns = nx * ny;
     uint32_t cols = min(cap / per_col, total_columns);
     // Four-column tiles preserve float4 alignment and regular double accesses.
-    constexpr uint32_t column_alignment = 4U;
+    constexpr uint32_t column_alignment = 32U;
     const uint32_t aligned_cols = cols & ~(column_alignment - 1U);
     if (aligned_cols >= column_alignment)
         cols = aligned_cols;
+    else if (cols >= 4U)
+        cols &= ~3U;
+    if constexpr (FixedColumns != 0U)
+        cols = FixedColumns;
     if (cols == 0U)
         return;
 
@@ -1926,7 +2043,8 @@ __device__ __forceinline__ void idwt_z_columns_all(const T* src, T* dst,
 
     for (uint32_t chunkID = blockIdx.x; chunkID < max_count; chunkID += gridDim.x) {
         const uint32_t col0 = chunkID * cols;
-        const uint32_t ncol = min(cols, total_columns - col0);
+        const uint32_t ncol = FixedColumns != 0U ? FixedColumns : min(cols, total_columns - col0);
+        const uint32_t valid_cols = min(ncol, total_columns - col0);
         const uint32_t tile_elems = ncol * full_z;
         T* const imm = s_data;
         T* const scratch_a = s_data + imm_cap;
@@ -1942,15 +2060,17 @@ __device__ __forceinline__ void idwt_z_columns_all(const T* src, T* dst,
                 for (uint32_t i = threadIdx.x; i < vec_elems; i += TPB) {
                     const uint32_t z = i / vec_cols;
                     const uint32_t vc = i - z * vec_cols;
-                    sh4[i] = *reinterpret_cast<const float4*>(src + col0 + (vc << 2U) +
-                                                              static_cast<size_t>(z) * stride_z);
+                    sh4[i] = (vc << 2U) < valid_cols
+                        ? *reinterpret_cast<const float4*>(src + col0 + (vc << 2U) +
+                                                          static_cast<size_t>(z) * stride_z)
+                        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                 }
             }
         } else {
             for (uint32_t i = threadIdx.x; i < tile_elems; i += TPB) {
                 const uint32_t z = i / ncol;
                 const uint32_t lc = i - z * ncol;
-                imm[i] = src[col0 + lc + static_cast<size_t>(z) * stride_z];
+                imm[i] = lc < valid_cols ? src[col0 + lc + static_cast<size_t>(z) * stride_z] : T(0);
             }
         }
         __syncthreads();
@@ -1968,49 +2088,21 @@ __device__ __forceinline__ void idwt_z_columns_all(const T* src, T* dst,
             if (vector_tile) {
                 if constexpr (std::is_same_v<T, float>) {
                     const uint32_t vec_cols = ncol >> 2U;
-                    const uint32_t vec_pairs = low_lz * vec_cols;
+                    const uint32_t vec_pairs = ((low_lz + 1U) >> 1U) * vec_cols;
                     for (uint32_t vi = threadIdx.x; vi < vec_pairs; vi += TPB) {
-                        const uint32_t i = vi / vec_cols;
-                        const uint32_t lc = (vi - i * vec_cols) << 2U;
-                        auto low4 = [&](uint32_t k) -> float4 {
-                            return *reinterpret_cast<const float4*>(low_src +
-                                                                    static_cast<size_t>(k) * ncol + lc);
-                        };
-                        auto high4 = [&](uint32_t k) -> float4 {
-                            return *reinterpret_cast<const float4*>(
-                                imm + static_cast<size_t>(low_lz + k) * ncol + lc);
-                        };
+                        const uint32_t group = vi / vec_cols;
+                        const uint32_t first_i = group * 2U;
+                        const uint32_t lc = (vi - group * vec_cols) << 2U;
                         auto C4 = [&](long long idx) -> float4 {
-                            const uint32_t pos = sym_idx(idx, last);
-                            return (pos & 1U) ? high4(pos >> 1U) : low4(pos >> 1U);
+                            const uint32_t pos = sym_idx32(static_cast<int>(idx), static_cast<int>(last));
+                            const float* ptr = (pos & 1U)
+                                ? imm + static_cast<size_t>(low_lz + (pos >> 1U)) * ncol + lc
+                                : low_src + static_cast<size_t>(pos >> 1U) * ncol + lc;
+                            return *reinterpret_cast<const float4*>(ptr);
                         };
-                        float4 oe, oo;
-                        if (i >= 2U && i <= hi_i) {
-                            const float4 c0 = high4(i - 2U), c1 = low4(i - 1U), c2 = high4(i - 1U),
-                                         c3 = low4(i), c4 = high4(i), c5 = low4(i + 1U),
-                                         c6 = high4(i + 1U), c7 = low4(i + 2U), c8 = high4(i + 2U);
-                            oe = idwt_even4(c0, c1, c2, c3, c4, c5, c6);
-                            oo = idwt_odd4(c0, c1, c2, c3, c4, c5, c6, c7, c8);
-                        } else {
-                            const long long b = 2LL * static_cast<long long>(i) - 3LL;
-                            oe = idwt_even4(C4(b + 0),
-                                            C4(b + 1),
-                                            C4(b + 2),
-                                            C4(b + 3),
-                                            C4(b + 4),
-                                            C4(b + 5),
-                                            C4(b + 6));
-                            oo = idwt_odd4(C4(b + 0),
-                                           C4(b + 1),
-                                           C4(b + 2),
-                                           C4(b + 3),
-                                           C4(b + 4),
-                                           C4(b + 5),
-                                           C4(b + 6),
-                                           C4(b + 7),
-                                           C4(b + 8));
-                        }
-
+                        auto emit = [&](uint32_t i, float4 oe, float4 oo) {
+                        if (final && lc >= valid_cols)
+                            return;
                         if (!final) {
                             *reinterpret_cast<float4*>(out_sh + static_cast<size_t>(2U * i) * ncol +
                                                        lc) = oe;
@@ -2068,6 +2160,21 @@ __device__ __forceinline__ void idwt_z_columns_all(const T* src, T* dst,
                                     oo.w, r1.w, g1 + 3U, bound, fast_bound, ocnt, oidx, oerr, ocap);
                             }
                         }
+
+                        };
+                        const long long b = 2LL * first_i - 3LL;
+                        const float4 c2 = C4(b + 2), c3 = C4(b + 3), c4 = C4(b + 4),
+                                     c5 = C4(b + 5), c6 = C4(b + 6), c7 = C4(b + 7), c8 = C4(b + 8);
+                        {
+                            const float4 c0 = C4(b), c1 = C4(b + 1);
+                            emit(first_i, idwt_even4(c0,c1,c2,c3,c4,c5,c6),
+                                 idwt_odd4(c0,c1,c2,c3,c4,c5,c6,c7,c8));
+                        }
+                        if (first_i + 1U < low_lz) {
+                            const float4 c9 = C4(b + 9), c10 = C4(b + 10);
+                            emit(first_i + 1U, idwt_even4(c2,c3,c4,c5,c6,c7,c8),
+                                 idwt_odd4(c2,c3,c4,c5,c6,c7,c8,c9,c10));
+                        }
                     }
                 }
             } else {
@@ -2075,8 +2182,10 @@ __device__ __forceinline__ void idwt_z_columns_all(const T* src, T* dst,
                 for (uint32_t e = threadIdx.x; e < pairs; e += TPB) {
                     const uint32_t i = e / ncol;
                     const uint32_t lc = e - i * ncol;
+                    if (final && lc >= valid_cols)
+                        continue;
                     auto C = [&](long long idx) -> T {
-                        const uint32_t pos = sym_idx(idx, last);
+                        const uint32_t pos = sym_idx32(static_cast<int>(idx), static_cast<int>(last));
                         return (pos & 1U)
                                    ? imm[static_cast<size_t>(low_lz + (pos >> 1U)) * ncol + lc]
                                    : low_src[static_cast<size_t>(pos >> 1U) * ncol + lc];
@@ -2166,7 +2275,7 @@ __device__ __forceinline__ void idwt_z_columns_all(const T* src, T* dst,
 
 
 // Dynamically sized shared-memory Z inverse.
-template <typename T>
+template <typename T, bool DecodeOnly = false, uint32_t FixedColumns = 0U>
 __global__ __launch_bounds__(TPB, std::is_same_v<T, float> ? 3 : CDF97_MIN_BLOCKS_D)
 void idwt_z_all_dynamic(const T* src, T* dst, uint32_t nx, uint32_t ny, uint32_t nz,
                         int levels_z, const T* orig, double bound, unsigned int* ocnt,
@@ -2174,8 +2283,34 @@ void idwt_z_all_dynamic(const T* src, T* dst, uint32_t nx, uint32_t ny, uint32_t
                         bool direct_error = false) {
     extern __shared__ __align__(128) unsigned char z_shared[];
     T* const s_data = reinterpret_cast<T*>(z_shared);
-    idwt_z_columns_all<T>(src, dst, nx, ny, nz, levels_z, s_data, cap,
-                                  orig, bound, ocnt, oidx, oerr, ocap, direct_error);
+    idwt_z_columns_all<T, DecodeOnly, FixedColumns>(src, dst, nx, ny, nz, levels_z, s_data, cap,
+                                  DecodeOnly ? nullptr : orig, bound, ocnt, oidx, oerr, ocap,
+                                  DecodeOnly ? false : direct_error);
+}
+
+// Compile the same algorithm for every warp-width tile up to a block's thread
+// count. Selection is solely capacity based, not a volume-divisibility rule.
+template <typename T, uint32_t Columns = 32U>
+inline cudaError_t idwt_configure_z_columns(size_t bytes) {
+    cudaError_t e = cudaFuncSetAttribute(idwt_z_all_dynamic<T, true, Columns>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes));
+    if (e != cudaSuccess) return e;
+    e = cudaFuncSetAttribute(idwt_z_all_dynamic<T, false, Columns>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes));
+    if (e != cudaSuccess) return e;
+    if constexpr (Columns < TPB)
+        return idwt_configure_z_columns<T, Columns + 32U>(bytes);
+    return cudaSuccess;
+}
+
+template <typename T, bool DecodeOnly, uint32_t Columns = 32U, typename... Args>
+inline void idwt_launch_z_columns(uint32_t cols, int grid, size_t smem, cudaStream_t stream, Args... args) {
+    if (cols == Columns)
+        idwt_z_all_dynamic<T, DecodeOnly, Columns><<<grid, TPB, smem, stream>>>(args...);
+    else if constexpr (Columns < TPB)
+        idwt_launch_z_columns<T, DecodeOnly, Columns + 32U>(cols, grid, smem, stream, args...);
+    else
+        idwt_z_all_dynamic<T, DecodeOnly><<<grid, TPB, smem, stream>>>(args...);
 }
 
 // Configure dyadic/plane inverse launches and optionally allocate temporary storage.
@@ -2215,8 +2350,17 @@ inline cudaError_t idwt3d_prealloc(dim3 dims, bool use_dyadic, bool allocate_scr
             const int z_global_blocks = max(blocks_per_sm, 1) * sm_count;
 
             blocks_per_sm = 0;
-            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &blocks_per_sm, idwt_3d_z_single_static<T>, TPB, 0);
+            if (idwt_z_shared_bytes<T>() == 65536U) {
+                cudaFuncSetAttribute(idwt_3d_z_single_static<T, 65536U>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+                cudaFuncSetAttribute(idwt_3d_z_single_static<T, 65536U, true>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks_per_sm, idwt_3d_z_single_static<T, 65536U>, IDWT_Z_STATIC_TPB<T>, 65536U);
+            } else {
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks_per_sm, idwt_3d_z_single_static<T>, IDWT_Z_STATIC_TPB<T>, 0);
+            }
             const int z_static_blocks = max(blocks_per_sm, 1) * sm_count;
             IDWTConfig<T>::z_static_blocks = z_static_blocks;
 
@@ -2274,6 +2418,12 @@ inline cudaError_t idwt3d_prealloc(dim3 dims, bool use_dyadic, bool allocate_scr
                                      static_cast<int>(z_smem));
         if (error != cudaSuccess)
             return error;
+        error = cudaFuncSetAttribute(idwt_z_all_dynamic<double, true>,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     static_cast<int>(z_smem));
+        if (error != cudaSuccess) return error;
+        error = idwt_configure_z_columns<T>(z_smem);
+        if (error != cudaSuccess) return error;
 
         int blocks_per_sm = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -2304,6 +2454,12 @@ inline cudaError_t idwt3d_prealloc(dim3 dims, bool use_dyadic, bool allocate_scr
                                                       static_cast<int>(chosen_smem));
             if (error != cudaSuccess)
                 return error;
+            error = cudaFuncSetAttribute(idwt_z_all_dynamic<float, true>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(chosen_smem));
+            if (error != cudaSuccess) return error;
+            error = idwt_configure_z_columns<T>(chosen_smem);
+            if (error != cudaSuccess) return error;
             int blocks_per_sm = 0;
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &blocks_per_sm, idwt_z_all_dynamic<float>, TPB, chosen_smem);
@@ -2340,13 +2496,15 @@ inline cudaError_t idwt3d_plane_xy_halo_z(T* d_vol, T* d_tmp, dim3 dims, int lev
 
     constexpr bool is_float = std::is_same_v<T, float>;
     constexpr uint32_t xy_tpb = 256U;
-    constexpr uint32_t static_capacity = (is_float ? 32U : 48U) * 1024U / sizeof(T);
+    constexpr uint32_t static_capacity = 48U * 1024U / sizeof(T);
     constexpr uint32_t max_pairs = is_float ? 12U : 8U;
 
     for (int lev = levels_xy - 1; lev >= 0; --lev) {
         const dim3 chunk_dims = level_dims[lev];
         const dim3 next_dims = lev > 0 ? level_dims[lev - 1] : chunk_dims;
         uint32_t pairs = min(max_pairs, static_cast<uint32_t>(static_capacity / (2ULL * chunk_dims.x)));
+        if (pairs > 1U)
+            pairs &= ~1U;
         const uint32_t low_y = (chunk_dims.y + 1U) >> 1U;
         if (pairs > 4U && static_cast<size_t>((low_y + pairs - 1U) / pairs) * chunk_dims.z <
             static_cast<size_t>(WALTZ::gpu_config().sm_count()))
@@ -2358,6 +2516,7 @@ inline cudaError_t idwt3d_plane_xy_halo_z(T* d_vol, T* d_tmp, dim3 dims, int lev
         const bool vector_y = (dims.x & 1U) == 0U && (chunk_dims.x & 1U) == 0U;
         idwt_yx_plane<T><<<IDWTConfig<T>::plane_yx_blocks, xy_tpb, 0, stream>>>(
             src, dst, dims, chunk_dims, pairs, next_dims.x, next_dims.y, carry,
+            idwt_xy_divisors<T>(chunk_dims.x),
             nullptr, 0.0, nullptr, nullptr, nullptr, 0U, vector_y);
         cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess)
@@ -2370,9 +2529,17 @@ inline cudaError_t idwt3d_plane_xy_halo_z(T* d_vol, T* d_tmp, dim3 dims, int lev
 
     const uint32_t z_cap = IDWTConfig<T>::z_capacity;
     const size_t z_smem = static_cast<size_t>(z_cap) * sizeof(T);
-    idwt_z_all_dynamic<T><<<IDWTConfig<T>::plane_z_blocks, TPB, z_smem, stream>>>(
-        src, d_vol, dims.x, dims.y, dims.z, levels_z,
-        d_orig, bound, d_ocnt, d_oidx, d_oerr, ocap, z_cap, direct_error);
+    const uint32_t a1 = (dims.z + 1U) / 2U;
+    const uint32_t cols = min(z_cap / (dims.z + a1 + (a1 + 1U) / 2U), dims.x * dims.y) & ~31U;
+    if (d_orig == nullptr && !direct_error) {
+        idwt_launch_z_columns<T, true>(cols, IDWTConfig<T>::plane_z_blocks, z_smem, stream,
+            src, d_vol, dims.x, dims.y, dims.z, levels_z,
+            d_orig, bound, d_ocnt, d_oidx, d_oerr, ocap, z_cap, direct_error);
+    } else {
+        idwt_launch_z_columns<T, false>(cols, IDWTConfig<T>::plane_z_blocks, z_smem, stream,
+            src, d_vol, dims.x, dims.y, dims.z, levels_z,
+            d_orig, bound, d_ocnt, d_oidx, d_oerr, ocap, z_cap, direct_error);
+    }
     return cudaGetLastError();
 }
 

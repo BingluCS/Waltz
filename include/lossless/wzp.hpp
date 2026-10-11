@@ -24,6 +24,11 @@ void wzp_encode(const uint16_t* input,
                                  cudaStream_t stream = 0);
 size_t wzp_encode_with_sign_finish(uint32_t* nnz, double* ms);
 const void* wzp_encoded_buf();
+// Requires completion of the decode stream, before reusing WZP's timing events.
+double wzp_decode_elapsed();
+// Decoders enqueue on stream. If ms is non-null they wait and return elapsed
+// time; otherwise the caller must order output consumers on the same stream
+// or synchronize before host access/workspace reuse.
 void wzp_decode_with_sign(const void* cmpdata,
                           uint32_t n,
                           uint16_t* output,
@@ -41,7 +46,9 @@ void wzp_decode_reordered_float(const void* cmpdata,
                                 dim3 dims,
                                 uint32_t block_z,
                                 double* ms,
-                                cudaStream_t stream = 0);
+                                cudaStream_t stream = 0,
+                                uint32_t* xy_nonzero = nullptr,
+                                uint32_t zero_columns = 0U);
 void wzp_decode_reordered_double(const void* cmpdata,
                                  uint32_t n,
                                  double* output,
@@ -50,6 +57,8 @@ void wzp_decode_reordered_double(const void* cmpdata,
                                  dim3 dims,
                                  uint32_t block_z,
                                  double* ms,
-                                 cudaStream_t stream = 0);
+                                 cudaStream_t stream = 0,
+                                 uint32_t* xy_nonzero = nullptr,
+                                 uint32_t zero_columns = 0U);
 
 } // namespace WALTZ::lossless

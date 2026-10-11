@@ -70,10 +70,12 @@ static __device__ inline bool d_BIT_2(int& csize, byte in[CS], byte out[CS], byt
 
     for (int pos = 16 * tid; pos < size; pos += 16 * TPB) {
         const int wi = pos / 4; // process 16 shorts in four 64-bit registers
-        unsigned long long a0 = in_l[wi + 0];
-        unsigned long long a1 = in_l[wi + 1];
-        unsigned long long a2 = in_l[wi + 2];
-        unsigned long long a3 = in_l[wi + 3];
+        const ulonglong2 a01 = *reinterpret_cast<const ulonglong2*>(in_l + wi);
+        const ulonglong2 a23 = *reinterpret_cast<const ulonglong2*>(in_l + wi + 2);
+        unsigned long long a0 = a01.x;
+        unsigned long long a1 = a01.y;
+        unsigned long long a2 = a23.x;
+        unsigned long long a3 = a23.y;
         unsigned long long t;
 
         swp(a0, a2, 8, 0x00FF00FF00FF00FFULL);
@@ -151,10 +153,8 @@ static __device__ inline void d_iBIT_2(int& csize, byte in[CS], byte out[CS], by
         a3 = d_BIT_2_swap_17(d_BIT_2_swap_34(a3));
 
         const int wi = pos / 4;
-        out_l[wi + 0] = a0;
-        out_l[wi + 1] = a1;
-        out_l[wi + 2] = a2;
-        out_l[wi + 3] = a3;
+        *reinterpret_cast<ulonglong2*>(out_l + wi) = make_ulonglong2(a0, a1);
+        *reinterpret_cast<ulonglong2*>(out_l + wi + 2) = make_ulonglong2(a2, a3);
     }
 
     // copy leftover bytes

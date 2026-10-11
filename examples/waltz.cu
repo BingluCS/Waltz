@@ -8,7 +8,7 @@
 #include <memory>
 #include <cuda_runtime.h>
 
-[[noreturn]] inline void usage(int status = EXIT_FAILURE) {
+inline void usage() {
     std::printf("Usage:\n"
                 "  Compress:   waltz [-f|-d] -i input -z compressed -3 nx ny nz -M REL|ABS bound [-o output]\n"
                 "  Decompress: waltz [-f|-d] -z compressed -o output -3 nx ny nz\n"
@@ -28,7 +28,6 @@
                 "\nExamples:\n"
                 "  waltz -f -i field.f32 -z field.waltz -3 512 512 512 -M REL 1e-3\n"
                 "  waltz -f -z field.waltz -o field.out.f32 -3 512 512 512\n");
-    std::exit(status);
 }
 
 template <class T>
@@ -134,19 +133,22 @@ int main(int argc, char* argv[]) try {
     size_t r1 = 0;
 
     int i = 0;
-    if (argc == 1)
+    if (argc == 1) {
         usage();
+        return EXIT_FAILURE;
+    }
     int width = -1;
 
     for (i = 1; i < argc; i++) {
         if (std::strlen(argv[i]) != 2 || argv[i][0] != '-') {
             usage();
+            return EXIT_FAILURE;
         }
 
         switch (argv[i][1]) {
         case 'h':
-            usage(EXIT_SUCCESS);
-            break;
+            usage();
+            return EXIT_SUCCESS;
         case 'z':
             compression = true;
             if (i + 1 < argc) {
@@ -176,6 +178,7 @@ int main(int argc, char* argv[]) try {
         case 'I':
             if (++i == argc || sscanf(argv[i], "%d", &width) != 1) {
                 usage();
+                return EXIT_FAILURE;
             }
             if (width == 32) {
                 dataType = WALTZ_INT32;
@@ -183,36 +186,49 @@ int main(int argc, char* argv[]) try {
                 dataType = WALTZ_INT64;
             } else {
                 usage();
+                return EXIT_FAILURE;
             }
             break;
         case 'i':
-            if (++i == argc)
+            if (++i == argc) {
                 usage();
+                return EXIT_FAILURE;
+            }
             inPath = argv[i];
             break;
         case '1':
-            if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1)
+            if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1) {
                 usage();
+                return EXIT_FAILURE;
+            }
             break;
         case '2':
             if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 || ++i == argc ||
-                sscanf(argv[i], "%zu", &r2) != 1)
+                sscanf(argv[i], "%zu", &r2) != 1) {
                 usage();
+                return EXIT_FAILURE;
+            }
             break;
         case '3':
             if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 || ++i == argc ||
-                sscanf(argv[i], "%zu", &r2) != 1 || ++i == argc || sscanf(argv[i], "%zu", &r3) != 1)
+                sscanf(argv[i], "%zu", &r2) != 1 || ++i == argc || sscanf(argv[i], "%zu", &r3) != 1) {
                 usage();
+                return EXIT_FAILURE;
+            }
             break;
         case '4':
             if (++i == argc || sscanf(argv[i], "%zu", &r1) != 1 || ++i == argc ||
                 sscanf(argv[i], "%zu", &r2) != 1 || ++i == argc ||
-                sscanf(argv[i], "%zu", &r3) != 1 || ++i == argc || sscanf(argv[i], "%zu", &r4) != 1)
+                sscanf(argv[i], "%zu", &r3) != 1 || ++i == argc || sscanf(argv[i], "%zu", &r4) != 1) {
                 usage();
+                return EXIT_FAILURE;
+            }
             break;
         case 'M':
-            if (++i == argc)
+            if (++i == argc) {
                 usage();
+                return EXIT_FAILURE;
+            }
             errBoundMode = argv[i];
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 errBound = argv[++i];
@@ -220,7 +236,7 @@ int main(int argc, char* argv[]) try {
             break;
         default:
             usage();
-            break;
+            return EXIT_FAILURE;
         }
     }
 
@@ -228,7 +244,7 @@ int main(int argc, char* argv[]) try {
         printf("Error: you need to specify either a raw binary data file or a compressed data file "
                "as input\n");
         usage();
-        exit(0);
+        return EXIT_FAILURE;
     }
 
     char cmpPathTmp[1024];
@@ -243,12 +259,16 @@ int main(int argc, char* argv[]) try {
     }
     if (!compression && !decompression) {
         usage();
-        exit(0);
+        return EXIT_FAILURE;
     }
-    if (decompression && decPath == nullptr)
+    if (decompression && decPath == nullptr) {
         usage();
-    if (compression && cmpPath == nullptr)
+        return EXIT_FAILURE;
+    }
+    if (compression && cmpPath == nullptr) {
         usage();
+        return EXIT_FAILURE;
+    }
     if (!compression && cmpPath == nullptr)
         cmpPath = inPath;
 
@@ -284,7 +304,7 @@ int main(int argc, char* argv[]) try {
         } else {
             printf("Error: wrong error bound mode setting by using the option '-M'\n");
             usage();
-            exit(0);
+            return EXIT_FAILURE;
         }
     }
 
@@ -296,7 +316,7 @@ int main(int argc, char* argv[]) try {
         } else {
             printf("Error: data type not supported \n");
             usage();
-            exit(0);
+            return EXIT_FAILURE;
         }
     }
     if (decompression) {
@@ -307,6 +327,7 @@ int main(int argc, char* argv[]) try {
         } else {
             std::fprintf(stderr, "Error: data type not supported\n");
             usage();
+            return EXIT_FAILURE;
         }
     }
 

@@ -43,7 +43,7 @@ size_t d_WALTZ_decompress(
     char* d_cmpData, T* d_decData, const WALTZ::Config& config, const char* decPath, void* stream);
 
 // The caller resolves REL to conf.absErrorBound before entering this API.
-// Keep relErrorBound as the autotuner's relative-bound hint.
+// Transform mode follows SPERR's dimension-only rule; no data sampling is performed.
 template <typename T>
 size_t d_compress(
     const WALTZ::Config& config, T* d_oridata, char* d_cmpData, const char* cmpPath, void* stream) {

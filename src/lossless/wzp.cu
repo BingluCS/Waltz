@@ -458,7 +458,7 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
     uint32_t direct_ny = 0,
     uint32_t direct_nz = 0,
     uint32_t direct_block_z = 0) {
-    __shared__ long long storage[STORAGE_BYTES / sizeof(long long)];
+    __shared__ __align__(16) long long storage[STORAGE_BYTES / sizeof(long long)];
     byte* const encoded = reinterpret_cast<byte*>(storage);
     byte* const expanded = encoded + CS;
     byte* const temp = expanded + CS;
@@ -486,32 +486,33 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
     // Decode blocks used to make lane 0 serially walk every preceding chunk in
     // the group.  A warp-wide metadata scan computes the same local byte
     // offset in four shuffle steps.
-    if (threadIdx.x < 32) {
-        const uint32_t lane = threadIdx.x;
-        const uint32_t first = group * GROUP_CHUNKS;
-        const uint32_t group_count = min(GROUP_CHUNKS, chunks - first);
-        uint32_t bytes = 0;
-        if (lane < group_count) {
-            {
+    uint32_t chunk_begin = 0;
+    if (stored_bytes != 0U) {
+        if (threadIdx.x < 32) {
+            const uint32_t lane = threadIdx.x;
+            const uint32_t first = group * GROUP_CHUNKS;
+            const uint32_t group_count = min(GROUP_CHUNKS, chunks - first);
+            uint32_t bytes = 0;
+            if (lane < group_count) {
                 const uint32_t prior_raw =
                     min(static_cast<uint32_t>(CS), output_bytes - (first + lane) * CS);
                 const uint32_t m = load_meta24(metadata, first + lane);
                 bytes = decode_mag_bytes(m, prior_raw) + decode_sign_bytes(m);
             }
-        }
-        uint32_t inclusive = bytes;
+            uint32_t inclusive = bytes;
 #pragma unroll
-        for (uint32_t delta = 1; delta < GROUP_CHUNKS; delta <<= 1u) {
-            const uint32_t prior = __shfl_up_sync(0xffffffffu, inclusive, delta);
-            if (lane >= delta)
-                inclusive += prior;
+            for (uint32_t delta = 1; delta < GROUP_CHUNKS; delta <<= 1u) {
+                const uint32_t prior = __shfl_up_sync(0xffffffffu, inclusive, delta);
+                if (lane >= delta)
+                    inclusive += prior;
+            }
+            if (lane == local)
+                *shared_begin = group_offsets[group] + inclusive - bytes;
         }
-        if (lane == local)
-            *shared_begin = group_offsets[group] + inclusive - bytes;
+        __syncthreads();
+        chunk_begin = *shared_begin;
+        __syncthreads();
     }
-    __syncthreads();
-    const uint32_t chunk_begin = *shared_begin;
-    __syncthreads();
 
     if (stored_bytes == 0) {
         if constexpr (DirectLayout != 0) {
@@ -519,59 +520,79 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
             const uint32_t elem_base = base / sizeof(uint16_t);
             if constexpr (DirectLayout == 2) {
                 constexpr uint32_t BN = 16U * 16U * 2U;
-                const uint32_t natural = threadIdx.x;
-                const uint32_t x = natural & 15U;
-                const uint32_t y = (natural >> 4U) & 15U;
-                const uint32_t z = natural >> 8U;
-                const size_t local = x + static_cast<size_t>(y) * direct_nx +
-                                     static_cast<size_t>(z) * direct_nx * direct_ny;
-                const uint32_t nbx = direct_nx >> 4U;
-                const uint32_t nby = direct_ny >> 4U;
                 const size_t nxy = static_cast<size_t>(direct_nx) * direct_ny;
                 const uint32_t first_bi = elem_base / BN;
-                uint32_t bx = first_bi % nbx;
-                const uint32_t byz = first_bi / nbx;
-                uint32_t by = byz % nby;
-                size_t brick_origin = static_cast<size_t>(bx * 16U) +
-                                      static_cast<size_t>(by * 16U) * direct_nx +
-                                      static_cast<size_t>(byz / nby * 2U) * nxy;
-                for (uint32_t i = threadIdx.x; i < elements; i += blockDim.x) {
-                    direct_coeff[brick_origin + local] = static_cast<DirectT>(0);
-                    if (++bx < nbx) {
-                        brick_origin += 16U;
-                    } else {
-                        bx = 0U;
-                        if (++by < nby) {
-                            brick_origin += static_cast<size_t>(16U) * direct_nx -
-                                            static_cast<size_t>(nbx - 1U) * 16U;
-                        } else {
-                            by = 0U;
-                            brick_origin += 2U * nxy -
-                                            static_cast<size_t>(nby - 1U) * 16U * direct_nx -
-                                            static_cast<size_t>(nbx - 1U) * 16U;
-                        }
+                const uint32_t bricks = elements / BN;
+                auto* const origins = reinterpret_cast<size_t*>(expanded);
+                if (threadIdx.x < bricks)
+                    origins[threadIdx.x] = full_brick_origin(
+                        first_bi + threadIdx.x, direct_nx, direct_ny, 2U);
+                __syncthreads();
+                // The layout contract guarantees complete 16x16x2 bricks.
+                // A zero chunk needs no Morton permutation; store 16 bytes
+                // per lane, with each brick origin evaluated only once.
+                constexpr uint32_t width = sizeof(uint4) / sizeof(DirectT);
+                if ((reinterpret_cast<uintptr_t>(direct_coeff) & 15U) == 0U) {
+                    for (uint32_t i = threadIdx.x * width; i < elements;
+                         i += blockDim.x * width) {
+                        const uint32_t natural = i & (BN - 1U);
+                        const size_t local = (natural & 15U) +
+                            static_cast<size_t>((natural >> 4U) & 15U) * direct_nx +
+                            static_cast<size_t>(natural >> 8U) * nxy;
+                        *reinterpret_cast<uint4*>(direct_coeff + origins[i / BN] + local) =
+                            make_uint4(0U, 0U, 0U, 0U);
+                    }
+                } else {
+                    // The caller may pass a naturally aligned T subview, not
+                    // a 16-byte-aligned allocation base. No permutation is
+                    // needed here either, but its stores must remain scalar.
+                    for (uint32_t i = threadIdx.x; i < elements; i += blockDim.x) {
+                        const uint32_t natural = i & (BN - 1U);
+                        const size_t local = (natural & 15U) +
+                            static_cast<size_t>((natural >> 4U) & 15U) * direct_nx +
+                            static_cast<size_t>(natural >> 8U) * nxy;
+                        direct_coeff[origins[i / BN] + local] = static_cast<DirectT>(0);
                     }
                 }
             } else if constexpr (DirectLayout == 3) {
-                const uint32_t block_n = 16U * 16U * direct_block_z;
                 const size_t nxy = static_cast<size_t>(direct_nx) * direct_ny;
-                for (uint32_t i = threadIdx.x; i < elements; i += blockDim.x) {
-                    const uint32_t pos = elem_base + i;
-                    const uint32_t bi = pos / block_n;
-                    const uint32_t natural = pos - bi * block_n;
+                const uint32_t first_bi = elem_base >> 12U;
+                const size_t origin0 = full_brick_origin(first_bi, direct_nx, direct_ny, 16U);
+                const size_t origin1 = full_brick_origin(first_bi + 1U, direct_nx, direct_ny, 16U);
+                for (uint32_t i = threadIdx.x * 4U; i < elements; i += blockDim.x * 4U) {
+                    const uint32_t natural = i & 4095U;
                     const uint32_t x = natural & 15U;
                     const uint32_t y = (natural >> 4U) & 15U;
                     const uint32_t z = natural >> 8U;
-                    direct_coeff[full_brick_origin(
-                                     bi, direct_nx, direct_ny, direct_block_z) +
+                    *reinterpret_cast<float4*>(direct_coeff + (i < 4096U ? origin0 : origin1) +
                                  x + static_cast<size_t>(y) * direct_nx +
-                                 static_cast<size_t>(z) * nxy] = static_cast<DirectT>(0);
+                                 static_cast<size_t>(z) * nxy) = make_float4(0, 0, 0, 0);
                 }
             } else {
                 const bool full_layout = direct_nx % 16U == 0U && direct_ny % 16U == 0U &&
                                          direct_nz % direct_block_z == 0U;
                 if (full_layout) {
                     const uint32_t block_n = 16U * 16U * direct_block_z;
+                    if ((ELEMS_PER_CHUNK % block_n) == 0U) {
+                        auto* const origins = reinterpret_cast<size_t*>(expanded);
+                        const uint32_t first_bi = elem_base / block_n;
+                        const uint32_t bricks = (elements + block_n - 1U) / block_n;
+                        if (threadIdx.x < bricks)
+                            origins[threadIdx.x] = full_brick_origin(first_bi + threadIdx.x,
+                                direct_nx, direct_ny, direct_block_z);
+                        __syncthreads();
+                        constexpr uint32_t width = sizeof(uint4) / sizeof(DirectT);
+                        for (uint32_t i = threadIdx.x * width; i < elements; i += blockDim.x * width) {
+                            const uint32_t pos = elem_base + i;
+                            const uint32_t bi = pos / block_n;
+                            const uint32_t natural = pos - bi * block_n;
+                            const size_t offset = origins[bi - first_bi] +
+                                (natural & 15U) + static_cast<size_t>((natural >> 4U) & 15U) * direct_nx +
+                                static_cast<size_t>(natural >> 8U) * direct_nx * direct_ny;
+                            *reinterpret_cast<uint4*>(direct_coeff + offset) = make_uint4(0, 0, 0, 0);
+                        }
+                        return;
+                    }
                     for (uint32_t i = threadIdx.x; i < elements; i += blockDim.x) {
                         const uint32_t pos = elem_base + i;
                         const uint32_t bi = pos / block_n;
@@ -641,34 +662,38 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
 
     {
         __syncthreads();
-        // Each thread owns one contiguous 16-element half-word.  Compute one
-        // block-wide nonzero prefix, consume the compact sign stream locally,
-        // then pair adjacent threads into the natural 32-bit sign bitmap.  The
-        // former 512-element tiled scan repeated three CTA barriers 16 times
-        // per chunk; this produces the identical ranks with one prefix scan.
+        // Each warp owns 512 contiguous magnitudes. A block prefix gives the
+        // warp's sign-stream base; ballots then consume 32 adjacent elements
+        // at a time and publish the natural 32-bit sign bitmap.
         const auto* mag = reinterpret_cast<const uint16_t*>(decoded);
         const uint32_t elements = raw_bytes / sizeof(uint16_t);
         const byte* packed_sign = source + stored_bytes;
-        const uint32_t start = threadIdx.x * ITEMS_PER_THREAD;
+        const uint32_t lane = threadIdx.x & 31U;
+        const uint32_t warp = threadIdx.x >> 5U;
+        const uint32_t start = warp * (32U * ITEMS_PER_THREAD) + lane;
         uint32_t local_nnz = 0;
 #pragma unroll
         for (uint32_t j = 0; j < ITEMS_PER_THREAD; ++j) {
-            const uint32_t i = start + j;
+            const uint32_t i = start + j * 32U;
             local_nnz += static_cast<uint32_t>(i < elements && mag[i] != 0);
         }
         const uint32_t inclusive =
             block_prefix_sum<uint32_t>(local_nnz, reinterpret_cast<uint32_t*>(temp));
-        uint32_t rank = inclusive - local_nnz;
-        uint32_t negative_half = 0;
+        uint32_t rank = __shfl_sync(0xffffffffU, inclusive - local_nnz, 0);
+        __syncthreads();
+        auto* const sign_words = reinterpret_cast<uint32_t*>(temp);
 #pragma unroll
         for (uint32_t j = 0; j < ITEMS_PER_THREAD; ++j) {
-            const uint32_t i = start + j;
-            if (i < elements && mag[i] != 0) {
-                const bool negative = ((packed_sign[rank >> 3u] >> (rank & 7u)) & 1u) != 0;
-                negative_half |= static_cast<uint32_t>(negative) << j;
-                ++rank;
-            }
+            const uint32_t i = start + j * 32U;
+            const bool nz = i < elements && mag[i] != 0;
+            const uint32_t nz_mask = __ballot_sync(0xffffffffU, nz);
+            const uint32_t pos = rank + __popc(nz_mask & ((1U << lane) - 1U));
+            const bool neg = nz && ((packed_sign[pos >> 3U] >> (pos & 7U)) & 1U) != 0U;
+            const uint32_t neg_mask = __ballot_sync(0xffffffffU, neg);
+            if (lane == 0U) sign_words[(start + j * 32U) >> 5U] = neg_mask;
+            rank += __popc(nz_mask);
         }
+        __syncthreads();
         if constexpr (DirectLayout != 0) {
             const uint32_t elem_base = base / sizeof(uint16_t);
             if constexpr (DirectLayout == 2) {
@@ -676,12 +701,6 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
                 // Invert the access direction so stores are row-major for every
                 // aligned volume, independent of its global dimensions.
                 auto* const negative_words = reinterpret_cast<uint16_t*>(temp);
-                // block_prefix_sum() returns the per-thread value before all
-                // warps are necessarily finished reading its shared scratch.
-                // Fence the old use before repurposing temp as sign storage.
-                __syncthreads();
-                negative_words[threadIdx.x] = static_cast<uint16_t>(negative_half);
-                __syncthreads();
                 constexpr uint32_t BN = 16U * 16U * 2U;
                 const uint32_t natural = threadIdx.x;
                 const uint32_t source_rank = rank_16x16x2(natural);
@@ -730,18 +749,15 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
                 // operations for fully coalesced output stores and removes the
                 // global rank->offset table read on complete deep bricks.
                 auto* const negative_words = reinterpret_cast<uint16_t*>(temp);
-                __syncthreads();
-                negative_words[threadIdx.x] = static_cast<uint16_t>(negative_half);
-                __syncthreads();
-                const uint32_t block_n = 16U * 16U * direct_block_z;
                 const size_t nxy = static_cast<size_t>(direct_nx) * direct_ny;
+                const uint32_t first_bi = elem_base >> 12U;
+                const size_t origin0 = full_brick_origin(first_bi, direct_nx, direct_ny, 16U);
+                const size_t origin1 = full_brick_origin(first_bi + 1U, direct_nx, direct_ny, 16U);
                 for (uint32_t i = threadIdx.x; i < elements; i += blockDim.x) {
-                    const uint32_t pos = elem_base + i;
-                    const uint32_t bi = pos / block_n;
-                    const uint32_t natural = pos - bi * block_n;
+                    const uint32_t natural = i & 4095U;
                     const uint32_t source_rank =
-                        rank_16x16_power2_z(natural, direct_block_z);
-                    const uint32_t source_i = bi * block_n + source_rank - elem_base;
+                        rank_16x16_power2_z(natural, 16U);
+                    const uint32_t source_i = (i & ~4095U) + source_rank;
                     const uint32_t sign_word = negative_words[source_i >> 4U];
                     const bool negative = ((sign_word >> (source_i & 15U)) & 1U) != 0U;
                     const DirectT value = static_cast<DirectT>(mag[source_i]) * direct_q;
@@ -749,7 +765,7 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
                     const uint32_t y = (natural >> 4U) & 15U;
                     const uint32_t z = natural >> 8U;
                     const size_t destination =
-                        full_brick_origin(bi, direct_nx, direct_ny, direct_block_z) + x +
+                        (i < 4096U ? origin0 : origin1) + x +
                         static_cast<size_t>(y) * direct_nx + static_cast<size_t>(z) * nxy;
                     direct_coeff[destination] = negative ? -value : value;
                 }
@@ -757,19 +773,17 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
                 const bool full_layout = direct_nx % 16U == 0U && direct_ny % 16U == 0U &&
                                          direct_nz % direct_block_z == 0U;
                 if (full_layout) {
-                    // The decoder assigns each thread 16 consecutive Morton ranks so
-                    // it can unpack signs locally.  Writing rank `start + j` directly
-                    // makes a warp access 0,16,32,... at each unrolled `j`, which badly
-                    // scatters both the offset-table reads and the output stores for
-                    // deep bricks.  Publish the per-thread sign words, then remap the
-                    // store phase so every warp handles consecutive ranks, matching
-                    // the standalone inverse-reorder kernel while retaining the
-                    // decode/dequant fusion.
+                    // Adjacent lanes handle adjacent Morton ranks. Cache each
+                    // brick origin once, independently of the rank-offset table.
                     auto* const negative_words = reinterpret_cast<uint16_t*>(temp);
-                    __syncthreads();
-                    negative_words[threadIdx.x] = static_cast<uint16_t>(negative_half);
-                    __syncthreads();
                     const uint32_t block_n = 16U * 16U * direct_block_z;
+                    auto* const origins = reinterpret_cast<size_t*>(expanded);
+                    const uint32_t first_bi = elem_base / block_n;
+                    const uint32_t bricks = (elem_base + elements - 1U) / block_n - first_bi + 1U;
+                    if (threadIdx.x < bricks)
+                        origins[threadIdx.x] = full_brick_origin(first_bi + threadIdx.x,
+                            direct_nx, direct_ny, direct_block_z);
+                    __syncthreads();
                     for (uint32_t i = threadIdx.x; i < elements; i += blockDim.x) {
                         const uint32_t pos = elem_base + i;
                         const uint32_t bi = pos / block_n;
@@ -777,18 +791,13 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
                         const uint32_t sign_word = negative_words[i >> 4U];
                         const bool negative = ((sign_word >> (i & 15U)) & 1U) != 0U;
                         const DirectT value = static_cast<DirectT>(mag[i]) * direct_q;
-                        const size_t origin =
-                            full_brick_origin(bi, direct_nx, direct_ny, direct_block_z);
+                        const size_t origin = origins[bi - first_bi];
                         direct_coeff[origin + direct_offset[rank]] = negative ? -value : value;
                     }
                 } else {
                     // Unpack signs locally, then redistribute stores so adjacent
                     // lanes own adjacent ranks, for regular and short edge bricks.
                     auto* const negative_words = reinterpret_cast<uint16_t*>(temp);
-                    __syncthreads();
-                    negative_words[threadIdx.x] = static_cast<uint16_t>(negative_half);
-                    // build_reorder_warps also publishes the sign words: its
-                    // barrier covers both independent shared-memory writes.
                     const uint32_t lane = threadIdx.x & 31U;
                     auto* const runs = reinterpret_cast<ReorderWarp*>(expanded);
                     build_reorder_warps(runs, elem_base, elements,
@@ -810,10 +819,9 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
                 }
             }
         } else {
-            const uint32_t upper = __shfl_down_sync(0xffffffffu, negative_half, 1);
-            if ((threadIdx.x & 1u) == 0u && start < elements)
-                sign_bitmap[(base / 2u + start) >> 5u] =
-                    negative_half | (upper << ITEMS_PER_THREAD);
+            const uint32_t words = (elements + 31U) >> 5U;
+            for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
+                sign_bitmap[(base / 2U / 32U) + i] = sign_words[i];
         }
         (void)sign_bytes;
     }
@@ -891,12 +899,55 @@ void decode_impl(const void* cmpdata,
                                                         reinterpret_cast<byte*>(output),
                                                         sign_bitmap);
     cudaEventRecord(WZPConfig::timing_end, stream);
-    cudaEventSynchronize(WZPConfig::timing_end);
-    float elapsed = 0;
-    cudaEventElapsedTime(&elapsed, WZPConfig::timing_begin, WZPConfig::timing_end);
-    if (ms)
+    if (ms) {
+        cudaEventSynchronize(WZPConfig::timing_end);
+        float elapsed = 0;
+        cudaEventElapsedTime(&elapsed, WZPConfig::timing_begin, WZPConfig::timing_end);
         *ms = elapsed;
+    }
     cudaGetLastError();
+}
+
+// One warp proves an inverse-Z tile's columns zero across a 16-row band.
+// The flags are expanded to the exact inverse tile order, leaving only one
+// flag read and one branch in the synthesis kernel. Nonempty chunk overlap
+// conservatively prevents skipping; edge brick sizes remain exact.
+__global__ void build_xy_nonzero_kernel(const byte* cmpdata, uint32_t chunks, uint32_t groups,
+    uint32_t nx, uint32_t ny, uint32_t nz, uint32_t bz, uint32_t* flags, uint32_t columns) {
+    const uint32_t nbx = (nx + columns - 1U) / columns;
+    const uint32_t nby = (ny + 15U) / 16U;
+    const uint32_t b = (blockIdx.x * blockDim.x + threadIdx.x) / 32U;
+    const uint32_t lane = threadIdx.x & 31U;
+    if (b >= nbx * nby) return;
+    const uint32_t tile_x = b % nbx;
+    const uint32_t x0 = tile_x * columns;
+    const uint32_t y0 = (b / nbx) * 16U;
+    const bool coarse_low = x0 < nx - (nx >> 1U) && y0 < ny - (ny >> 1U);
+    const uint32_t first_x = (x0 / 16U) * 16U;
+    const uint32_t end_x = min(nx, ((x0 + min(columns, nx - x0) + 15U) / 16U) * 16U);
+    const uint32_t dx = end_x - first_x, dy = min(16U, ny - y0);
+    const size_t nxy = static_cast<size_t>(nx) * ny;
+    const byte* metadata = cmpdata + static_cast<size_t>(groups) * sizeof(uint32_t);
+    // bit 0: low-Z may be nonzero; bit 1: high-Z may be nonzero.
+    // Coarser inverse levels can change only low-Z in the protected XY region.
+    uint32_t nonzero = coarse_low ? 1U : 0U;
+    const uint32_t low_z = nz - (nz >> 1U);
+    for (uint32_t z0 = lane * bz; z0 < nz; z0 += 32U * bz) {
+        const uint32_t dz = min(bz, nz - z0);
+        const size_t begin = nxy * z0 + static_cast<size_t>(nx) * dz * y0 +
+            static_cast<size_t>(dy) * dz * first_x;
+        const uint32_t first = static_cast<uint32_t>(begin / ELEMS_PER_CHUNK);
+        const uint32_t last = static_cast<uint32_t>(
+            (begin + static_cast<size_t>(dx) * dy * dz - 1U) / ELEMS_PER_CHUNK);
+        for (uint32_t chunk = first; chunk <= last; ++chunk) {
+            if (chunk >= chunks || (load_meta24(metadata, chunk) & 0x3fffU) != 0U)
+                nonzero |= (z0 < low_z ? 1U : 0U) | (z0 + dz > low_z ? 2U : 0U);
+        }
+    }
+    const uint32_t low_nonzero = __ballot_sync(0xffffffffU, (nonzero & 1U) != 0U);
+    const uint32_t high_nonzero = __ballot_sync(0xffffffffU, (nonzero & 2U) != 0U);
+    if (lane < 16U && y0 + lane < ny)
+        flags[(y0 + lane) * nbx + tile_x] = (low_nonzero ? 1U : 0U) | (high_nonzero ? 2U : 0U);
 }
 
 template <typename DirectT>
@@ -908,12 +959,19 @@ void decode_reordered_impl(const void* cmpdata,
                            dim3 dims,
                            uint32_t block_z,
                            double* ms,
-                           cudaStream_t stream) {
+                           cudaStream_t stream,
+                           uint32_t* xy_nonzero, uint32_t zero_columns) {
     reserve(n, stream);
     const uint32_t output_bytes = n * sizeof(uint16_t);
     const uint32_t chunks = (output_bytes + CS - 1u) / CS;
     const uint32_t groups = (chunks + GROUP_CHUNKS - 1u) / GROUP_CHUNKS;
     cudaEventRecord(WZPConfig::timing_begin, stream);
+    if (xy_nonzero != nullptr) {
+        const uint32_t xy_bricks = ((dims.x + zero_columns - 1U) / zero_columns) * ((dims.y + 15U) / 16U);
+        build_xy_nonzero_kernel<<<(xy_bricks + 7U) / 8U, 256, 0, stream>>>(
+            static_cast<const byte*>(cmpdata), chunks, groups,
+            dims.x, dims.y, dims.z, block_z, xy_nonzero, zero_columns);
+    }
     const bool aligned_bz2 = block_z == 2U && dims.x % 16U == 0U && dims.y % 16U == 0U &&
                              dims.z % 2U == 0U;
     const bool full_layout = dims.x % 16U == 0U && dims.y % 16U == 0U &&
@@ -949,11 +1007,12 @@ void decode_reordered_impl(const void* cmpdata,
                 output, offset_table, q, dims.x, dims.y, dims.z, block_z);
     }
     cudaEventRecord(WZPConfig::timing_end, stream);
-    cudaEventSynchronize(WZPConfig::timing_end);
-    float elapsed = 0;
-    cudaEventElapsedTime(&elapsed, WZPConfig::timing_begin, WZPConfig::timing_end);
-    if (ms)
+    if (ms) {
+        cudaEventSynchronize(WZPConfig::timing_end);
+        float elapsed = 0;
+        cudaEventElapsedTime(&elapsed, WZPConfig::timing_begin, WZPConfig::timing_end);
         *ms = elapsed;
+    }
     cudaGetLastError();
 }
 
@@ -1016,6 +1075,12 @@ const void* wzp_encoded_buf() {
     return WZPConfig::cmpdata;
 }
 
+double wzp_decode_elapsed() {
+    float ms = 0;
+    cudaEventElapsedTime(&ms, WZPConfig::timing_begin, WZPConfig::timing_end);
+    return ms;
+}
+
 void wzp_decode_with_sign(const void* cmpdata,
                           uint32_t n,
                           uint16_t* output,
@@ -1033,8 +1098,9 @@ void wzp_decode_reordered_float(const void* cmpdata,
                                 dim3 dims,
                                 uint32_t block_z,
                                 double* ms,
-                                cudaStream_t stream) {
-    decode_reordered_impl(cmpdata, n, output, offset_table, q, dims, block_z, ms, stream);
+                                cudaStream_t stream,
+                                uint32_t* xy_nonzero, uint32_t zero_columns) {
+    decode_reordered_impl(cmpdata, n, output, offset_table, q, dims, block_z, ms, stream, xy_nonzero, zero_columns);
 }
 
 void wzp_decode_reordered_double(const void* cmpdata,
@@ -1045,8 +1111,9 @@ void wzp_decode_reordered_double(const void* cmpdata,
                                  dim3 dims,
                                  uint32_t block_z,
                                  double* ms,
-                                 cudaStream_t stream) {
-    decode_reordered_impl(cmpdata, n, output, offset_table, q, dims, block_z, ms, stream);
+                                 cudaStream_t stream,
+                                 uint32_t* xy_nonzero, uint32_t zero_columns) {
+    decode_reordered_impl(cmpdata, n, output, offset_table, q, dims, block_z, ms, stream, xy_nonzero, zero_columns);
 }
 
 } // namespace WALTZ::lossless

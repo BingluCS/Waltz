@@ -8,7 +8,7 @@
 #include "utils/Statistics.hpp"
 #include "utils/def.hpp"
 
-#include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -157,175 +157,10 @@ apply_q_outliers(T* iq, const uint32_t* qidx, const int32_t* qval, uint32_t n, d
     }
 }
 
-// Fast autotune statistics over the whole volume at compile-time stride STEP.
-// Adaptive sampling starts at 8 and refines uncertain decisions at stride 4. Sampled points keep
-// their +-1 ORIGINAL- resolution neighbours (subsample-then-diff would measure lag-4 statistics).
-// acc[0..5] = sum gx2, gy2, gz2, gxgy, gxgz, gygz   (gradient structure tensor)
-// nzc       = #{ max(|gx|,|gy|,|gz|) < ctau }       (near-zero-gradient fraction:
-//             "background that quantizes to zero at this bound" -- needs NO field
-//             min/range, only the known absolute bound; ctau = 2*tau)
-template <typename T, uint32_t STEP>
-__global__ void d_isotropy_stats(const T* __restrict__ vol, uint32_t nx, uint32_t ny,
-    uint32_t nz, double ctau, double* acc, unsigned int* nzc) {
-    static_assert(STEP == 4 || STEP == 8, "autotune sampling stride must be 4 or 8");
-    const uint32_t isx = (nx - 2 + STEP - 1) / STEP;
-    const uint32_t isy = (ny - 2 + STEP - 1) / STEP;
-    const uint32_t isz = (nz - 2 + STEP - 1) / STEP;
-    const uint64_t total = static_cast<uint64_t>(isx) * isy * isz;
-    const uint32_t stride = static_cast<uint32_t>(gridDim.x) * blockDim.x;
-    const uint64_t sy = nx, sz = static_cast<uint64_t>(nx) * ny;
-    double l[6] = {0, 0, 0, 0, 0, 0};
-    unsigned int lnz = 0;
-
-    const uint64_t isxy = static_cast<uint64_t>(isx) * isy;
-    for (uint64_t g = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x; g < total;
-         g += stride) {
-        const uint32_t lx = 1u + STEP * (g % isx);
-        const uint32_t ly = 1u + STEP * ((g / isx) % isy);
-        const uint32_t lzc = 1u + STEP * (g / isxy);
-
-        const uint64_t base = lx + ly * sy + lzc * sz;
-
-        const T vxp = vol[base + 1];
-        const T vyp = vol[base + sy];
-        const T vzp = vol[base + sz];
-
-        const T gx = 0.5 * (vxp - vol[base - 1]);
-        const T gy = 0.5 * (vyp - vol[base - sy]);
-        const T gz = 0.5 * (vzp - vol[base - sz]);
-
-        l[0] += gx * gx;
-        l[1] += gy * gy;
-        l[2] += gz * gz;
-        l[3] += gx * gy;
-        l[4] += gx * gz;
-        l[5] += gy * gz;
-        const double ga = fabs(gx) > fabs(gy) ? fabs(gx) : fabs(gy);
-        if ((ga > fabs(gz) ? ga : fabs(gz)) < ctau)
-            ++lnz;
-    }
-    // warp-shuffle tree reduction (same-address shared atomics serialize 256-way on
-    // dense fields: measured 3.6x slowdown vs sparse on identical dims)
-    const unsigned int FULL = 0xFFFFFFFFu;
-    #pragma unroll
-    for (int i = 0; i < 6; ++i)
-        for (int o = 16; o > 0; o >>= 1)
-            l[i] += __shfl_down_sync(FULL, l[i], o);
-    for (int o = 16; o > 0; o >>= 1)
-        lnz += __shfl_down_sync(FULL, lnz, o);
-    __shared__ double swarp[8][6];
-    __shared__ unsigned int snz[8];
-    const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if (lane == 0) {
-        for (int i = 0; i < 6; ++i)
-            swarp[wid][i] = l[i];
-        snz[wid] = lnz;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        double t[6] = {0, 0, 0, 0, 0, 0};
-        unsigned int z = 0;
-        const int nw = blockDim.x >> 5;
-        for (int w = 0; w < nw; ++w) {
-            for (int i = 0; i < 6; ++i)
-                t[i] += swarp[w][i];
-            z += snz[w];
-        }
-        for (int i = 0; i < 6; ++i)
-            if (t[i] != 0.0)
-                atomicAdd(&acc[i], t[i]);
-        if (z)
-            atomicAdd(nzc, z);
-    }
-}
-
 // Tiny compression-result copies use this reusable pinned array so they can be
 // queued together and completed by one synchronization.
 static unsigned int* g_host_outlier_counts = nullptr;
 static WaltzBlobHeader* g_pipeline_host_header = nullptr;
-static double* g_tune_acc = nullptr;
-static unsigned int* g_tune_nzc = nullptr;
-static double* g_tune_host_acc = nullptr;
-static unsigned int* g_tune_host_nzc = nullptr;
-static cudaEvent_t g_tune_begin = nullptr;
-static cudaEvent_t g_tune_end = nullptr;
-constexpr size_t TUNE_RESULT_BYTES = 6U * sizeof(double) + sizeof(unsigned int);
-void calculate_dwt_levels(dim3 data_dims, uint8_t& levels_xy, uint8_t& levels_z);
-
-static void reserve_tuner() {
-    if (g_tune_acc == nullptr) {
-        cudaMalloc(reinterpret_cast<void**>(&g_tune_acc), TUNE_RESULT_BYTES);
-        g_tune_nzc = reinterpret_cast<unsigned int*>(g_tune_acc + 6);
-    }
-    if (g_tune_host_acc == nullptr) {
-        cudaMallocHost(reinterpret_cast<void**>(&g_tune_host_acc), TUNE_RESULT_BYTES);
-        g_tune_host_nzc = reinterpret_cast<unsigned int*>(g_tune_host_acc + 6);
-    }
-    if (g_tune_begin == nullptr) {
-        cudaEventCreate(&g_tune_begin);
-        cudaEventCreate(&g_tune_end);
-    }
-}
-
-template <typename T, uint32_t STEP>
-static void sample_isotropy(const T* d_data, dim3 dims, double ctau,
-    cudaStream_t st, double& cs, double& nz0, double& time_ms) {
-    static_assert(STEP == 4u || STEP == 8u, "autotune sampling stride must be 4 or 8");
-
-    const uint32_t isx = (dims.x - 2u + STEP - 1u) / STEP;
-    const uint32_t isy = (dims.y - 2u + STEP - 1u) / STEP;
-    const uint32_t isz = (dims.z - 2u + STEP - 1u) / STEP;
-    const size_t points = static_cast<size_t>(isx) * isy * isz;
-    const int tb = 256;
-    const int gb = std::min(static_cast<int>((points + tb - 1) / tb), 4096);
-
-    reserve_tuner();
-
-    cudaEventRecord(g_tune_begin, st);
-    cudaMemsetAsync(g_tune_acc, 0, TUNE_RESULT_BYTES, st);
-    d_isotropy_stats<T, STEP><<<gb, tb, 0, st>>>(
-        d_data, dims.x, dims.y, dims.z, ctau, g_tune_acc, g_tune_nzc);
-    cudaMemcpyAsync(g_tune_host_acc, g_tune_acc, TUNE_RESULT_BYTES,
-                    cudaMemcpyDeviceToHost, st);
-    cudaEventRecord(g_tune_end, st);
-    // This sample is only a few microseconds long. cudaEventSynchronize can
-    // spend another 0.1--0.2 ms putting the host thread to sleep and waking it
-    // again, which used to dominate the tuner. Poll this one short event so the
-    // topology decision is available as soon as the D2H result completes.
-    while (cudaEventQuery(g_tune_end) == cudaErrorNotReady) {
-    }
-    float elapsed_ms = 0.0f;
-    cudaEventElapsedTime(&elapsed_ms, g_tune_begin, g_tune_end);
-    time_ms = elapsed_ms;
-
-    cs = 0.0;
-    const double pts = static_cast<double>(points);
-    const double Jxx = g_tune_host_acc[0] / pts, Jyy = g_tune_host_acc[1] / pts;
-    const double Jzz = g_tune_host_acc[2] / pts, Jxy = g_tune_host_acc[3] / pts;
-    const double Jxz = g_tune_host_acc[4] / pts, Jyz = g_tune_host_acc[5] / pts;
-    {
-        const double q = (Jxx + Jyy + Jzz) / 3.0;
-        const double p1 = Jxy * Jxy + Jxz * Jxz + Jyz * Jyz;
-        const double p2 =
-            (Jxx - q) * (Jxx - q) + (Jyy - q) * (Jyy - q) + (Jzz - q) * (Jzz - q) + 2.0 * p1;
-        const double p = std::sqrt(std::max(p2 / 6.0, 0.0));
-        if (p > 0.0) {
-            const double bxx = (Jxx - q) / p, byy = (Jyy - q) / p, bzz = (Jzz - q) / p;
-            const double bxy = Jxy / p, bxz = Jxz / p, byz = Jyz / p;
-            const double detB = bxx * (byy * bzz - byz * byz) - bxy * (bxy * bzz - byz * bxz) +
-                                bxz * (bxy * byz - byy * bxz);
-            const double rr = std::min(1.0, std::max(-1.0, detB / 2.0));
-            const double phi = std::acos(rr) / 3.0;
-            const double l1 = q + 2.0 * p * std::cos(phi);
-            const double l3 = q + 2.0 * p * std::cos(phi + 2.0943951023931953); // +2pi/3
-            if (l1 > 0.0)
-                cs = std::max(0.0, l3 / l1);
-        } else if (q > 0.0) {
-            cs = 1.0; // isotropic: all eigenvalues equal
-        }
-    }
-    nz0 = *g_tune_host_nzc / pts;
-}
 
 static uint8_t calculate_dwt_levels_1d(size_t len) {
     uint8_t levels = 0;
@@ -341,76 +176,24 @@ void calculate_dwt_levels(dim3 data_dims, uint8_t& levels_xy, uint8_t& levels_z)
     levels_z = calculate_dwt_levels_1d(data_dims.z);
 }
 
-// CR-first topology decision using statistics already produced by d_isotropy_stats.
-// The REL boundaries are half-decades, so arbitrary bounds map to the nearest tested
-// decade without log10/pow.  No field names or exact dimensions are encoded here;
-// very_flat is a geometry-only distinction.
-static int pick_cr_first_mode(dim3 dims, double rel, double cs, double nz0) {
-    // ABS callers do not provide a normalized bound.  Preserve the conservative
-    // sphericity fallback rather than interpreting rel=0 as an extremely tight REL.
-    if (rel <= 0.0)
-        return cs >= 0.21 ? 0 : 1;
-
-    constexpr double R1_R2 = 3.162277660168379e-2;
-    constexpr double R2_R3 = 3.162277660168379e-3;
-    constexpr double R3_R4 = 3.162277660168379e-4;
-    constexpr double R4_R5 = 3.162277660168379e-5;
-    const bool very_flat = static_cast<uint64_t>(dims.z) * 8u <= std::min(dims.x, dims.y);
-
-    if (very_flat) {
-        if (rel >= R1_R2)
-            return cs >= 0.10 && cs <= 0.13 ? 0 : 1;
-        if (rel >= R3_R4)
-            return 1;
-        if (rel >= R4_R5)
-            return cs >= 0.10 && cs <= 0.121 && nz0 > 0.80 ? 0 : 1;
-        return cs >= 0.02 && cs <= 0.121 && nz0 > 0.60 ? 0 : 1;
-    }
-
-    if (rel >= R1_R2) {
-        const bool sparse_low = cs >= 0.03 && cs <= 0.05 && nz0 < 0.995;
-        return sparse_low || (cs >= 0.21 && cs <= 0.265) || cs >= 0.45 ? 0 : 1;
-    }
-    if (rel >= R2_R3) {
-        const bool sparse_low = cs >= 0.03 && cs <= 0.05 && nz0 > 0.98;
-        return sparse_low || (cs >= 0.21 && cs <= 0.30) || cs >= 0.45 ? 0 : 1;
-    }
-    if (rel >= R3_R4) {
-        const bool sparse_low = cs >= 0.06 && cs <= 0.09 && nz0 > 0.95;
-        return sparse_low || (cs >= 0.21 && cs <= 0.30) || cs >= 0.45 ? 0 : 1;
-    }
-    const bool sparse_low = cs >= 0.06 && cs <= 0.09 && nz0 > 0.90;
-    return sparse_low || (cs >= 0.21 && cs <= 0.30) ? 0 : 1;
-}
-
-// ---------------------------------------------------------------------------
-// FAST transform auto-tuner. Sample at stride 8 first and refine uncertain decisions at stride 4.
-//
-// CR-first decision based on decomposition geometry, sampled field statistics, and
-// the current REL bound.
-//
-//   cs  = lambda3/lambda1 of J = mean(grad f * grad f^T)      [sphericity]
-//   nz0 = #{ max(|gx|,|gy|,|gz|) < 2*tau } / points           [zero-quantizing frac]
-// rel selects a half-decade rule; nz0 also changes with the current error bound.  Thus
-// the choice adapts to error without another kernel, trial transform, or device read.
-// ---------------------------------------------------------------------------
-template <typename T>
-static int autotune_pick_mode_fast(const T* d_data, dim3 dims, double tau,
-    double rel_hint, cudaStream_t st, double* tune_ms) {
-    const double ctau = 2.0 * tau;
-    double cs = 0.0, nz0 = 0.0, sample_ms = 0.0;
-    sample_isotropy<T, 8>(d_data, dims, ctau, st, cs, nz0, sample_ms);
-    double accumulated_ms = sample_ms;
-
-    const bool uncertain_cs = cs >= 0.10 && cs <= 0.32;
-    const bool uncertain_nz = rel_hint <= 1.5e-4 && nz0 >= 0.45 && nz0 <= 0.55;
-    if (uncertain_cs || uncertain_nz) {
-        sample_isotropy<T, 4>(d_data, dims, ctau, st, cs, nz0, sample_ms);
-        accumulated_ms += sample_ms;
-    }
-    const int mode = pick_cr_first_mode(dims, rel_hint, cs, nz0);
-    *tune_ms = accumulated_ms;
-    return mode;
+// Conservatively map forward flat-column tiles to inverse row tiles. Only the
+// high band is proven here: the low band remains marked possibly nonzero.
+static __global__ void map_z_high_flags(const uint32_t* producer, uint32_t* inverse,
+    uint32_t nx, uint32_t ny, uint32_t producer_columns, uint32_t inverse_columns) {
+    const uint32_t nx_tiles = (nx + inverse_columns - 1U) / inverse_columns;
+    const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nx_tiles * ny)
+        return;
+    const uint32_t y = t / nx_tiles;
+    const uint32_t x0 = (t - y * nx_tiles) * inverse_columns;
+    const uint32_t columns = min(inverse_columns, nx - x0);
+    const size_t begin = static_cast<size_t>(y) * nx + x0;
+    const uint32_t first = static_cast<uint32_t>(begin / producer_columns);
+    const uint32_t last = static_cast<uint32_t>((begin + columns - 1U) / producer_columns);
+    uint32_t high_nonzero = 0U;
+    for (uint32_t tile = first; tile <= last; ++tile)
+        high_nonzero |= producer[tile];
+    inverse[t] = high_nonzero ? 3U : 1U;
 }
 
 template <typename T, int NDIMS>
@@ -430,13 +213,10 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
 
     uint8_t levels_xy = 0, levels_z = 0;
     calculate_dwt_levels(data_dims, levels_xy, levels_z);
-    uint8_t use_dyadic = 0;
-    uint8_t dyadic_level = std::min(levels_xy, levels_z);
-
-    double tune_ms = 0.0;
-    const int mode = autotune_pick_mode_fast<T>(d_oridata, data_dims, real_error, config.relErrorBound,
-        cuda_stream, &tune_ms);
-    use_dyadic = mode == 0 ? 1 : 0;
+    // SPERR's dimension-only rule: equal levels use dyadic, otherwise XY+Z.
+    // Both level counts are capped at 5, covering SPERR's >=5 exception too.
+    const bool use_dyadic = levels_xy == levels_z;
+    const uint8_t dyadic_level = std::min(levels_xy, levels_z);
 
     if (!use_dyadic && levels_z > 0 &&
         data_dims.z > CDF97::DWT_Z_STATIC_BYTES / (2U * sizeof(T)))
@@ -448,6 +228,31 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
     CDF97::dwt3d_prealloc<T>();
     if (CDF97::idwt3d_prealloc<T>(data_dims, use_dyadic != 0U, false, cuda_stream) != cudaSuccess)
         throw std::runtime_error("Waltz: cannot configure IDWT workspace");
+
+    uint32_t* forward_high_flags = nullptr;
+    uint32_t* inverse_high_flags = nullptr;
+    uint32_t forward_columns = 0U, inverse_columns = 0U, inverse_tiles = 0U;
+    if constexpr (std::is_same_v<T, double>) {
+        // The exact low-only synthesis path requires aligned double2 columns.
+        // Keep both the forward and inverse shared/global dispatch unchanged.
+        if (use_dyadic && levels_z > 0 && (data_dims.x & 1U) == 0U &&
+            static_cast<size_t>(data_dims.z) * 16U <= WALTZ::IDWT_SHARED_BYTES / sizeof(T)) {
+            const uint32_t columns = data_dims.x * data_dims.y;
+            forward_columns = std::min(static_cast<uint32_t>(32768U / sizeof(T) / data_dims.z), columns);
+            if (forward_columns >= 2U)
+                forward_columns &= ~1U;
+            const uint32_t forward_tiles = (columns + forward_columns - 1U) / forward_columns;
+            const uint32_t sm_count = WALTZ::gpu_config().properties.multiProcessorCount;
+            if (forward_tiles > 2U * sm_count) {
+                inverse_columns = (CDF97::idwt_z_shared_bytes<T>() / sizeof(T) / data_dims.z) & ~1U;
+                inverse_tiles = ((data_dims.x + inverse_columns - 1U) / inverse_columns) * data_dims.y;
+                static thread_local CompressionWorkspace high_flag_storage;
+                forward_high_flags = reinterpret_cast<uint32_t*>(high_flag_storage.reserve(
+                    (static_cast<size_t>(forward_tiles) + inverse_tiles) * sizeof(uint32_t)));
+                inverse_high_flags = forward_high_flags + forward_tiles;
+            }
+        }
+    }
 
     T* d_data = nullptr;
     T* tmp_data = nullptr;
@@ -466,8 +271,9 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
     const uint32_t pout_cap = std::min(datasize, 1U << 22U);
     const size_t mag_bytes = static_cast<size_t>(datasize) * sizeof(uint16_t);
     const size_t sb_bytes = ((static_cast<size_t>(datasize) + 8191) / 8192) * 1024;
-    const bool plane_z_direct = !use_dyadic;
-    GPUTimer block_rank_timer;
+    static thread_local GPUTimerCache<2> timer_cache;
+    GPUTimer* const timers = timer_cache.get();
+    GPUTimer& block_rank_timer = timers[0];
 
     // All scratch buffers have the same lifetime. Allocate once, preserving
     // cudaMalloc's 256-byte alignment for every typed/vectorized view.
@@ -501,35 +307,35 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
     d_cnt = static_cast<unsigned int*>(buffers[8]);
     d_qoc = d_cnt + 1;
 
-    if (!plane_z_direct)
-        cudaMemcpyAsync(d_data, d_oridata, bytes, cudaMemcpyDeviceToDevice, cuda_stream);
-
     block_rank_timer.start(stream);
     WALTZ::lossless::d_build_block_rank<<<dim3(reorder_bz, rank_shapes), 256, 0, cuda_stream>>>
         (d_tb, 16U, 16U, reorder_bz, data_dims);
     block_rank_timer.record_stop(stream);
 
-    if (!use_dyadic)
-        cudaMemsetAsync(d_q, 0, bytes, cuda_stream);
+    // The sparse emitter skips zero magnitudes; reconstructed coefficients are
+    // still written at every finalized position. Sign bits use atomic OR.
     cudaMemsetAsync(d_q_abs, 0, mag_bytes, cuda_stream);
     cudaMemsetAsync(d_q_sign, 0, sb_bytes, cuda_stream);
     cudaMemsetAsync(d_qoc, 0, sizeof(unsigned int), cuda_stream);
 
     CDF97::set_quant_params<T>(d_q_abs, d_q_sign, reinterpret_cast<T*>(d_q), d_tb,
         data_dims, reorder_bz, quantity, d_qoi, d_qov, d_qoc, qout_cap, cuda_stream);
-    cudaStreamSynchronize(cuda_stream);
-
     double gpu_predict_ms;
     size_t blob_bytes = 0; // assembled compressed-cmpdata size (returned)
-    GPUTimer timer;
+    GPUTimer& timer = timers[1];
     timer.start(stream);
     CDF97::d_reset<<<1, 1, 0, cuda_stream>>>();
     if (use_dyadic) {
-        CDF97::dwt3d_xy_halo_z<T>(d_data, tmp_data, data_dims, dyadic_level, reorder_bz, cuda_stream);
+        CDF97::dwt3d_xy_halo_z<T>(d_data, tmp_data, data_dims, dyadic_level, reorder_bz,
+            cuda_stream, d_oridata, forward_high_flags);
     } else {
         CDF97::dwt3d_plane_xy_halo_z<T>(
             d_data, tmp_data, data_dims, levels_xy, levels_z, d_oridata, reorder_bz, cuda_stream);
     }
+    if (forward_high_flags != nullptr)
+        map_z_high_flags<<<(inverse_tiles + 255U) / 256U, 256, 0, cuda_stream>>>(
+            forward_high_flags, inverse_high_flags, data_dims.x, data_dims.y,
+            forward_columns, inverse_columns);
     timer.record_stop(stream);
 
     // Error-bounded compression: lossless magnitude/sign runs on the main
@@ -550,7 +356,7 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
     cudaEventRecord(overlap_begin, cuda_stream1);
     if (use_dyadic) {
         CDF97::idwt3d_xy_halo_z<T>(d_q, tmp_data, data_dims, dyadic_level,
-            d_oridata, real_error, d_cnt, d_poi, d_poe, pout_cap, cuda_stream1);
+            d_oridata, real_error, d_cnt, d_poi, d_poe, pout_cap, cuda_stream1, inverse_high_flags);
     } else {
         // Supported plane inputs have levels_z >= 1; PWE is fused into Z synthesis.
         CDF97::idwt3d_plane_xy_halo_z<T>(
@@ -586,7 +392,7 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
         static_cast<size_t>(magc), pwe_count, d_poi, d_poe, qout_count, d_qoi, d_qov, cuda_stream);
 
     Waltz_print_compression<T>(bytes,
-        {tune_ms, block_rank_timer.elapsed_ready(), gpu_predict_ms, t_quant, t_mag, t_idwt, 0.0},
+        {block_rank_timer.elapsed_ready(), gpu_predict_ms, t_quant, t_mag, t_idwt, 0.0},
         static_cast<size_t>(magc), pwe_count, qout_count, blob_bytes);
 
     return blob_bytes;
@@ -619,49 +425,91 @@ size_t d_WALTZ_decompress(
     const bool full_reorder_bricks = dims.x % 16U == 0U && dims.y % 16U == 0U &&
                                       dims.z % dec_quant_bz == 0U;
     const bool complete_bz2_layout = dec_quant_bz == 2U && full_reorder_bricks;
+    const bool needs_offsets = !complete_bz2_layout &&
+        !(std::is_same_v<T, float> && full_reorder_bricks && dec_quant_bz == 16U);
 
     // WZP always writes dequantized row-major coefficients directly, including edges.
     uint32_t* d_tb = nullptr;
     const uint32_t entries = 16U * 16U * dec_quant_bz;
     const uint32_t offset_shapes = full_reorder_bricks ? 1U : 8U;
-    if (!complete_bz2_layout)
-        cudaMalloc(reinterpret_cast<void**>(&d_tb), offset_shapes * entries * sizeof(uint32_t));
+    struct OffsetCache {
+        CompressionWorkspace storage;
+        dim3 dims{0U, 0U, 0U};
+        uint32_t bz = 0;
+        int device = -1;
+    };
+    static thread_local OffsetCache offsets;
+    bool build_offsets = false;
+    int current_device = -1;
+    if (needs_offsets) {
+        cudaGetDevice(&current_device);
+        d_tb = reinterpret_cast<uint32_t*>(offsets.storage.reserve(
+            static_cast<size_t>(offset_shapes) * entries * sizeof(uint32_t)));
+        build_offsets = offsets.device != current_device || offsets.bz != dec_quant_bz ||
+            offsets.dims.x != dims.x || offsets.dims.y != dims.y || offsets.dims.z != dims.z;
+    }
 
     if (CDF97::idwt3d_prealloc<T>(dims, dec_use_dyadic, true, cuda_stream) != cudaSuccess)
         throw std::runtime_error("Waltz: cannot configure IDWT workspace");
-    GPUTimer block_offset_timer, unquant_timer, idwt_timer, pwe_timer;
-    double wzp_decode_kernel_ms = 0.0;
+    static thread_local GPUTimerCache<4> timer_cache;
+    GPUTimer* const timers = timer_cache.get();
+    GPUTimer& block_offset_timer = timers[0];
+    GPUTimer& unquant_timer = timers[1];
+    GPUTimer& idwt_timer = timers[2];
+    GPUTimer& pwe_timer = timers[3];
     T* const d_coeff = d_decData;
 
-    if (!complete_bz2_layout) {
+    // A few bytes per XY brick summarize only this decode's nonzero chunks.
+    // WZP's metadata prepass overwrites every flag inside the measured API.
+    static thread_local CompressionWorkspace zero_column_storage;
+    uint32_t* xy_nonzero = nullptr;
+    uint32_t zero_columns = 0U;
+    if (dec_use_dyadic && static_cast<size_t>(dims.z) * 16U <=
+            WALTZ::IDWT_SHARED_BYTES / sizeof(T)) {
+        zero_columns = CDF97::idwt_z_shared_bytes<T>() / sizeof(T) / dims.z;
+        constexpr uint32_t align_mask = std::is_same_v<T, float> ? 3U : 1U;
+        if ((dims.x & align_mask) == 0U && zero_columns > align_mask)
+            zero_columns &= ~align_mask;
+        const size_t tiles = static_cast<size_t>((dims.x + zero_columns - 1U) / zero_columns) * dims.y;
+        // A workload-size heuristic avoids a metadata launch for very short
+        // passes. Two SM waves is not a proven break-even threshold.
+        const size_t sm_count = WALTZ::gpu_config().properties.multiProcessorCount;
+        if (tiles > 2U * sm_count)
+            xy_nonzero = reinterpret_cast<uint32_t*>(zero_column_storage.reserve(tiles * sizeof(uint32_t)));
+    }
+
+    if (build_offsets) {
         block_offset_timer.start(stream);
         WALTZ::lossless::d_build_block_ioffset<<<dim3(dec_quant_bz, offset_shapes), 256, 0, cuda_stream>>>(
             d_tb, 16U, 16U, dec_quant_bz, dims.x, static_cast<size_t>(dims.x) * dims.y, dims);
         block_offset_timer.record_stop(stream);
+        offsets.dims = dims;
+        offsets.bz = dec_quant_bz;
+        offsets.device = current_device;
     }
     if constexpr (std::is_same_v<T, float>) {
         WALTZ::lossless::wzp_decode_reordered_float(sections.magnitude,
             N, d_coeff, d_tb, static_cast<float>(hdr.q), dims,
-            dec_quant_bz, &wzp_decode_kernel_ms, cuda_stream);
+            dec_quant_bz, nullptr, cuda_stream, xy_nonzero, zero_columns);
     } else if constexpr (std::is_same_v<T, double>) {
         WALTZ::lossless::wzp_decode_reordered_double(
             sections.magnitude, N, d_coeff, d_tb,
-            hdr.q, dims, dec_quant_bz, &wzp_decode_kernel_ms, cuda_stream);
+            hdr.q, dims, dec_quant_bz, nullptr, cuda_stream, xy_nonzero, zero_columns);
     }
-    unquant_timer.start(stream); // Only quantization-outlier patches remain separate.
     if (hdr.n_qo) {
+        unquant_timer.start(stream); // Only quantization-outlier patches remain separate.
         const int tb2 = 256, gb2 = static_cast<int>((hdr.n_qo + tb2 - 1) / tb2);
         apply_q_outliers<T><<<gb2, tb2, 0, cuda_stream>>>(d_coeff,
             reinterpret_cast<const uint32_t*>(sections.quant_index),
             reinterpret_cast<const int32_t*>(sections.quant_value), hdr.n_qo, hdr.q);
+        unquant_timer.record_stop(stream);
     }
-    unquant_timer.record_stop(stream);
     idwt_timer.start(stream); // 5) IDWT (in place)
     if (dec_use_dyadic) {
         const int level = std::min(hdr.levels_xy, hdr.levels_z);
         CDF97::idwt3d_xy_halo_z<T>(
             d_decData, static_cast<T*>(WALTZ::IDWTConfig<T>::tmp), dims, level,
-            nullptr, 0.0, nullptr, nullptr, nullptr, 0, cuda_stream);
+            nullptr, 0.0, nullptr, nullptr, nullptr, 0, cuda_stream, xy_nonzero);
     } else {
         CDF97::idwt3d_plane_xy_halo_z<T>(
             d_decData, nullptr, dims, hdr.levels_xy, hdr.levels_z,
@@ -682,13 +530,11 @@ size_t d_WALTZ_decompress(
     // The final stream synchronization above is required by the public decode
     // contract.  Read all interval events only now, so timing instrumentation
     // adds no submission bubbles between decode stages.
-    const double t_offset = complete_bz2_layout ? 0.0 : block_offset_timer.elapsed_ready();
-    const double t_wzp = wzp_decode_kernel_ms;
-    const double t_uq = unquant_timer.elapsed_ready();
+    const double t_offset = build_offsets ? block_offset_timer.elapsed_ready() : 0.0;
+    const double t_wzp = WALTZ::lossless::wzp_decode_elapsed();
+    const double t_uq = hdr.n_qo ? unquant_timer.elapsed_ready() : 0.0;
     const double t_idwt = idwt_timer.elapsed_ready();
     const double t_pw = pwe_timer.elapsed_ready();
-    if (d_tb)
-        cudaFree(d_tb);
     const size_t orig = static_cast<size_t>(N) * sizeof(T);
     Waltz_print_decompression(orig, sections.bytes, {t_offset, t_wzp, t_uq, t_idwt, t_pw});
 

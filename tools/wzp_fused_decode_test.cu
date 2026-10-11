@@ -53,7 +53,7 @@ static unsigned run(bool small) {
             check(cudaMalloc(&input, n * sizeof(uint16_t)));
             check(cudaMalloc(&signs, sign_words * sizeof(uint32_t)));
             check(cudaMalloc(&table, 8U * 256U * bz * sizeof(uint32_t)));
-            check(cudaMalloc(&output, n * sizeof(T)));
+            check(cudaMalloc(&output, (n + 1U) * sizeof(T)));
             WALTZ::lossless::d_build_block_ioffset<<<dim3(bz, 8), 256>>>(
                 table, 16, 16, bz, dims.x, static_cast<size_t>(dims.x) * dims.y, dims);
             check(cudaGetLastError());
@@ -77,20 +77,25 @@ static unsigned run(bool small) {
                 check(cudaMemcpy(input, values.data(), n * sizeof(uint16_t), cudaMemcpyHostToDevice));
                 check(cudaMemcpy(signs, bits.data(), sign_words * sizeof(uint32_t), cudaMemcpyHostToDevice));
                 wzp_encode_with_sign(input, signs, n, nullptr, nullptr);
-                check(cudaMemset(output, 0xff, n * sizeof(T)));
-                if constexpr (std::is_same_v<T, float>)
-                    wzp_decode_reordered_float(wzp_encoded_buf(), n, output, table, q, dims, bz, nullptr);
-                else
-                    wzp_decode_reordered_double(wzp_encoded_buf(), n, output, table, q, dims, bz, nullptr);
-                check(cudaMemcpy(actual.data(), output, n * sizeof(T), cudaMemcpyDeviceToHost));
-                for (uint32_t i = 0; i < n; ++i) {
-                    if (actual[i] != expected[i]) {
-                        std::fprintf(stderr, "FAIL sizeof(T)=%zu dims=%u,%u,%u bz=%u pattern=%u i=%u\n",
-                                     sizeof(T), dims.x, dims.y, dims.z, bz, pattern, i);
-                        std::exit(1);
+                // Exercise the regular-bz2 zero-store path with both allocation
+                // bases and naturally T-aligned subviews (not 16-byte aligned).
+                for (unsigned shift = 0; shift < (bz == 2U ? 2U : 1U); ++shift) {
+                    T* const destination = output + shift;
+                    check(cudaMemset(destination, 0xff, n * sizeof(T)));
+                    if constexpr (std::is_same_v<T, float>)
+                        wzp_decode_reordered_float(wzp_encoded_buf(), n, destination, table, q, dims, bz, nullptr);
+                    else
+                        wzp_decode_reordered_double(wzp_encoded_buf(), n, destination, table, q, dims, bz, nullptr);
+                    check(cudaMemcpy(actual.data(), destination, n * sizeof(T), cudaMemcpyDeviceToHost));
+                    for (uint32_t i = 0; i < n; ++i) {
+                        if (actual[i] != expected[i]) {
+                            std::fprintf(stderr, "FAIL sizeof(T)=%zu dims=%u,%u,%u bz=%u pattern=%u shift=%u i=%u\n",
+                                         sizeof(T), dims.x, dims.y, dims.z, bz, pattern, shift, i);
+                            std::exit(1);
+                        }
                     }
+                    ++cases;
                 }
-                ++cases;
             }
             check(cudaFree(input)); check(cudaFree(signs));
             check(cudaFree(table)); check(cudaFree(output));

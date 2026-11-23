@@ -3,6 +3,7 @@
 #include "lossless/reorder.hpp"
 #include "quantizer/quantize.hpp"
 #include "utils/Config.hpp"
+#include "halo3d.cuh"
 
 #include <algorithm>
 #include <cstdlib>
@@ -255,18 +256,15 @@ __device__ __forceinline__ bool dwt_quant_emit(
 template <typename T>
 __device__ __forceinline__ bool dwt_quant_emit_regular(T value, size_t s,
     uint32_t x, uint32_t y, uint32_t z, const DwtQuantParams<T>* __restrict__ p) {
-    const long long rll = WALTZ::quantizer::llrint_real(value * p->inv_q);
-    if (rll == 0) {
-        p->iquant[s] = T(0);
-        return false;
-    }
+    const long long rll=WALTZ::quantizer::llrint_real(value*p->inv_q);
+    if(rll==0){p->iquant[s]=T(0);return false;}
+    const bool neg=rll<0;
+    const int32_t mag=WALTZ::quantizer::saturate_q<int32_t>(neg?-rll:rll);
     constexpr uint32_t BX = 16U, BY = 16U;
     const uint32_t bz = p->q_bz;
     const uint32_t block = (x >> 4U) + p->block_nx * (y >> 4U) + p->block_nx * p->block_ny * (z >> p->bz_shift);
     const uint32_t local = (x & (BX - 1U)) + (y & (BY - 1U)) * BX + (z & (bz - 1U)) * BX * BY;
     const size_t outpos = static_cast<size_t>(block) * p->block_elems + p->rank_table[local];
-    const bool neg = rll < 0;
-    const int32_t mag = WALTZ::quantizer::saturate_q<int32_t>(neg ? -rll : rll);
     p->qint_z[outpos] = static_cast<uint16_t>(mag > 65535 ? 65535 : mag);
 
     if (neg && mag != 0)
@@ -865,6 +863,13 @@ __global__ void dwt_3d_z_single_global(
 // when device limits allow three such tiles per SM. Column widths are selected
 // uniformly from capacity in warp multiples, with a generic fallback.
 constexpr uint32_t DWT_Z_STATIC_BYTES = 45U * 1024U;
+constexpr uint32_t DWT_Z_WIDE_BYTES = 64U * 1024U;
+
+inline bool dwt_wide_z_supported() {
+    const auto& prop = WALTZ::gpu_config().properties;
+    return prop.sharedMemPerBlockOptin >= DWT_Z_WIDE_BYTES &&
+           prop.sharedMemPerMultiprocessor >= 3U * DWT_Z_WIDE_BYTES;
+}
 
 template <typename T, uint32_t FixedColumns = 0U, uint32_t SharedBytes = DWT_Z_STATIC_BYTES>
 __global__ __launch_bounds__(TPB, std::is_same_v<T, float> ? 3 : 2)
@@ -896,6 +901,14 @@ inline void dwt_launch_z_tiles(uint32_t columns, const float* src, float* dst,
     else
         dwt_3d_z_all_static<float, 0U, SharedBytes>
             <<<DWTConfig<float>::z_blocks, TPB, smem, stream>>>(src, dst, dims, levels);
+}
+
+template <uint32_t SharedBytes>
+inline void dwt_launch_z_tiles(const float* src, float* dst, dim3 dims,
+                              uint8_t levels, cudaStream_t stream) {
+    const uint32_t cols = std::min(SharedBytes / uint32_t(2U * sizeof(float)) / dims.z,
+                                   dims.x * dims.y) & ~31U;
+    dwt_launch_z_tiles<SharedBytes>(cols, src, dst, dims, levels, stream);
 }
 
 // At coarse plane levels the number of row tiles quickly drops below the
@@ -946,17 +959,11 @@ inline cudaError_t dwt3d_plane_xy_halo_z(
         if (dims.z > shared_capacity / 2U)
             return cudaErrorInvalidConfiguration;
         if constexpr (std::is_same_v<T, float>) {
-            const auto& prop = WALTZ::gpu_config().properties;
-            const bool wide = prop.sharedMemPerBlockOptin >= 64U * 1024U &&
-                              prop.sharedMemPerMultiprocessor >= 3U * 64U * 1024U;
-            const uint32_t bytes = wide ? 64U * 1024U : DWT_Z_STATIC_BYTES;
-            const uint32_t cols = min(bytes / static_cast<uint32_t>(sizeof(T)) / (2U * dims.z),
-                                      dims.x * dims.y) & ~31U;
-            if (wide)
-                dwt_launch_z_tiles<64U * 1024U>(cols, input, data, dims,
+            if (dwt_wide_z_supported())
+                dwt_launch_z_tiles<DWT_Z_WIDE_BYTES>(input, data, dims,
                                                static_cast<uint8_t>(levels_z), stream);
             else
-                dwt_launch_z_tiles<DWT_Z_STATIC_BYTES>(cols, input, data, dims,
+                dwt_launch_z_tiles<DWT_Z_STATIC_BYTES>(input, data, dims,
                                                       static_cast<uint8_t>(levels_z), stream);
         } else
             dwt_3d_z_all_static<T><<<DWTConfig<T>::z_blocks, TPB, 0, stream>>>(
@@ -1007,9 +1014,22 @@ __global__ void dwt_3d_z_single_static(
 // then runs the dependent Z stage and quantizes the subbands finalized at that
 // level. Ordinary kernel-launch ordering supplies the required global barrier;
 // no grid-wide synchronization is needed.
+template<class T, bool Regular>
+struct Halo3DQuantEmit {
+    T* low;
+    dim3 dims;
+    bool final_level;
+    __device__ __forceinline__ void operator()(T value, size_t index, int x, int y, int z) const {
+        if(final_level || x>=int((dims.x+1U)/2U) || y>=int((dims.y+1U)/2U) || z>=int((dims.z+1U)/2U))
+            quantization<Regular>(value,index,x,y,z,dims);
+        else low[index]=value;
+    }
+};
+
 template <typename T>
 inline void dwt3d_xy_halo_z(T* data, T* tmp, dim3 dims, int levels, uint32_t q_bz, cudaStream_t stream,
-                          const T* input = nullptr, uint32_t* high_flags = nullptr) {
+                          const T* input = nullptr, uint32_t* high_flags = nullptr,
+                          bool halo_finest = false) {
     constexpr uint32_t static_capacity = 32768U / sizeof(T);
     const bool quant_blocks_regular = (q_bz & (q_bz - 1U)) == 0U &&
         (dims.x & 15U) == 0U && (dims.y & 15U) == 0U && dims.z % q_bz == 0U;
@@ -1018,6 +1038,26 @@ inline void dwt3d_xy_halo_z(T* data, T* tmp, dim3 dims, int levels, uint32_t q_b
     dim3 chunk_dims = dims;
     for (int lev = 0; lev < levels; ++lev) {
         const T* src = lev == 0 && input != nullptr ? input : data;
+        {
+            // Finest level reads the immutable caller input: no in-place halo race.
+            // Finalized subbands go directly through quantization + Morton emit;
+            // only the unquantized LLL goes to the existing coarse-level buffer.
+            if(halo_finest && lev==0 && input!=nullptr && input!=data) {
+                constexpr int Z=sizeof(T)==4?8:4;
+                constexpr unsigned smem=56U*8U*(Z+8U)*sizeof(T);
+                const dim3 grid((dims.x+55U)/56U,(dims.y+7U)/8U,(dims.z+Z-1U)/Z);
+                if(quant_blocks_regular)
+                    halo3d::forward<Z><<<grid,256,smem,stream>>>(src,dims.x,dims.y,dims.z,
+                        Halo3DQuantEmit<T,true>{data,dims,levels==1});
+                else
+                    halo3d::forward<Z><<<grid,256,smem,stream>>>(src,dims.x,dims.y,dims.z,
+                        Halo3DQuantEmit<T,false>{data,dims,levels==1});
+                chunk_dims.x-=chunk_dims.x>>1U;
+                chunk_dims.y-=chunk_dims.y>>1U;
+                chunk_dims.z-=chunk_dims.z>>1U;
+                continue;
+            }
+        }
         if constexpr (std::is_same_v<T, float>) {
             const dim3 grid((chunk_dims.x + BX_64 - 1U) / BX_64,
                             (chunk_dims.y + BY_32 - 1U) / BY_32,
@@ -1942,9 +1982,8 @@ template <typename T>
 inline void dwt3d_prealloc() {
     const cudaDeviceProp& prop = WALTZ::gpu_config().properties;
     if constexpr (std::is_same_v<T, float>) {
-        if (prop.sharedMemPerBlockOptin >= 64U * 1024U &&
-            prop.sharedMemPerMultiprocessor >= 3U * 64U * 1024U && DWTConfig<T>::z_blocks == 0)
-            dwt_configure_z_tiles<64U * 1024U>();
+        if (DWTConfig<T>::z_blocks == 0 && dwt_wide_z_supported())
+            dwt_configure_z_tiles<DWT_Z_WIDE_BYTES>();
     }
     const int multiprocessor_count = prop.multiProcessorCount;
     const auto initialize_grid_blocks = [multiprocessor_count](auto kernel, int& grid_blocks) {

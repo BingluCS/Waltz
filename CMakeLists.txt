@@ -47,7 +47,7 @@ target_include_directories(
 target_link_libraries(
     waltz_shared
     PUBLIC CUDA::cudart
-    PRIVATE CUDA::cuda_driver CUDA::cublas)
+    PRIVATE CUDA::cuda_driver)
 
 if(WALTZ_BUILD_EXAMPLES)
     add_subdirectory(examples)
@@ -68,6 +68,24 @@ if(WALTZ_BUILD_TESTS)
     target_link_libraries(wzp_fused_decode_test PRIVATE Waltz::waltz CUDA::cudart)
     add_test(NAME wzp_fused_decode COMMAND wzp_fused_decode_test)
     set_tests_properties(wzp_fused_decode PROPERTIES TIMEOUT 180)
+
+    function(waltz_cuda_regression name source)
+        add_executable(${name}_test ${source})
+        target_include_directories(${name}_test PRIVATE src)
+        target_compile_options(${name}_test PRIVATE
+            $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--extended-lambda;--expt-relaxed-constexpr>)
+        target_link_libraries(${name}_test PRIVATE Waltz::waltz)
+        add_test(NAME ${name} COMMAND ${name}_test)
+    endfunction()
+    waltz_cuda_regression(small_pwe_unit tests/small_pwe.cu)
+    waltz_cuda_regression(pwe_roundtrip tests/pwe_roundtrip.cu)
+    waltz_cuda_regression(halo3d_roundtrip tests/halo3d_roundtrip.cu)
+    waltz_cuda_regression(halo3d_address tests/halo3d_address.cu)
+    waltz_cuda_regression(all_halo_transform tests/all_halo_transform.cu)
+    set_tests_properties(
+        wzp_roundtrip wzp_fused_decode small_pwe_unit pwe_roundtrip
+        halo3d_roundtrip halo3d_address all_halo_transform
+        PROPERTIES LABELS GPU RUN_SERIAL TRUE)
 endif()
 
 install(

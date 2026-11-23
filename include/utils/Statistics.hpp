@@ -173,9 +173,10 @@ inline void Waltz_print_compression(size_t bytes, const CompressionTimes& t,
     Waltz_print_stage("mag+sign-WZP", bytes, t.wzp, "   (sign fused in)");
     Waltz_print_stage("IDWT", bytes, t.idwt);
     Waltz_print_stage("outlier", bytes, t.outlier);
-    // WZP and reconstruction overlap; this is the existing stage total, not API e2e.
+    // Reconstruction and its queued repair pack overlap WZP. This stage sum
+    // still excludes host gaps and archive assembly; it is not API E2E time.
     Waltz_print_total(bytes, t.block_rank + t.dwt + t.quant +
-                                std::max(t.wzp, t.idwt) + t.outlier);
+                                std::max(t.wzp, t.idwt + t.outlier));
 
     const size_t index_bytes = static_cast<size_t>(pwe_count) * sizeof(uint32_t);
     const size_t error_bytes = static_cast<size_t>(pwe_count) * sizeof(T);

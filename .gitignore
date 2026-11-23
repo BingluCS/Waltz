@@ -1,5 +1,7 @@
 /build*/
 /benchmark_results/
+/cpu/build*/
+/platform/hip/build-*/
 CMakeUserPresets.json
 *.nsys-rep
 *.ncu-rep

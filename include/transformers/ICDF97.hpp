@@ -1828,11 +1828,59 @@ __global__ void idwt_yx_double(
 // Requires idwt3d_prealloc<T>() before launch to prepare IDWTConfig<T>.
 // Optional PWE recording at the finest level: d_orig/bound/d_ocnt (pre-zeroed)
 // enable detection; d_oidx/d_oerr receive the index and original-precision error.
+template<class T, bool Repair>
+struct Halo3DSynthEmit {
+    T* output;
+    const T* original;
+    double bound;
+    float fast_bound;
+    unsigned int* count;
+    uint32_t* indices;
+    T* errors;
+    uint32_t capacity;
+    __device__ __forceinline__ void operator()(T value,size_t index) const {
+        if constexpr(Repair) {
+            if constexpr(std::is_same_v<T,float>)
+                idwt_pwe_record_float(value,index,original,bound,fast_bound,count,indices,errors,capacity);
+            else {
+                const T error=value-original[index];
+                if(fabs(error)>bound) {
+                    const unsigned slot=atomicAdd(count,1U);
+                    if(indices!=nullptr && slot<capacity) {indices[slot]=uint32_t(index);errors[slot]=error;}
+                }
+            }
+        } else output[index]=value;
+    }
+};
+
+template<class T> inline cudaError_t configure_halo3d_inverse() {
+    constexpr int Z=sizeof(T)==4?16:8;
+    static thread_local int configured_device=-1;
+    int device=-1;
+    cudaError_t e=cudaGetDevice(&device);
+    if(e!=cudaSuccess || configured_device==device) return e;
+    e=cudaFuncSetAttribute(halo3d::inverse<Z,T,Halo3DSynthEmit<T,true>>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,65536);
+    if(e!=cudaSuccess) return e;
+    e=cudaFuncSetAttribute(halo3d::inverse<Z,T,Halo3DSynthEmit<T,false>>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,65536);
+    if(e!=cudaSuccess) return e;
+    if constexpr(std::is_same_v<T,double>) {
+        e=cudaFuncSetAttribute(halo3d::inverse<Z,T,Halo3DSynthEmit<T,true>,true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,65536);
+        if(e!=cudaSuccess) return e;
+        e=cudaFuncSetAttribute(halo3d::inverse<Z,T,Halo3DSynthEmit<T,false>,true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,65536);
+    }
+    if(e==cudaSuccess) configured_device=device;
+    return e;
+}
+
 template <typename T>
 inline cudaError_t idwt3d_xy_halo_z(T* d_vol, T* d_tmp, dim3 data_dims, int levels, const T* d_orig = nullptr,
     double bound = 0.0, unsigned int* d_ocnt = nullptr, uint32_t* d_oidx = nullptr, T* d_oerr = nullptr,
                                  uint32_t ocap = 0, cudaStream_t stream = 0,
-                                 const uint32_t* xy_nonzero = nullptr) {
+                                 const uint32_t* xy_nonzero = nullptr, bool halo_finest = false) {
     if (levels > CDF97_MAX_LEVELS)
         return cudaErrorInvalidValue;
     dim3 level_dims[CDF97_MAX_LEVELS];
@@ -1849,6 +1897,30 @@ inline cudaError_t idwt3d_xy_halo_z(T* d_vol, T* d_tmp, dim3 data_dims, int leve
         const dim3 chunk_dims = level_dims[lev];
         const uint32_t lx = chunk_dims.x, ly = chunk_dims.y, lz = chunk_dims.z;
         const T* const original = lev == 0 ? d_orig : nullptr;
+        {
+            if(halo_finest && lev==0) {
+                // Coarse levels are unchanged and finish in d_vol. The finest
+                // level reads d_vol and writes d_tmp (or emits PWE only).
+                const cudaError_t e=configure_halo3d_inverse<T>();
+                if(e!=cudaSuccess) return e;
+                constexpr int Z=sizeof(T)==4?16:8;
+                const dim3 grid((lx+55U)/56U,(ly+7U)/8U,(lz+Z-1U)/Z);
+                // FP32 specialization increases register pressure and lost E2E
+                // throughput. Use the measured FP64 specialization only.
+                const bool single_fold=std::is_same_v<T,double> && lx>=64U && ly>=64U && lz>=64U;
+                if(original!=nullptr) {
+                    const float fast=std::nextafter(static_cast<float>(bound),0.0f);
+                    const auto emit=Halo3DSynthEmit<T,true>{nullptr,original,bound,fast,d_ocnt,d_oidx,d_oerr,ocap};
+                    if(single_fold) halo3d::inverse<Z,T,Halo3DSynthEmit<T,true>,true><<<grid,256,65536U,stream>>>(d_vol,lx,ly,lz,emit);
+                    else halo3d::inverse<Z><<<grid,256,65536U,stream>>>(d_vol,lx,ly,lz,emit);
+                } else {
+                    const auto emit=Halo3DSynthEmit<T,false>{d_tmp,nullptr,0,0,nullptr,nullptr,nullptr,0};
+                    if(single_fold) halo3d::inverse<Z,T,Halo3DSynthEmit<T,false>,true><<<grid,256,65536U,stream>>>(d_vol,lx,ly,lz,emit);
+                    else halo3d::inverse<Z><<<grid,256,65536U,stream>>>(d_vol,lx,ly,lz,emit);
+                }
+                return cudaGetLastError();
+            }
+        }
 
         // Z: data -> tmp. Limit the grid to useful tiles/items at coarse levels.
         // Preserve the original shared/global dispatch; only widen existing
@@ -2313,6 +2385,24 @@ inline void idwt_launch_z_columns(uint32_t cols, int grid, size_t smem, cudaStre
         idwt_z_all_dynamic<T, DecodeOnly><<<grid, TPB, smem, stream>>>(args...);
 }
 
+template <typename T>
+inline void idwt_plane_z(const T* src, T* dst, dim3 dims, int levels_z, cudaStream_t stream,
+                         const T* original = nullptr, double bound = 0.0,
+                         unsigned int* count = nullptr, uint32_t* indices = nullptr,
+                         T* errors = nullptr, uint32_t outlier_cap = 0, bool direct_error = false) {
+    const uint32_t cap = IDWTConfig<T>::z_capacity;
+    const size_t smem = size_t(cap) * sizeof(T);
+    const uint32_t a1 = (dims.z + 1U) / 2U;
+    const uint32_t cols = min(cap / (dims.z + a1 + (a1 + 1U) / 2U), dims.x * dims.y) & ~31U;
+    const int grid = IDWTConfig<T>::plane_z_blocks;
+    if (original == nullptr && !direct_error)
+        idwt_launch_z_columns<T, true>(cols, grid, smem, stream, src, dst, dims.x, dims.y, dims.z,
+            levels_z, original, bound, count, indices, errors, outlier_cap, cap, direct_error);
+    else
+        idwt_launch_z_columns<T, false>(cols, grid, smem, stream, src, dst, dims.x, dims.y, dims.z,
+            levels_z, original, bound, count, indices, errors, outlier_cap, cap, direct_error);
+}
+
 // Configure dyadic/plane inverse launches and optionally allocate temporary storage.
 // Call once before launching IDWT; callers with their own scratch pass false.
 template <typename T>
@@ -2527,19 +2617,7 @@ inline cudaError_t idwt3d_plane_xy_halo_z(T* d_vol, T* d_tmp, dim3 dims, int lev
         dst = swap;
     }
 
-    const uint32_t z_cap = IDWTConfig<T>::z_capacity;
-    const size_t z_smem = static_cast<size_t>(z_cap) * sizeof(T);
-    const uint32_t a1 = (dims.z + 1U) / 2U;
-    const uint32_t cols = min(z_cap / (dims.z + a1 + (a1 + 1U) / 2U), dims.x * dims.y) & ~31U;
-    if (d_orig == nullptr && !direct_error) {
-        idwt_launch_z_columns<T, true>(cols, IDWTConfig<T>::plane_z_blocks, z_smem, stream,
-            src, d_vol, dims.x, dims.y, dims.z, levels_z,
-            d_orig, bound, d_ocnt, d_oidx, d_oerr, ocap, z_cap, direct_error);
-    } else {
-        idwt_launch_z_columns<T, false>(cols, IDWTConfig<T>::plane_z_blocks, z_smem, stream,
-            src, d_vol, dims.x, dims.y, dims.z, levels_z,
-            d_orig, bound, d_ocnt, d_oidx, d_oerr, ocap, z_cap, direct_error);
-    }
+    idwt_plane_z(src, d_vol, dims, levels_z, stream, d_orig, bound, d_ocnt, d_oidx, d_oerr, ocap, direct_error);
     return cudaGetLastError();
 }
 

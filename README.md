@@ -1,49 +1,36 @@
 # Waltz
 
-Waltz is a CUDA research implementation of error-bounded lossy compression for
+Waltz is a research implementation of error-bounded lossy compression for
 3D scientific float32 and float64 fields. It combines CDF 9/7 wavelet transforms,
 fused quantization and block reordering, WZP magnitude/sign coding, and
-reconstruction-error correction.
+reconstruction-error correction. It includes a CUDA codec, a CPU scalar/AVX2
+codec and a separate native AMD/DCU HIP backend.
 
 ## Current implementation
 
-The source synchronized on 2026-10-11 includes:
+- The level count for each axis group is computed from its dimensions, capped
+  at five. Equal XY and Z level counts select dyadic (XYZ at each level);
+  otherwise plane applies all Z levels then all XY levels. No data sampling.
+- CUDA uses native halo/lifting across levels. Eligible FP32 planes with
+  `17 <= nz <= 128`, `nx % 4 == 0`, at least 64 XY columns, nonzero XY
+  levels, and a GPU with at least 64 KiB opt-in shared memory per block and
+  192 KiB per SM use one full-column convolution kernel per Z direction.
+  Other shapes and FP64 retain lifting. Decode reverses the encoded schedule.
+- Finalized coefficients are quantized and reordered together. WZP decodes
+  signed magnitudes directly into dequantized, row-major coefficients.
+  Reusable scratch, timing events and geometry-dependent lookup tables are
+  cached; every call recomputes coefficients and repair positions.
+- CUDA defaults to compact error repairs (`WALTZ_SMALL_PWE_SCALE=64`),
+  with native residual fallback. Scale `16` selects the coarser preset.
+  Scale `0` keeps native residuals and lifting for the portable profile.
 
-- SPERR-style, dimension-only transform selection: compute the XY level count
-  from `min(nx, ny)` and the Z level count from `nz`, repeatedly rounding up
-  after halving until the length is at most 8, with at most 5 levels. Equal
-  level counts use dyadic; otherwise use plane (XY + Z). The old sampling
-  tuner and its timing row are removed. Neither data values nor a REL hint
-  select the transform mode.
-- Quantization and forward reordering fused into DWT coefficient writes.
-- DWT reads the original input directly on its first pass, avoiding a
-  whole-volume device copy. Zero coefficients bypass unnecessary reorder/sign
-  work while still writing the reconstruction coefficients.
-- Plane float/double IDWT sharing `idwt_yx_plane<T>` and
-  `idwt_z_all_dynamic<T>`. The latter calls `idwt_z_columns_all<T>`:
-  original detail bands stay fixed while reconstructed low bands use two
-  scratch regions, avoiding per-level copies of untouched high-frequency data.
-  Float retains its float4 path. Inverse plane Z uses dynamic shared memory.
-- Capacity-based Z tiles with aligned float4/double2 accesses and fixed-column
-  kernel variants, with general fallbacks. Eligible inverse tiles use exact
-  zero/high-band-zero fast paths based on current quantized coefficients or
-  WZP metadata. These dispatch rules do not identify individual datasets.
-- Signed WZP encoding and group packing in one kernel with a fixed grid of
-  512 blocks and dynamic chunk scheduling. WZP is the only lossless backend;
-  experimental LC selection and old-format compatibility paths are removed.
-- WZP decoding fused with reordering and dequantization. Quantization-outlier
-  restoration remains a separate step when required. Vectorized bit-plane
-  transfers and zero-chunk stores reduce decode work; decode timing is read
-  after the pipeline's final synchronization instead of blocking the next stage.
-- Regular/edge lookup tables, including a timed decode `block-offset` stage.
-  Decode offset tables are reused for the same device, dimensions and reorder
-  band, and omitted for supported direct-index layouts.
-- Reusable compression workspace, CUDA timing events, and the `dwt3d_prealloc`,
-  `idwt3d_prealloc`, and `wzp_prealloc` resource setup entries.
-- Shared file I/O in `utils/io.hpp` and reporting in `utils/Statistics.hpp`.
-
-P4/dual-transform and auxiliary entropy-coder experiments are not enabled.
-Benchmark archives, local datasets and prebuilt binaries are not synchronized.
+The native archive header is 32 bytes with no magic or version field. A flag
+selects the matching inverse arithmetic; files made by the former workshop
+layout are not supported. The default CUDA output is **not** the canonical
+CPU/CUDA/HIP profile. The [portable build instructions](cpu/README.md)
+describe the explicit native-repair entry points for byte-identical encoding
+and interchange. WAW2, benchmark archives and prebuilt binaries are not
+included in this checkout.
 
 ## Build
 
@@ -84,6 +71,10 @@ cmake --install build --prefix /path/to/waltz-install
 Downstream projects can use `find_package(Waltz CONFIG REQUIRED)` and link
 `Waltz::waltz`.
 
+The [standalone CPU build](cpu/README.md) does not need CUDA unless
+CPU↔CUDA tests are requested. The [native HIP build](platform/hip/README.md)
+uses the separate AMD/DCU toolchain.
+
 ## Usage
 
 Run `./build/waltz -h` to print help and exit successfully. No dataset or GPU
@@ -111,8 +102,9 @@ Decompress:
 | `-M ABS bound` | Compress using the supplied absolute tolerance. |
 
 Input is a headerless, native-endian array with X varying fastest and exactly
-`nx * ny * nz` elements. Compressed files store neither dimensions nor data
-type. Decode with the same `-3` dimensions and `-f`/`-d` type used to compress.
+`nx * ny * nz` elements. Dimensions are external to the archive. Decode
+with the original `-3` dimensions and matching `-f`/`-d` type; element
+width is checked against the stored flag.
 
 ### Compression only
 
@@ -166,14 +158,13 @@ CUDA_VISIBLE_DEVICES=0 WALTZ_WARMUP=1 WALTZ_REPORT_CE2E=1 \
   and host-side verification are outside these API timers.
   Internal API allocations/work, synchronization and reporting remain inside.
 - Stage timings and API wall time are different measurements. Compression's
-  printed stage total uses `max(WZP, IDWT)` for the overlapping stages, not their
-  sum; it is not a complete GPU timeline or process wall time.
+  printed stage total uses `max(WZP, IDWT + repair packing)` for the
+  overlapping work; it is not a complete GPU timeline or process wall time.
 - A cached or unnecessary decode offset table reports `block-offset = 0`.
   `unquant = 0` when there are no quantization outliers to restore; normal
   dequantization is already included in WZP decoding.
 - Throughput labels currently say GB/s but use GiB/s (bytes divided by
   `1024^3`, then divided by seconds).
-- The obsolete `WALTZ_ASYNC_ALLOC` warm-up switch is no longer used.
 
 ## Library API
 

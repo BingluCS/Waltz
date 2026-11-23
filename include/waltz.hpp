@@ -16,7 +16,8 @@ namespace WALTZ {
 
 // Output capacity for the current fixed-cap side channels plus one input-volume
 // worth of magnitude/header storage.  The extra MiB covers small-volume codec
-// metadata and section alignment.
+// metadata and section alignment. Compact PWE is selected only when smaller
+// than native PWE (including its header/directory), so it needs no extra capacity.
 template <typename T> size_t compressed_buffer_capacity(uint64_t num) {
     constexpr uint64_t pwe_cap = uint64_t{1} << 22U;
     constexpr uint64_t qout_cap = uint64_t{1} << 20U;
@@ -44,6 +45,8 @@ size_t d_WALTZ_decompress(
 
 // The caller resolves REL to conf.absErrorBound before entering this API.
 // Transform mode follows SPERR's dimension-only rule; no data sampling is performed.
+// Eligible FP32 plane volumes use fused short-Z convolution by default. The
+// canonical portable wrapper selects native repair/lifting via WALTZ_SMALL_PWE_SCALE=0.
 template <typename T>
 size_t d_compress(
     const WALTZ::Config& config, T* d_oridata, char* d_cmpData, const char* cmpPath, void* stream) {
@@ -59,7 +62,9 @@ size_t d_compress(
 // Decompress a blob produced by d_compress (device->device).  d_decData must hold
 // config.dimx*config.dimy*config.dimz elements of T. Config must contain the exact
 // original dimensions: the blob does not store dimensions or element count.
-// T must match the compression type; no data-type tag is stored in the blob.
+// T must match the archived element size. Only the current 32-byte archive
+// header is supported, with either native or compact PWE. CUDA-only short
+// plane-Z archives explicitly select their inverse in the stored flags.
 // Returns the decompressed byte count.
 template <typename T>
 size_t d_decompress(

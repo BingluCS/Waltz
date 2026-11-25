@@ -12,6 +12,7 @@
 #include "wzp_hip.cuh"
 #include "fused_hip.cuh"
 #include "reorder_hip.cuh"
+#include "../../src/batch_decode.cuh"
 
 namespace native {
 namespace tiles = WALTZ::allhalo;

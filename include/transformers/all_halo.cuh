@@ -140,10 +140,16 @@ template<int Z,class T,class Emit,bool SingleFold=false> __global__ void inverse
     }
 }
 
-template<class T,bool Inverse,class Emit> __global__ void xy(Read<T> src,dim3 n,Emit emit) {
+template<class T,bool Inverse,class Emit,bool Batch=false> __global__ void xy(Read<T> src,dim3 n,Emit emit,size_t stride=0) {
+    unsigned bx=blockIdx.x;
+    if constexpr(Batch) {
+        const unsigned cols=(n.x+55)/56,job=bx/cols;
+        bx%=cols;src.base+=job*stride;if(src.low)src.low+=job*stride;
+        emit.set_job(job,stride);
+    }
     const int lane=threadIdx.x%32,warp=threadIdx.x/32,z=int(blockIdx.z)*(blockDim.x/32)+warp;
     if(z>=n.z)return; // Warp-uniform: all shuffles use a complete warp.
-    const int xb=int(blockIdx.x)*56-4,yb=int(blockIdx.y)*8-4,x=xb+2*lane;
+    const int xb=int(bx)*56-4,yb=int(blockIdx.y)*8-4,x=xb+2*lane;
     const int x0=Inverse?halo3d::coeff(x,n.x):halo3d::mirror(x,n.x);
     const int x1=Inverse?halo3d::coeff(x+1,n.x):halo3d::mirror(x+1,n.x);
     T e0[8],o0[8],e1[8],o1[8];
@@ -178,7 +184,12 @@ template<class T,bool Inverse,class Emit> __global__ void xy(Read<T> src,dim3 n,
     }
 }
 
-template<int Z,class T,bool Inverse,class Emit> __global__ void zline(Read<T> src,dim3 n,Emit emit) {
+template<int Z,class T,bool Inverse,class Emit,bool Batch=false> __global__ void zline(Read<T> src,dim3 n,Emit emit,size_t stride=0) {
+    if constexpr(Batch) {
+        const unsigned job=blockIdx.z;
+        src.base+=job*stride;if(src.low)src.low+=job*stride;
+        emit.set_job(job,stride);
+    }
     const unsigned col=blockIdx.x*blockDim.x+threadIdx.x;
     if(col>=n.x*n.y)return;
     const int x=col%n.x,y=col/n.x,zb=int(blockIdx.y)*Z-4;

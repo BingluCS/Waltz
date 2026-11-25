@@ -23,6 +23,7 @@ static const int TPB = 512;
 #include "components/d_RZE_1.h"
 #include "lossless/wzp.hpp"
 #include "utils/Config.hpp"
+#include "utils/Blob.hpp"
 
 namespace WALTZ::lossless {
 namespace {
@@ -443,7 +444,7 @@ void encode_kernel(const byte* __restrict__ input,
     }
 }
 
-template <int DirectLayout = 0, typename DirectT = float>
+template <int DirectLayout = 0, typename DirectT = float, bool Batch = false>
 __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
     const byte* __restrict__ cmpdata,
     uint32_t chunks,
@@ -457,12 +458,26 @@ __global__ __launch_bounds__(TPB, 2048 / TPB) void decode_kernel(
     uint32_t direct_nx = 0,
     uint32_t direct_ny = 0,
     uint32_t direct_nz = 0,
-    uint32_t direct_block_z = 0) {
+    uint32_t direct_block_z = 0, const uint64_t* spans=nullptr, size_t stride=0) {
     __shared__ __align__(16) long long storage[STORAGE_BYTES / sizeof(long long)];
     byte* const encoded = reinterpret_cast<byte*>(storage);
     byte* const expanded = encoded + CS;
     byte* const temp = expanded + CS;
     const uint32_t chunk = blockIdx.x;
+    if constexpr(Batch) {
+        const unsigned job=blockIdx.y;
+        direct_coeff+=job*stride;
+        if(!spans[2*job+1]) {
+            // The final fill kernel supplies the HDF5 fill value for holes.
+            for(unsigned i=chunk*ELEMS_PER_CHUNK+threadIdx.x;
+                i<min((chunk+1)*ELEMS_PER_CHUNK,output_bytes/2);i+=blockDim.x)
+                direct_coeff[i]=DirectT(0);
+            return;
+        }
+        const byte* archive=cmpdata+spans[2*job];
+        direct_q=DirectT(reinterpret_cast<const WaltzBlobHeader*>(archive)->q);
+        cmpdata=archive+BlobSize;
+    }
     if (chunk >= chunks)
         return;
 
@@ -1017,6 +1032,19 @@ void decode_reordered_impl(const void* cmpdata,
 }
 
 } // namespace
+
+void wzp_decode_tiles(const byte* packed,const uint64_t* spans,unsigned jobs,
+    unsigned n,void* coeff,size_t stride,const uint32_t* ranks,dim3 dims,unsigned bz,
+    unsigned width,cudaStream_t stream) {
+    const unsigned chunks=(n+8191)/8192;
+    auto launch=[&](auto* p) {
+        using T=std::remove_pointer_t<decltype(p)>;
+        decode_kernel<1,T,true><<<dim3(chunks,jobs),TPB,0,stream>>>(
+            packed,chunks,(chunks+15)/16,n*2,nullptr,nullptr,p,ranks,T(0),
+            dims.x,dims.y,dims.z,bz,spans,stride);
+    };
+    if(width==4)launch(static_cast<float*>(coeff));else launch(static_cast<double*>(coeff));
+}
 
 size_t wzp_maxsize(uint32_t n) {
     const uint32_t chunks = (n + ELEMS_PER_CHUNK - 1u) / ELEMS_PER_CHUNK;

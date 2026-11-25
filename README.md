@@ -75,6 +75,25 @@ The [standalone CPU build](cpu/README.md) does not need CUDA unless
 CPU↔CUDA tests are requested. The [native HIP build](platform/hip/README.md)
 uses the separate AMD/DCU toolchain.
 
+## Python, HDF5 and PyTorch
+
+Install the NumPy bindings from the repository root with `python -m pip install .`.
+To also build the HDF5 filter and use the PyTorch DataLoader (requires HDF5
+development headers), use:
+
+```bash
+CMAKE_ARGS="-DWALTZ_BUILD_HDF5_FILTER=ON" python -m pip install '.[loader]'
+```
+
+`pywaltz.compress(array, abs_error=...)` returns a native canonical archive;
+`pywaltz.decompress(blob, shape=array.shape, dtype=array.dtype)` reconstructs
+the array. The HDF5 filter stores one such archive per chunk. `WaltzDataset`
+returns CPU-decoded samples; `WaltzGPUDataLoader` transfers compressed chunks
+and reconstructs multiple chunks together on NVIDIA CUDA or HIP/DCU using a
+separately built native backend. The batched path writes directly into the
+training tensor without changing the HDF5 format. See the
+[Python, HDF5 and DataLoader guide](python/README.md) for runnable examples.
+
 ## Usage
 
 Run `./build/waltz -h` to print help and exit successfully. No dataset or GPU

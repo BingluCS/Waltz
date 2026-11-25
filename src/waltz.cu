@@ -4,6 +4,7 @@
 #include "transformers/ICDF97.hpp"
 #include "transformers/all_halo.cuh"
 #include "waltz.hpp"
+#include "waltz_cuda.h"
 #include "utils/Blob.hpp"
 #include "utils/Timer.hpp"
 #include "utils/Statistics.hpp"
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -616,22 +618,41 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
 
 
 template <typename T, int NDIMS>
-size_t d_WALTZ_decompress(
-    char* d_cmpData, T* d_decData, const WALTZ::Config& config, const char* decPath, void* stream) {
+static size_t decode_impl(
+    char* d_cmpData, T* d_decData, const WALTZ::Config& config, const char* decPath,
+    void* stream, size_t canonical_bytes) {
     if constexpr (NDIMS != 3) {
         throw std::runtime_error("decompress currently only supports 3D");
     }
     const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     WaltzBlobHeader hdr{};
     if (g_pipeline_host_header == nullptr)
-        cudaMallocHost(reinterpret_cast<void**>(&g_pipeline_host_header),
-                       sizeof(WaltzBlobHeader));
-    cudaMemcpyAsync(g_pipeline_host_header, d_cmpData, sizeof(hdr),
-                    cudaMemcpyDeviceToHost, cuda_stream);
-    cudaStreamSynchronize(cuda_stream);
+        check_pwe_cuda(cudaMallocHost(reinterpret_cast<void**>(&g_pipeline_host_header),
+                                     sizeof(WaltzBlobHeader)));
+    check_pwe_cuda(cudaMemcpyAsync(g_pipeline_host_header, d_cmpData, sizeof(hdr),
+                                   cudaMemcpyDeviceToHost, cuda_stream));
+    check_pwe_cuda(cudaStreamSynchronize(cuda_stream));
     hdr = *g_pipeline_host_header;
     const uint32_t N = config.num;
     dim3 dims(config.dimx, config.dimy, config.dimz);
+    if (canonical_bytes) {
+        uint8_t xy, z;
+        calculate_dwt_levels(dims, xy, z);
+        const bool dyadic = xy == z;
+        const size_t chunks = (size_t(N) + 8191) / 8192;
+        if (hdr.flags != WaltzBlobHeader::pack_flags(dyadic, sizeof(T), PweEncoding::Native,
+                                                     Synthesis::HaloAllLevels) ||
+            hdr.levels_xy != xy || hdr.levels_z != z ||
+            hdr.reorder_bz != lossless::select_block_zband(dims, z, dyadic) ||
+            !(T(hdr.q) > 0) || !std::isfinite(T(hdr.q)) ||
+            hdr.mag_comp_bytes < 3*chunks + 4*((chunks+15)/16) ||
+            hdr.mag_comp_bytes > canonical_bytes - BlobSize ||
+            hdr.n_pwe > N || hdr.n_qo > N || hdr.pwe_bytes != size_t(hdr.n_pwe)*sizeof(T) ||
+            canonical_bytes != BlobSize + blob_align(hdr.mag_comp_bytes) +
+                blob_align(size_t(hdr.n_pwe)*4) + blob_align(hdr.pwe_bytes) +
+                2*blob_align(size_t(hdr.n_qo)*4))
+            throw std::runtime_error("invalid canonical Waltz chunk shape, header or length");
+    }
     const bool fused_plane_z=(hdr.flags&WaltzBlobHeader::CudaFusedPlaneZ)!=0;
     hdr.flags &= ~WaltzBlobHeader::CudaFusedPlaneZ;
     if (!WaltzBlobHeader::valid_flags(hdr.flags) || hdr.element_bytes() != sizeof(T) ||
@@ -798,7 +819,8 @@ size_t d_WALTZ_decompress(
     const double t_idwt = idwt_timer.elapsed_ready();
     const double t_pw = pwe_timer.elapsed_ready();
     const size_t orig = static_cast<size_t>(N) * sizeof(T);
-    Waltz_print_decompression(orig, sections.bytes, {t_offset, t_wzp, t_uq, t_idwt, t_pw});
+    if (!canonical_bytes)
+        Waltz_print_decompression(orig, sections.bytes, {t_offset, t_wzp, t_uq, t_idwt, t_pw});
 
     if (decPath != nullptr) { // optional host-side dump of the reconstruction
         T* h = new T[N];
@@ -811,6 +833,43 @@ size_t d_WALTZ_decompress(
         delete[] h;
     }
     return static_cast<size_t>(N) * sizeof(T);
+}
+
+template <typename T, int NDIMS>
+size_t d_WALTZ_decompress(char* archive, T* output, const Config& cfg,
+                         const char* path, void* stream) {
+    return decode_impl<T,NDIMS>(archive, output, cfg, path, stream, 0);
+}
+
+extern "C" const char* waltz_cuda_decode_chunk(uint32_t nx, uint32_t ny, uint32_t nz, int width,
+        const void* archive, size_t bytes, void* output, size_t out_bytes, void* stream) {
+    static thread_local char error[256];
+    static std::mutex lock;
+    try {
+        std::lock_guard<std::mutex> guard(lock);
+        if ((width != 4 && width != 8) || !nx || !ny || !nz || !archive || !output ||
+            bytes < BlobSize || uint64_t(nx)*ny > UINT32_MAX / unsigned(width) / nz ||
+            out_bytes != uint64_t(nx)*ny*nz*width)
+            throw std::invalid_argument("invalid chunk dimensions or buffer sizes");
+        int device;
+        check_pwe_cuda(cudaGetDevice(&device));
+        if (device != gpu_config().device)
+            throw std::runtime_error("use one CUDA device per Waltz training process");
+        // The variadic constructor collapses singleton axes. Keep chunk geometry.
+        Config cfg;
+        cfg.ndims = 3; cfg.dimx = nx; cfg.dimy = ny; cfg.dimz = nz;
+        cfg.num = uint64_t(nx)*ny*nz;
+        auto* src = const_cast<char*>(static_cast<const char*>(archive));
+        if (width == 4) decode_impl<float,3>(src, static_cast<float*>(output), cfg, nullptr, stream, bytes);
+        else decode_impl<double,3>(src, static_cast<double*>(output), cfg, nullptr, stream, bytes);
+        return nullptr;
+    } catch (const std::exception& e) {
+        std::snprintf(error, sizeof(error), "%s", e.what());
+    } catch (...) {
+        std::snprintf(error, sizeof(error), "unknown CUDA decode error");
+    }
+    (void)cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream));
+    return error;
 }
 
 // GPU extrema scan used by callers to resolve REL before entering d_compress.
@@ -833,3 +892,5 @@ template size_t
 d_WALTZ_decompress<double, 3>(char*, double*, const WALTZ::Config&, const char*, void*);
 
 } // namespace WALTZ
+
+#include "batch_decode.cuh"

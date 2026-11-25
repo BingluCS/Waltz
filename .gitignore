@@ -5,3 +5,4 @@
 CMakeUserPresets.json
 *.nsys-rep
 *.ncu-rep
+/python/**/__pycache__/

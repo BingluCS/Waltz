@@ -1,0 +1,26 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "pywaltz"
+version = "0.1.0"
+description = "NumPy bindings for the canonical Waltz scientific field codec"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.22"]
+
+[project.optional-dependencies]
+hdf5 = ["h5py>=3.8"]
+loader = ["h5py>=3.8", "torch>=2"]
+
+[tool.scikit-build]
+cmake.source-dir = "cpu"
+cmake.args = ["-DWALTZ_PYTHON_PACKAGE=ON", "-DBUILD_SHARED_LIBS=ON", "-DWALTZ_CPU_BUILD_TESTS=OFF"]
+build.targets = ["waltz_python_runtime"]
+wheel.packages = ["python/pywaltz"]
+wheel.py-api = "py3"
+sdist.include = ["cpu/CMakeLists.txt", "cpu/src/**", "cpu/include/**", "cpu/tests/*.cpp",
+                 "cpu/tests/*.cu", "cpu/tools/*.cpp", "cpu/gpu/*", "include/utils/Blob.hpp",
+                 "python/pywaltz/*.py", "python/hdf5/*.cpp", "python/examples/*.py",
+                 "python/tests/*.py", "python/README.md"]
+sdist.exclude = ["**/__pycache__/**", "cpu/build*/**"]

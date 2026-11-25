@@ -6,6 +6,11 @@
 
 namespace WALTZ::lossless {
 
+// Each row of the grid decodes one independent canonical archive.
+void wzp_decode_tiles(const unsigned char* packed,const uint64_t* spans,unsigned jobs,
+    unsigned n,void* coeff,size_t stride,const uint32_t* ranks,dim3 dims,unsigned bz,
+    unsigned width,cudaStream_t stream);
+
 // Waltz Zero-aware Parallel magnitude codec.  The archive is chunk independent:
 // zero chunks have no payload, while nonzero chunks use the fast bit-plane sparse
 // hierarchy.  All metadata and payload remain device resident.

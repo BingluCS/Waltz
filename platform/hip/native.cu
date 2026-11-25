@@ -13,6 +13,7 @@
 #include "fused_hip.cuh"
 #include "reorder_hip.cuh"
 #include "../../src/batch_decode.cuh"
+#include "xy_wave64.cuh"
 
 namespace native {
 namespace tiles = WALTZ::allhalo;
@@ -66,7 +67,7 @@ bool regular_morton(Profile p){
 int default_tune(Profile p){
     if(p.dyadic&&p.lx)
         return SplitInverse|OverlapWzp|(regular_morton(p)?FuseQuantization:LdsMorton|SplitForward);
-    return FastVerify|LdsMorton|OverlapWzp;
+    return FastVerify|LdsMorton|OverlapWzp|((p.lx && regular_morton(p))?FuseQuantization:0);
 }
 Profile profile(const waltz_hip_config& c){
     require(c.width==4||c.width==8,"unsupported dtype");
@@ -99,7 +100,7 @@ struct Stats {u64 side;unsigned payload,status;};
 
 struct waltz_hip_session {
     int device,sms,tune=0,tune_override=-1;
-    native::Device first,second,coeff,zbuf,correction,qout,mag,sign,table,rank_table,stats,status,scan,
+    native::Device masks,first,second,coeff,zbuf,correction,qout,mag,sign,table,rank_table,stats,status,scan,
         inverse_output,inverse_stage,
         side_count,side_offset,chunk_count,wzp_count,wzp_offset,slots,sign_slots,meta,wzp_scan;
     hipStream_t auxiliary=nullptr;
@@ -145,40 +146,57 @@ template<class T> struct BandStore {
         else low[at]=v;
     }
 };
+template<bool Inv,class T,class Out> void run_xy(Read<T> src, dim3 n, Out out) {
+    const dim3 grid(blocks(n.x,56),blocks(n.y,8),blocks(n.z,8));
+    if ((!src.low || (Inv && src.low_dims.x==half(n.x) && src.low_dims.y==half(n.y) && src.low_dims.z==n.z)) && n.y>=64 && n.x>=64) {
+        if constexpr(!Inv || sizeof(T)==4) {
+            if(n.x>=128) {
+                constexpr int rows=Inv?8:16;
+                if(n.z==1)xy_strip<Inv,64,rows,true><<<dim3(blocks(n.x,120),blocks(n.y,rows*4)),256>>>(src,n,out);
+                else xy_strip<Inv,64,rows><<<dim3(blocks(n.x,120),blocks(n.y,rows),blocks(n.z,4)),256>>>(src,n,out);
+                return;
+            }
+        }
+        xy_strip<Inv,32,8><<<grid,256>>>(src,n,out);
+    } else xy<T,Inv><<<grid,256>>>(src,n,out);
+}
 template<class T> void forward_level(Read<T> src,dim3 n,BandStore<T> emit,int axes,T* stage){
     if(axes==3){
         constexpr unsigned Z=sizeof(T)==4?8:4;
         if(stage){
-            xy<T,false><<<dim3(blocks(n.x,56),blocks(n.y,8),blocks(n.z,8)),256>>>(src,n,Store<T>{stage});
+            run_xy<false>(src,n,Store<T>{stage});
             launch_check();
             zline<Z,T,false><<<dim3(blocks(size_t(n.x)*n.y,128),blocks(n.z,Z)),128>>>
                 (Read<T>{stage,nullptr,src.full,{}},n,emit);
         }else forward_xyz<Z><<<dim3(blocks(n.x,56),blocks(n.y,8),blocks(n.z,Z)),256,56*8*(Z+8)*sizeof(T)>>>(src,n,emit);
     }else if(axes==2)
-        xy<T,false><<<dim3(blocks(n.x,56),blocks(n.y,8),blocks(n.z,8)),256>>>(src,n,emit);
+        run_xy<false>(src,n,emit);
     else{
         constexpr unsigned Z=sizeof(T)==4?16:8;
         zline<Z,T,false><<<dim3(blocks(size_t(n.x)*n.y,128),blocks(n.z,Z)),128>>>(src,n,emit);
     }
     launch_check();
 }
+template<class T> const T* forward_bands(waltz_hip_session& w,const T* src,Profile p,
+                                         T* bands,unsigned count,int axes,T* stage=nullptr){
+    T* a=w.first.get<T>(p.n);T* b=w.second.get<T>(p.n);
+    dim3 n=p.dims;
+    for(unsigned j=0;j<count;++j){
+        const dim3 inner=shrink(n,axes);
+        T* dst=(j&1)?b:a;
+        forward_level(Read<T>{src,nullptr,p.dims,{}},n,BandStore<T>{bands,dst,inner,j+1==count},axes,stage);
+        n=inner;src=dst;
+    }
+    return bands;
+}
 template<class T> const T* forward(waltz_hip_session& w,const T* input,Profile p){
     if(!p.lx&&!p.lz)return input;
-    T* a=w.first.get<T>(p.n);T* b=w.second.get<T>(p.n);
-    T* stage=(w.tune&SplitForward)&&p.dyadic?w.inverse_stage.get<T>(p.n):nullptr;
-    auto phase=[&](const T* src,T* bands,unsigned count,int axes){
-        dim3 n=p.dims;
-        for(unsigned j=0;j<count;++j){
-            dim3 inner=shrink(n,axes);
-            T* dst=(j&1)?b:a;
-            forward_level(Read<T>{src,nullptr,p.dims,{}},n,BandStore<T>{bands,dst,inner,j+1==count},axes,stage);
-            n=inner;src=dst;
-        }
-        return static_cast<const T*>(bands);
-    };
-    if(p.dyadic)return phase(input,w.coeff.get<T>(p.n),p.lx,3);
-    const T* src=p.lz?phase(input,w.zbuf.get<T>(p.n),p.lz,1):input;
-    return p.lx?phase(src,w.coeff.get<T>(p.n),p.lx,2):src;
+    if(p.dyadic){
+        T* stage=(w.tune&SplitForward)?w.inverse_stage.get<T>(p.n):nullptr;
+        return forward_bands(w,input,p,w.coeff.get<T>(p.n),p.lx,3,stage);
+    }
+    const T* src=p.lz?forward_bands(w,input,p,w.zbuf.get<T>(p.n),p.lz,1):input;
+    return p.lx?forward_bands(w,src,p,w.coeff.get<T>(p.n),p.lx,2):src;
 }
 template<class T> __device__ bool strict(double a,double b,double eb){
     const double high=a-b,m=fabs(high);
@@ -187,10 +205,18 @@ template<class T> __device__ bool strict(double a,double b,double eb){
     const double v=a-high,low=(a-(high+v))+(v-b);
     return !((high>0&&low>0)||(high<0&&low<0));
 }
+struct QuantExceptions {
+    uint32_t* value;
+    uint32_t* present;
+    __device__ void put(size_t i,unsigned mag) const {
+        if(mag>65535u){value[i]=mag;atomicOr(present+(i>>5),1u<<(i&31));}
+    }
+};
 template<class T,bool Fast=false> struct Verify {
-    const T* input;T* correction;double bound;unsigned* status;
-    __device__ T error(T sample,size_t at) const {
-        const T src=input[at],err=sample-src;
+    const T* input;T* correction;double bound;unsigned* status;unsigned* present;
+    __device__ T error_value(T sample,T src) const {
+        const T err=sample-src;
+        if(fabs(err)<T(bound))return T(0);
         const bool patch=fabs(err)>T(bound);
         const T v=patch?sample-err:sample;
         bool ok=false;
@@ -204,29 +230,63 @@ template<class T,bool Fast=false> struct Verify {
         if(!isfinite(err)||(!ok&&!strict<T>(double(v),double(src),bound)))atomicOr(status,2u);
         return patch?err:T(0);
     }
-    __device__ void operator()(T sample,size_t at) const {correction[at]=error(sample,at);}
+    __device__ void operator()(T sample,size_t at) const {
+        const T e=error_value(sample,input[at]);
+        if(e!=T(0)){correction[at]=e;atomicOr(present+(at>>5),1u<<(at&31));}
+    }
+    __device__ void pair(float a,float b,unsigned at) const{
+        const float2 v=reinterpret_cast<const float2*>(input)[at/2];
+        const float da=error_value(a,v.x),db=error_value(b,v.y);
+        if(da!=0)correction[at]=da;
+        if(db!=0)correction[at+1]=db;
+        const unsigned m=unsigned(da!=0)|(unsigned(db!=0)<<1);
+        if(m)atomicOr(present+(at>>5),m<<(at&31));
+    }
 };
+struct PairStore {
+    float* output;
+    __device__ void pair(float a,float b,unsigned at)const {
+        reinterpret_cast<float2*>(output)[at/2]=make_float2(a,b);
+    }
+};
+template<class T,bool F> auto pair_out(Verify<T,F> v){return v;}
+inline auto pair_out(Store<float> v){return PairStore{v.output};}
+template<class T,bool F> bool pair_aligned(Verify<T,F> v){return !(reinterpret_cast<uintptr_t>(v.input)&7);}
+inline bool pair_aligned(Store<float> v){return !(reinterpret_cast<uintptr_t>(v.output)&7);}
 template<class T,class Out> __global__ void identity(const T* src,unsigned n,Out emit){
     size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
     if(i<n)emit(src[i],i);
 }
-template<class T,class Out> void inverse_level(Read<T> src,dim3 n,Out emit,int axes,T* stage=nullptr){
+template<class T,class Out> void inverse_level(Read<T> src,dim3 n,Out emit,int axes,T* stage=nullptr,bool finest=false){
     if(axes==3){
         constexpr unsigned Z=sizeof(T)==4?16:8;
         const dim3 grid(blocks(n.x,56),blocks(n.y,8),blocks(n.z,Z));
         if(stage){
-            zline<Z,T,true><<<dim3(blocks(size_t(n.x)*n.y,128),blocks(n.z,Z)),128>>>(src,n,Store<T>{stage});
+            if constexpr(sizeof(T)==4){
+                // Both X subbands must start on pair boundaries. Only the
+                // finest level has tightly packed rows in src and stage.
+                if(finest && n.x>=128 && n.y>=128 && n.z>=64 && !(n.x&3u)){
+                    inverse_zpairs<<<dim3(blocks(n.x,256),n.y,blocks(n.z,16)),128>>>(src,n,stage);
+                    launch_check();
+                    const Read<T> from_z{stage,nullptr,src.full,{}};
+                    if(pair_aligned(emit))
+                        xy_strip<true,64,8,false,true><<<dim3(blocks(n.x,120),blocks(n.y,8),blocks(n.z,4)),256>>>(
+                            from_z,n,pair_out(emit));
+                    else run_xy<true>(from_z,n,emit);
+                    launch_check();return;
+                }
+            }
+            inverse_zstrip<Z><<<dim3(blocks(size_t(n.x)*n.y,128),blocks(n.z,Z)),128>>>(src,n,Store<T>{stage});
             launch_check();
-            xy<T,true><<<dim3(blocks(n.x,56),blocks(n.y,8),blocks(n.z,8)),256>>>
-                (Read<T>{stage,nullptr,src.full,{}},n,emit);
+            run_xy<true>(Read<T>{stage,nullptr,src.full,{}},n,emit);
         }else if(n.x>=64&&n.y>=64&&n.z>=64)
             inverse_xyz<Z,T,Out,true><<<grid,256,65536>>>(src,n,emit);
         else inverse_xyz<Z,T,Out,false><<<grid,256,65536>>>(src,n,emit);
     }else if(axes==2)
-        xy<T,true><<<dim3(blocks(n.x,56),blocks(n.y,8),blocks(n.z,8)),256>>>(src,n,emit);
+        run_xy<true>(src,n,emit);
     else{
         constexpr unsigned Z=sizeof(T)==4?16:8;
-        zline<Z,T,true><<<dim3(blocks(size_t(n.x)*n.y,128),blocks(n.z,Z)),128>>>(src,n,emit);
+        inverse_zstrip<Z><<<dim3(blocks(size_t(n.x)*n.y,128),blocks(n.z,Z)),128>>>(src,n,emit);
     }
     launch_check();
 }
@@ -241,7 +301,7 @@ template<class T,class Out> void inverse(waltz_hip_session& w,const T* coeff,Pro
         for(unsigned step=0;step<count;++step){
             n=dims[count-1-step];
             Read<T> read{src,prior,p.dims,low};
-            if(step+1==count)inverse_level(read,n,emit,axes,stage);
+            if(step+1==count)inverse_level(read,n,emit,axes,stage,true);
             else{
                 T* temp=(step&1)?b:a;
                 inverse_level(read,n,Store<T>{temp},axes,stage);prior=temp;low=n;
@@ -266,7 +326,7 @@ __device__ int32_t quantize_value(T v,unsigned* status){
 }
 
 template<class T>
-__global__ void quant(const T* in,T* coeff,uint16_t* mag,uint32_t* signs,uint32_t* qout,
+__global__ void quant(const T* in,T* coeff,uint16_t* mag,uint32_t* signs,QuantExceptions qout,
                       const uint32_t* table,dim3 n,unsigned bz,T q,T inv,unsigned* status){
     const unsigned bx=blockIdx.x*16,by=blockIdx.y*16,bz0=blockIdx.z*bz;
     const unsigned nx=min(16u,n.x-bx),ny=min(16u,n.y-by),nz=min(bz,n.z-bz0);
@@ -291,7 +351,7 @@ __global__ void quant(const T* in,T* coeff,uint16_t* mag,uint32_t* signs,uint32_
             unsigned m=a<0?unsigned(-a):unsigned(a);
             neg=a<0;
             coeff[at]=a?T(a)*q:T(0);
-            mag[packed+i]=uint16_t(min(65535u,m));qout[at]=m>65535?m:0;
+            mag[packed+i]=uint16_t(min(65535u,m));qout.put(at,m);
             if(!aligned&&neg)atomicOr(signs+(packed+i)/32,1u<<((packed+i)&31));
         }
         if(aligned){
@@ -304,7 +364,7 @@ __global__ void quant(const T* in,T* coeff,uint16_t* mag,uint32_t* signs,uint32_
 // A workgroup reads and writes contiguous row-major coefficients, then emits
 // contiguous packed magnitudes/signs after an LDS Morton permutation.
 template<class T>
-__global__ void quant_natural(const T* in,T* coeff,uint16_t* mag,uint32_t* signs,uint32_t* qout,
+__global__ void quant_natural(const T* in,T* coeff,uint16_t* mag,uint32_t* signs,QuantExceptions qout,
                               const uint16_t* rank,dim3 n,unsigned bz,T q,T inv,unsigned* status){
     extern __shared__ uint32_t perm[];
     const unsigned bx=blockIdx.x*16,by=blockIdx.y*16,bz0=blockIdx.z*bz;
@@ -322,7 +382,7 @@ __global__ void quant_natural(const T* in,T* coeff,uint16_t* mag,uint32_t* signs
             i%nx+size_t(i/nx%ny)*n.x+size_t(i/(nx*ny))*plane);
         const int32_t a=quantize_value(in[at]*inv,status);
         const unsigned m=a<0?unsigned(-a):unsigned(a);
-        coeff[at]=a?T(a)*q:T(0);qout[at]=m>65535?m:0;
+        coeff[at]=a?T(a)*q:T(0);qout.put(at,m);
         perm[rank[i]]=min(65535u,m)|(a<0?1u<<31:0u);
     }
     __syncthreads();
@@ -339,14 +399,13 @@ __global__ void quant_natural(const T* in,T* coeff,uint16_t* mag,uint32_t* signs
     }
 }
 
-// Write a completed subband directly to both consumers. The Z-line threads
-// naturally own consecutive x/y columns. Byte signs avoid cross-tile atomics;
-// WZP compacts them to the same format as its ordinary uint32 bitmap input.
+// Dequantized coefficients feed local synthesis. For WZP, a zeroed Morton
+// buffer holds a 15-bit magnitude plus sign; 0x7fff escapes to the full
+// transport magnitude. This staging convention never reaches the archive.
 template<class T,bool Regular> struct QuantBand {
     T *coeff,*low;
-    uint16_t *mag;
-    uint8_t* sign;
-    uint32_t *qout,*status;
+    uint16_t *codes,*escapes;
+    QuantExceptions qout;uint32_t* status;
     const uint16_t* rank;
     dim3 full,inner;
     unsigned bz,zshift;
@@ -354,6 +413,9 @@ template<class T,bool Regular> struct QuantBand {
     T q,inv;
     __device__ void operator()(T v,size_t at,int x,int y,int z)const{
         if(!last&&x<int(inner.x)&&y<int(inner.y)&&z<int(inner.z)){low[at]=v;return;}
+        const int32_t a=quantize_value(v*inv,status);
+        coeff[at]=a?T(a)*q:T(0);
+        if(!a)return; // packed magnitudes are cleared before the transform
         const unsigned bx=unsigned(x)&~15u,by=unsigned(y)&~15u;
         unsigned nx,ny,nz,bz0;
         if constexpr(Regular){
@@ -365,28 +427,43 @@ template<class T,bool Regular> struct QuantBand {
         const unsigned coords=(unsigned(z)-bz0)*ny*nx+(unsigned(y)&15u)*nx+(unsigned(x)&15u);
         const unsigned shape=(nx!=16)|((ny!=16)<<1)|((nz!=bz)<<2);
         const unsigned packed=full.x*full.y*bz0+full.x*nz*by+ny*nz*bx+rank[shape*256*bz+coords];
-        const int32_t a=quantize_value(v*inv,status);
         const unsigned m=a<0?unsigned(-a):unsigned(a);
-        coeff[at]=a?T(a)*q:T(0);qout[at]=m>65535?m:0;
-        mag[packed]=uint16_t(min(65535u,m));sign[packed]=a<0;
+        qout.put(at,m);
+        const unsigned kept=min(32767u,m);
+        codes[packed]=uint16_t(kept|(a<0?32768u:0u));
+        if(m>=32767u)escapes[packed]=uint16_t(min(65535u,m));
     }
 };
 template<class T,bool Regular>
-void forward_quantized(waltz_hip_session& w,const T* src,T* coeff,uint16_t* mag,uint8_t* sign,
-                       uint32_t* qout,unsigned* status,const uint16_t* rank,Profile p,T q,T inv){
-    T* a=w.first.get<T>(p.n);T* b=w.second.get<T>(p.n);T* stage=w.inverse_stage.get<T>(p.n);
+void forward_quantized(waltz_hip_session& w,const T* src,T* coeff,uint16_t* codes,uint16_t* escapes,
+                       QuantExceptions qout,unsigned* status,const uint16_t* rank,Profile p,T q,T inv){
+    T* a=w.first.get<T>(p.n);T* b=w.second.get<T>(p.n);
     dim3 n=p.dims;
     unsigned zshift=0;while((1u<<zshift)<p.bz)++zshift;
-    constexpr unsigned Z=sizeof(T)==4?8:4;
+    if(!p.dyadic){
+        // Complete the plane Z transform before any XY analysis. Only final
+        // XY subbands are quantized; the recursively transformed LL stays
+        // at its original precision until the next level consumes it.
+        if(p.lz)src=forward_bands(w,src,p,w.zbuf.get<T>(p.n),p.lz,1);
+        for(unsigned l=0;l<p.lx;++l){
+            const dim3 inner=shrink(n,2);
+            T* low=(l&1)?b:a;
+            run_xy<false>(Read<T>{src,nullptr,p.dims,{}},n,
+                QuantBand<T,Regular>{coeff,low,codes,escapes,qout,status,rank,p.dims,inner,p.bz,zshift,l+1==p.lx,q,inv});
+            launch_check();n=inner;src=low;
+        }
+        return;
+    }
+    T* stage=w.inverse_stage.get<T>(p.n);
+    constexpr unsigned Z=sizeof(T)==4?16:8;
     for(unsigned lev=0;lev<p.lx;++lev){
         T* low=(lev&1)?b:a;
         const dim3 inner=shrink(n,3);
-        xy<T,false><<<dim3(blocks(n.x,56),blocks(n.y,8),blocks(n.z,8)),256>>>(
-            Read<T>{src,nullptr,p.dims,{}},n,Store<T>{stage});
+        run_xy<false>(Read<T>{src,nullptr,p.dims,{}},n,Store<T>{stage});
         launch_check();
         zline<Z,T,false><<<dim3(blocks(size_t(n.x)*n.y,128),blocks(n.z,Z)),128>>>(
             Read<T>{stage,nullptr,p.dims,{}},n,
-            QuantBand<T,Regular>{coeff,low,mag,sign,qout,status,rank,p.dims,inner,p.bz,zshift,lev+1==p.lx,q,inv});
+            QuantBand<T,Regular>{coeff,low,codes,escapes,qout,status,rank,p.dims,inner,p.bz,zshift,lev+1==p.lx,q,inv});
         launch_check();n=inner;src=low;
     }
 }
@@ -411,47 +488,35 @@ template<class V> void scan(Device& scratch,const V* in,V* out,unsigned n,hipStr
     ck(rocprim::exclusive_scan(scratch.get<uint8_t>(sz),sz,in,out,V(0),n,rocprim::plus<V>(),stream));
 }
 
-// Side records remain sorted in native index order: one block tally per dense
-// tile, a small device prefix, and stable compaction only in nonempty tiles.
-template<class T,bool Fused=false>
-__global__ void tally(const T* e,const unsigned* q,unsigned n,u64* count,
-                      Verify<T,true> verify={},const T* recon=nullptr){
-    using Reduce=rocprim::block_reduce<u64,Threads>;
-    __shared__ typename Reduce::storage_type scratch;
-    size_t at=size_t(blockIdx.x)*Brick+threadIdx.x;
-    u64 v=0;
+// Two naturally ordered indicator bitmaps avoid scanning dense value arrays.
+// One wave counts or emits a 2048-value tile (64 words); padding bits are zero.
+static_assert(Brick == 64*32 && Threads%64 == 0);
+template<bool Write,class T>
+__global__ void side_masks(const uint32_t* pm,const uint32_t* qm,unsigned words,unsigned tiles,
+    u64* count,const u64* offset=nullptr,const T* errors=nullptr,const uint32_t* qo=nullptr,
+    uint32_t* pi=nullptr,T* pv=nullptr,uint32_t* qi=nullptr,uint32_t* qv=nullptr){
+    const unsigned word=blockIdx.x*blockDim.x+threadIdx.x, tile=word>>6,lane=word&63;
+    if(tile>=tiles)return; // wave-uniform
+    if constexpr(Write){if(!count[tile])return;}
+    unsigned p=word<words?pm[word]:0,q=word<words?qm[word]:0;
+    // Each total is <= 2048, so adding packed 16-bit counts cannot carry.
+    const unsigned self=__popc(p)+(unsigned(__popc(q))<<16);
+    unsigned sum=self;
     #pragma unroll
-    for(unsigned i=0;i<Brick/Threads;++i){
-        const size_t j=at+i*Threads;
-        if(j<n){
-            T err;
-            if constexpr(Fused){err=verify.error(recon[j],j);verify.correction[j]=err;}
-            else err=e[j];
-            v+=u64(err!=T(0))+(u64(q[j]!=0)<<32);
-        }
+    for(unsigned d=1;d<64;d*=2){
+        const unsigned before=__shfl_up(sum,d,64);
+        if(lane>=d)sum+=before;
     }
-    u64 total;Reduce().reduce(v,total,scratch,rocprim::plus<u64>());
-    if(!threadIdx.x)count[blockIdx.x]=total;
+    if constexpr(Write){
+        const u64 base=offset[tile];
+        unsigned pos=unsigned(base)+((sum-self)&65535u),qpos=unsigned(base>>32)+((sum-self)>>16);
+        while(p){const unsigned i=word*32+__ffs(p)-1;pi[pos]=i;pv[pos++]=errors[i];p&=p-1;}
+        while(q){const unsigned i=word*32+__ffs(q)-1;qi[qpos]=i;qv[qpos++]=qo[i];q&=q-1;}
+    } else if(lane==63) count[tile]=(sum&65535u)+(u64(sum>>16)<<32);
 }
-template<class T>
-__global__ void compact(const T* error,const unsigned* q,unsigned n,const u64* count,
-                        const u64* offset,uint32_t* pi,T* pv,uint32_t* qi,uint32_t* qv){
-    if(count[blockIdx.x]==0)return;
-    using Scan=rocprim::block_scan<u64,Threads>;
-    __shared__ typename Scan::storage_type scratch;
-    const size_t base=size_t(blockIdx.x)*Brick+threadIdx.x;
-    u64 prefix=offset[blockIdx.x];
-    for(unsigned i=0;i<Brick/Threads;++i){
-        const size_t j=base+i*Threads;
-        const T e=j<n?error[j]:T(0);const unsigned v=j<n?q[j]:0;
-        u64 before,total;
-        Scan().exclusive_scan(u64(e!=T(0))+(u64(v!=0)<<32),before,u64(0),total,scratch,rocprim::plus<u64>());
-        before+=prefix;
-        if(e!=T(0)){pi[uint32_t(before)]=uint32_t(j);pv[uint32_t(before)]=e;}
-        if(v){qi[before>>32]=uint32_t(j);qv[before>>32]=v;}
-        prefix+=total;
-        __syncthreads();
-    }
+template<class T> __global__ void verify_samples(Verify<T,true> v,const T* recon,unsigned n){
+    const unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n)v(recon[i],i);
 }
 __device__ unsigned chunk_len(const uint8_t* meta,unsigned chunk,unsigned n){
     const unsigned code=wzp::load_meta24(meta,chunk);
@@ -469,29 +534,38 @@ __global__ void collect(Stats* s,const u64* ns,const u64* os,unsigned sn,
     s->side=ns[sn-1]+os[sn-1];
     s->payload=nw[wg-1]+ow[wg-1];s->status=*status;
 }
+__device__ __forceinline__ void copy_slot(uint8_t* dst,const uint8_t* src,unsigned bytes,unsigned lane){
+    // Align the destination without writing into the neighboring chunk.
+    const unsigned head=min(bytes,unsigned(-reinterpret_cast<uintptr_t>(dst))&3u);
+    if(lane<head)dst[lane]=src[lane];
+    const unsigned words=(bytes-head)/4u;
+    for(unsigned k=lane;k<words;k+=64){
+        uint32_t v;
+        __builtin_memcpy(&v,src+head+4*k,4);
+        reinterpret_cast<uint32_t*>(dst+head)[k]=v;
+    }
+    const unsigned tail=head+4*words+lane;
+    if(tail<bytes)dst[tail]=src[tail];
+}
 __global__ void write_wzp(uint8_t* wire,const uint8_t* meta,const uint8_t* mag,const uint8_t* signs,
                           const unsigned* sizes,const unsigned* offsets,unsigned n,unsigned chunks,unsigned groups){
-    const unsigned g=blockIdx.x,t=threadIdx.x,first=g*16;
-    __shared__ unsigned group_starts[16];
-    if(!t){
-        reinterpret_cast<uint32_t*>(wire)[g]=sizes[g]?offsets[g]:0;
-        unsigned off=offsets[g];
-        for(unsigned j=0;j<min(16u,chunks-first);++j){group_starts[j]=off;off+=chunk_len(meta,first+j,n);}
-    }
+    const unsigned c=blockIdx.x*4+threadIdx.x/64,lane=threadIdx.x&63;
+    if(c>=chunks)return;
+    const unsigned g=c/16,first=g*16,local=c-first;
+    if(!local && !lane)reinterpret_cast<uint32_t*>(wire)[g]=sizes[g]?offsets[g]:0;
     auto* ometa=wire+size_t(groups)*4;
-    const unsigned span=min(16u,chunks-first);
-    if(t<span*3)ometa[first*3+t]=meta[first*3+t];
-    if(!sizes[g])return;
-    __syncthreads();
-    unsigned part=t>>4, lane=t&15;
-    if(part>=span)return;
-    const unsigned off=group_starts[part];
-    const unsigned c=first+part,code=wzp::load_meta24(meta,c);
+    if(lane<3)ometa[c*3+lane]=meta[c*3+lane];
+    const unsigned code=wzp::load_meta24(meta,c);
+    if(!code)return;
+    unsigned v=lane<local?chunk_len(meta,first+lane,n):0;
+    #pragma unroll
+    for(unsigned d=8;d;d>>=1)v+=__shfl_xor(v,d,16);
+    const unsigned off=offsets[g]+__shfl(v,0,64);
     const unsigned m=wzp::decode_mag_bytes(code,min(16384u,2*n-c*16384u));
     const unsigned s=wzp::decode_sign_bytes(code);
     uint8_t* dest=ometa+size_t(chunks)*3+off;
-    for(unsigned i=lane;i<m;i+=16)dest[i]=mag[size_t(c)*16384+i];
-    for(unsigned i=lane;i<s;i+=16)dest[m+i]=signs[size_t(c)*1024+i];
+    copy_slot(dest,mag+size_t(c)*16384,m,lane);
+    copy_slot(dest+m,signs+size_t(c)*1024,s,lane);
 }
 __global__ void prefix_header(uint8_t* dest,Header h,size_t pi,size_t pv,size_t qi,size_t qv){
     unsigned t=threadIdx.x;
@@ -524,7 +598,7 @@ size_t encode(waltz_hip_session& w,const waltz_hip_config& c,const T* src,uint8_
     require(c.bound>0&&std::isfinite(c.bound)&&q>0&&std::isfinite(q)&&std::isfinite(inv),"invalid quantizer");
     unsigned* st=w.status.get<unsigned>(1);ck(hipMemsetAsync(st,0,4));
     Trace trace("encode");
-    const bool fuse_quant=(w.tune&FuseQuantization)&&p.dyadic&&p.lx;
+    const bool fuse_quant=(w.tune&FuseQuantization)&&p.lx;
     const T* transformed=fuse_quant?nullptr:forward(w,src,p);
     trace.mark("forward");
     // Keep the dequantized values separate from the source so that a block's
@@ -537,18 +611,24 @@ size_t encode(waltz_hip_session& w,const waltz_hip_config& c,const T* src,uint8_
     if(p.lx&&p.lz&&!p.dyadic)errors=w.coeff.get<T>(n);
     const uint32_t* ranks=table(w,p);
     auto* mag=w.mag.get<uint16_t>(n);
-    auto* sign=w.sign.get<uint32_t>(fuse_quant?blocks(n,4):blocks(n,32));
-    auto* qo=w.qout.get<uint32_t>(n);
+    auto* sign=w.sign.get<uint32_t>(fuse_quant?blocks(n,2):blocks(n,32));
+    const unsigned words=blocks(n,32);
+    auto* pm=w.masks.get<uint32_t>(2ull*words);auto* qm=pm+words;
+    ck(hipMemsetAsync(pm,0,2ull*words*sizeof(uint32_t)));
+    auto* qo=w.qout.get<uint32_t>(n);const QuantExceptions exceptions{qo,qm};
     if(!fuse_quant)ck(hipMemsetAsync(sign,0,4ull*blocks(n,32)));
     const dim3 qgrid(blocks(p.dims.x,16),blocks(p.dims.y,16),blocks(p.dims.z,p.bz));
     if(fuse_quant){
+        // QuantBand only scatters nonzero transport codes.
+        ck(hipMemsetAsync(mag,0,size_t(n)*sizeof(uint16_t)));
         const auto* rank=w.rank_table.get<uint16_t>(8*256*p.bz);
-        if(regular_morton(p))forward_quantized<T,true>(w,src,coeff,mag,reinterpret_cast<uint8_t*>(sign),qo,st,rank,p,q,inv);
-        else forward_quantized<T,false>(w,src,coeff,mag,reinterpret_cast<uint8_t*>(sign),qo,st,rank,p,q,inv);
+        auto* escapes=reinterpret_cast<uint16_t*>(sign);
+        if(regular_morton(p))forward_quantized<T,true>(w,src,coeff,mag,escapes,exceptions,st,rank,p,q,inv);
+        else forward_quantized<T,false>(w,src,coeff,mag,escapes,exceptions,st,rank,p,q,inv);
     }else if(w.tune&LdsMorton)
         quant_natural<<<qgrid,Threads,256*p.bz*sizeof(uint32_t)>>>
-            (transformed,coeff,mag,sign,qo,w.rank_table.get<uint16_t>(8*256*p.bz),p.dims,p.bz,q,inv,st);
-    else quant<<<qgrid,Threads>>>(transformed,coeff,mag,sign,qo,ranks,p.dims,p.bz,q,inv,st);
+            (transformed,coeff,mag,sign,exceptions,w.rank_table.get<uint16_t>(8*256*p.bz),p.dims,p.bz,q,inv,st);
+    else quant<<<qgrid,Threads>>>(transformed,coeff,mag,sign,exceptions,ranks,p.dims,p.bz,q,inv,st);
     launch_check();
     trace.mark("quant_morton");
     auto* slots=w.slots.get<uint8_t>(size_t(chunks)*16384);
@@ -578,12 +658,15 @@ size_t encode(waltz_hip_session& w,const waltz_hip_config& c,const T* src,uint8_
     if(w.tune&SeparateVerify){
         reconstructed=w.inverse_output.get<T>(n);
         inverse(w,coeff,p,Store<T>{reconstructed});
-    }else if(w.tune&FastVerify)inverse(w,coeff,p,Verify<T,true>{src,errors,c.bound,st});
-    else inverse(w,coeff,p,Verify<T>{src,errors,c.bound,st});
+    }else if(w.tune&FastVerify)inverse(w,coeff,p,Verify<T,true>{src,errors,c.bound,st,pm});
+    else inverse(w,coeff,p,Verify<T>{src,errors,c.bound,st,pm});
     trace.mark("inverse_verify");
     auto* ns=w.side_count.get<u64>(nb);auto* os=w.side_offset.get<u64>(nb);
-    if(reconstructed)tally<T,true><<<nb,Threads>>>(errors,qo,n,ns,Verify<T,true>{src,errors,c.bound,st},reconstructed);
-    else tally<<<nb,Threads>>>(errors,qo,n,ns);
+    if(reconstructed){
+        verify_samples<<<blocks(n),Threads>>>(Verify<T,true>{src,errors,c.bound,st,pm},reconstructed,n);
+        launch_check();
+    }
+    side_masks<false,T><<<blocks(nb,Threads/64),Threads>>>(pm,qm,words,nb,ns);
     launch_check();scan(w.scan,ns,os,nb);
     trace.mark("side_tally_scan");
     if(overlap)ck(hipStreamWaitEvent(nullptr,w.wzp_done,0));
@@ -602,10 +685,10 @@ size_t encode(waltz_hip_session& w,const waltz_hip_config& c,const T* src,uint8_
     require(!(n>(1u<<20)&&h.n_qo>=(1u<<20))&&!(n>(1u<<22)&&h.n_pwe>=(1u<<22)),"portable side-channel capacity reached");
     Layout l(h);require(l.end<=cap,"archive capacity too small");
     prefix_header<<<1,64>>>(dst,h,l.pi,l.pv,l.qi,l.qv);launch_check();
-    write_wzp<<<groups,Threads>>>(dst+BlobSize,meta,slots,ss,nw,ow,n,chunks,groups);launch_check();
+    write_wzp<<<blocks(chunks,4),Threads>>>(dst+BlobSize,meta,slots,ss,nw,ow,n,chunks,groups);launch_check();
     trace.mark("write_records");
     if(h.n_pwe||h.n_qo){
-        compact<<<nb,Threads>>>(errors,qo,n,ns,os,reinterpret_cast<uint32_t*>(dst+l.pi),
+        side_masks<true,T><<<blocks(nb,Threads/64),Threads>>>(pm,qm,words,nb,ns,os,errors,qo,reinterpret_cast<uint32_t*>(dst+l.pi),
             reinterpret_cast<T*>(dst+l.pv),reinterpret_cast<uint32_t*>(dst+l.qi),reinterpret_cast<uint32_t*>(dst+l.qv));
         launch_check();
     }

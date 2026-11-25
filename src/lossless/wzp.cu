@@ -40,16 +40,40 @@ constexpr uint32_t ITEMS_PER_THREAD = (ELEMS_PER_CHUNK + TPB - 1u) / TPB;
 constexpr uint32_t TEMP_BYTES = 3u * 1024u;
 constexpr uint32_t STORAGE_BYTES = 2u * CS + TEMP_BYTES;
 
-__device__ unsigned int payload_counter;
+__device__ unsigned int payload_size;  // Set by the final group, not an allocator.
 __device__ unsigned int nnz_counter;
 __device__ unsigned long long chunk_counter;
 
 __global__ void reset_counter_kernel() {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        payload_counter = 0;
+        payload_size = 0;
         nnz_counter = 0;
         chunk_counter = 0;
     }
+}
+
+// LC-style decoupled lookback, at WZP group granularity. A single atomic
+// descriptor publishes both tag and value (including zero-length groups).
+// Dynamic chunk tickets are issued by running CTAs in increasing order:
+// before group g can finish, every predecessor chunk has a running producer
+// or has already published. Never wait for a higher numbered group.
+__device__ __forceinline__ uint32_t group_lookback(unsigned long long* desc,
+        uint32_t g, uint32_t length) {
+    using Ref = cuda::atomic_ref<unsigned long long, cuda::thread_scope_device>;
+    constexpr unsigned long long partial = 1ull << 32, complete = 2ull << 32;
+    uint32_t base = 0;
+    if (g) {
+        Ref(desc[g]).store(partial | length, cuda::memory_order_release);
+        for (uint32_t i = g; i != 0;) {
+            Ref prev(desc[--i]);
+            unsigned long long word;
+            do { word = prev.load(cuda::memory_order_acquire); } while (!word);
+            base += static_cast<uint32_t>(word);
+            if (word & complete) break;
+        }
+    }
+    Ref(desc[g]).store(complete | (base + length), cuda::memory_order_release);
+    return base;
 }
 
 __device__ __forceinline__ uint32_t load_meta24(const byte* meta, uint32_t chunk) {
@@ -237,7 +261,8 @@ __launch_bounds__(TPB, 2048 / TPB)
 void encode_kernel(const byte* __restrict__ input,
     uint32_t input_bytes, const uint32_t* __restrict__ sign_bitmap, byte* __restrict__ slots,
     byte* __restrict__ sign_slots, byte* __restrict__ meta,
-    byte* __restrict__ cmpdata, unsigned int* __restrict__ group_done) {
+    byte* __restrict__ cmpdata, unsigned int* __restrict__ group_done,
+    unsigned long long* __restrict__ group_carry) {
     const uint32_t chunks = input_bytes / CS + (input_bytes % CS != 0U);
     __shared__ __align__(16) long long storage[STORAGE_BYTES / sizeof(long long)];
     constexpr int counter_slot = STORAGE_BYTES / sizeof(long long) - 2 - WS;
@@ -368,7 +393,7 @@ void encode_kernel(const byte* __restrict__ input,
         if (!zero)
             __syncthreads();
         // Publish the slot/metadata writes. Only the last block in a group
-        // acquires the other chunks and packs that group; no block spins.
+        // acquires the other chunks and packs that group.
         if (threadIdx.x == 0) {
             const uint32_t group = chunk / GROUP_CHUNKS;
             const uint32_t count = min(GROUP_CHUNKS, chunks - group * GROUP_CHUNKS);
@@ -410,8 +435,10 @@ void encode_kernel(const byte* __restrict__ input,
                 if (lane < group_count)
                     group_prefix[lane + 1u] = inclusive;
                 if (lane + 1u == group_count) {
-                    group_offset = inclusive ? atomicAdd(&payload_counter, inclusive) : 0U;
-                    group_offsets[group] = group_offset;
+                    group_offset = group_lookback(group_carry, group, inclusive);
+                    group_offsets[group] = inclusive ? group_offset : 0U;
+                    if (first + group_count == chunks)
+                        payload_size = group_offset + inclusive;
                 }
             }
             __syncthreads();
@@ -851,6 +878,7 @@ void release() {
         cudaFree(WZPConfig::sign_slots);
         cudaFree(WZPConfig::cmpdata);
         cudaFree(WZPConfig::group_done);
+        cudaFree(WZPConfig::group_carry);
         if (WZPConfig::timing_begin)
             cudaEventDestroy(WZPConfig::timing_begin);
         if (WZPConfig::timing_end)
@@ -864,6 +892,7 @@ void release() {
     WZPConfig::slots = WZPConfig::sign_slots = WZPConfig::cmpdata = nullptr;
     WZPConfig::blob_capacity = 0;
     WZPConfig::group_done = nullptr;
+    WZPConfig::group_carry = nullptr;
     WZPConfig::host_results = nullptr;
     WZPConfig::timing_begin = WZPConfig::timing_end = nullptr;
     WZPConfig::signed_payload_offset = 0;
@@ -887,6 +916,7 @@ void reserve(uint32_t n, cudaStream_t stream) {
                       (static_cast<size_t>(n) + 7u) / 8u;
     cudaMalloc(&WZPConfig::cmpdata, WZPConfig::blob_capacity);
     cudaMalloc(&WZPConfig::group_done, static_cast<size_t>(groups) * sizeof(uint32_t));
+    cudaMalloc(&WZPConfig::group_carry, static_cast<size_t>(groups) * sizeof(unsigned long long));
     cudaMallocHost(&WZPConfig::host_results, 2 * sizeof(uint32_t));
     cudaEventCreate(&WZPConfig::timing_begin);
     cudaEventCreate(&WZPConfig::timing_end);
@@ -1078,10 +1108,12 @@ void wzp_encode(const uint16_t* input, const uint32_t* sign_bitmap,
     const byte* const raw = reinterpret_cast<const byte*>(input);
     byte* const metadata = WZPConfig::cmpdata + metadata_offset;
     cudaEventRecord(WZPConfig::timing_begin, stream);
+    cudaMemsetAsync(WZPConfig::group_carry, 0, size_t(groups) * sizeof(unsigned long long), stream);
     encode_kernel<<<512, TPB, 0, stream>>>(raw, input_bytes, sign_bitmap,
-        WZPConfig::slots, WZPConfig::sign_slots, metadata, WZPConfig::cmpdata, WZPConfig::group_done);
+        WZPConfig::slots, WZPConfig::sign_slots, metadata, WZPConfig::cmpdata,
+        WZPConfig::group_done, WZPConfig::group_carry);
 
-    cudaMemcpyFromSymbolAsync(WZPConfig::host_results, payload_counter, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyFromSymbolAsync(WZPConfig::host_results, payload_size, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream);
     cudaMemcpyFromSymbolAsync(WZPConfig::host_results + 1, nnz_counter, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream);
     cudaEventRecord(WZPConfig::timing_end, stream);
     reset_counter_kernel<<<1, 1, 0, stream>>>();

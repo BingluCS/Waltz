@@ -1,7 +1,6 @@
 #include "waltz_cpu.h"
 #include "waltz.hpp"
 #include "utils/Blob.hpp"
-#include "canonicalize.h"
 
 #include <cuda_runtime.h>
 #include <chrono>
@@ -108,7 +107,7 @@ bool identities() {
     if (!sha256_file(actual, hash)) return false;
     std::printf("IDENTITY loaded_library=%s sha256=%s\n", actual, hash);
     const char* sources[] = {"src/waltz.cu", "include/utils/Blob.hpp", "include/transformers/all_halo.cuh",
-                              "include/transformers/halo3d.cuh", "src/small_pwe.cuh", "cpu/gpu/canonicalize.cu"};
+                              "include/transformers/halo3d.cuh", "src/small_pwe.cuh", "src/native_repairs.cuh"};
     for (const char* source : sources) {
         char path[PATH_MAX];
         std::snprintf(path, sizeof(path), "%s/%s", WALTZ_SOURCE_ROOT, source);
@@ -238,7 +237,7 @@ void run_case(Workspace& w, uint32_t nx, uint32_t ny, uint32_t nz, unsigned patt
     const size_t gpu_capacity = WALTZ::compressed_buffer_capacity<T>(n);
     const size_t capacity = cpu_capacity > gpu_capacity ? cpu_capacity : gpu_capacity;
     Host input(bytes), saved(bytes), cpu_decoded(bytes), gpu_decoded(bytes), alternate(bytes), archive(capacity), cpu_archive(capacity);
-    Device device_input(bytes), device_output(bytes), device_archive(capacity), device_canonical(capacity);
+    Device device_input(bytes), device_output(bytes), device_archive(capacity);
     fill(reinterpret_cast<T*>(input.data), cc, pattern);
     std::memcpy(saved.data, input.data, bytes);
     std::printf("CASE f%zu %ux%ux%u pattern=%u eb=%.17g\n", 8 * sizeof(T), nx, ny, nz, pattern, bound);
@@ -280,26 +279,13 @@ void run_case(Workspace& w, uint32_t nx, uint32_t ny, uint32_t nz, unsigned patt
         cc.backend = WALTZ_CPU_SCALAR;
     }
 
-    // GPU -> CPU. Portable mode requires exact *encoded* bytes after the GPU
-    // wrapper's measured canonicalization. Legacy mode exists only to check
-    // decoding of older optimized/compact archives; it is not byte-portable.
+    // The ordinary encoder must emit CPU-identical bytes with default settings.
     if (!cuda_ok(cudaMemcpy(device_input.data, input.data, bytes, cudaMemcpyHostToDevice), "upload original data")) return;
     const auto start = std::chrono::steady_clock::now();
-    if (legacy_profile) {
-        written = WALTZ::d_compress<T>(gc, static_cast<T*>(device_input.data), static_cast<char*>(device_archive.data), nullptr, nullptr);
-    } else {
-        if constexpr (sizeof(T) == 4)
-            rc = waltz_gpu_portable_compress_f32(reinterpret_cast<float*>(device_input.data), nx, ny, nz, bound,
-                                                 device_archive.data, capacity, &written, nullptr);
-        else rc = waltz_gpu_portable_compress_f64(reinterpret_cast<double*>(device_input.data), nx, ny, nz, bound,
-                                                  device_archive.data, capacity, &written, nullptr);
-        if (rc) std::fprintf(stderr, "portable GPU encode: %s\n", waltz_gpu_portable_last_error());
-        check(rc == 0, "portable GPU complete encoder");
-        if (rc) return;
-    }
+    written = WALTZ::d_compress<T>(gc, static_cast<T*>(device_input.data),
+                                  static_cast<char*>(device_archive.data), nullptr, nullptr);
     const double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    std::printf("  WALL GPU_%s_complete_encode_ms=%.6f includes_workspace_growth_canonicalize_verify_sync=%u\n",
-                legacy_profile ? "legacy" : "portable", wall_ms, legacy_profile ? 0 : 1);
+    std::printf("  WALL GPU_d_compress_ms=%.6f\n", wall_ms);
     check(written >= WALTZ::BlobSize && written <= capacity, "GPU archive length");
     if (written > capacity || written < WALTZ::BlobSize) return;
     if (!cuda_ok(cudaMemcpy(archive.data, device_archive.data, written, cudaMemcpyDeviceToHost), "download GPU archive")) return;
@@ -315,12 +301,14 @@ void run_case(Workspace& w, uint32_t nx, uint32_t ny, uint32_t nz, unsigned patt
             std::fprintf(stderr, "  archive mismatch CPU_bytes=%zu GPU_bytes=%zu first_difference=%zu\n", cpu_written, written, first);
             header(cpu_archive, cpu_written, "CPU-reference");
         }
-        size_t canonical_bytes = 0;
-        rc = waltz_gpu_canonicalize(device_archive.data, written, uint32_t(n), device_canonical.data,
-                                     capacity, &canonical_bytes, nullptr);
-        check(rc == 0 && canonical_bytes == written, "GPU canonicalizer idempotent length");
-        if (!rc && cuda_ok(cudaMemcpy(cpu_archive.data, device_canonical.data, written, cudaMemcpyDeviceToHost), "download idempotent canonical archive"))
-            check(!std::memcmp(cpu_archive.data, archive.data, written), "GPU canonicalizer idempotent bytes");
+        // Poison unused storage before encoding again so nondeterministic
+        // ordering or uncleared padding cannot accidentally compare equal.
+        if (!cuda_ok(cudaMemset(device_archive.data, 0xa5, capacity), "poison archive")) return;
+        const size_t repeat = WALTZ::d_compress<T>(gc, static_cast<T*>(device_input.data),
+                                                  static_cast<char*>(device_archive.data), nullptr, nullptr);
+        if (!cuda_ok(cudaMemcpy(archive.data, device_archive.data, written, cudaMemcpyDeviceToHost), "download repeated encoding")) return;
+        check(repeat == cpu_written && written == cpu_written && !std::memcmp(archive.data, cpu_archive.data, written),
+              "repeated ordinary encoding matches CPU archive");
     }
     const size_t gpu_bytes2 = WALTZ::d_decompress<T>(gc, static_cast<char*>(device_archive.data),
                                                    static_cast<T*>(device_output.data), nullptr, nullptr);
@@ -360,8 +348,7 @@ void suite(Workspace& w, bool full) {
         run_case<T>(w, 33, 31, 17, 4, 0.001);
         run_case<T>(w, 64, 64, 64, 2, 0.001);
         run_case<T>(w, 128, 96, 65, 3, 0.0001);
-        // Eligible for CUDA's default fused Z; the portable API must still
-        // use lifting and match CPU archive bytes and reconstructed bits.
+        // Eligible for optional compact fused Z; the default must match CPU.
         if constexpr (std::is_same_v<T,float>)
             run_case<T>(w, 72, 70, 25, 2, 0.001);
         // Exercise nonempty quantization-outlier index/value radix sorting;
@@ -398,9 +385,8 @@ int main(int argc, char** argv) {
     if (!identities()) { std::fprintf(stderr, "GPU/source identity check failed\n"); return 2; }
     if (identity_only) return failures ? 1 : 0; // Does not call the CUDA API.
     if (!legacy_profile) {
-        // Test process profile selection, not mutation hidden inside the API.
-        setenv("WALTZ_HALO3D", "all", 1);
-        setenv("WALTZ_SMALL_PWE_SCALE", "0", 1);
+        unsetenv("WALTZ_HALO3D");
+        unsetenv("WALTZ_SMALL_PWE_SCALE");
     }
     if (!nx || !ny || !nz || !(bound > 0) || !std::isfinite(bound)) return 2;
     if (!cuda_ok(cudaSetDevice(device), "select exclusively leased GPU")) return 2;

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -44,7 +45,7 @@ template<class T> void roundtrip(dim3 dims, bool constant, double offset, bool s
     for (const char* mode : {"0","16","64","default"}) {
         if (std::string(mode)=="default") unsetenv("WALTZ_SMALL_PWE_SCALE");
         else setenv("WALTZ_SMALL_PWE_SCALE",mode,1);
-        const double scale=std::string(mode)=="default" ? 64.0 : std::stod(mode);
+        const double scale=std::string(mode)=="default" ? 0.0 : std::stod(mode);
         const size_t bytes=WALTZ::d_compress<T>(config,source,archive,nullptr,stream);
         ck(cudaStreamSynchronize(stream));
         require(bytes<=capacity,"compressed capacity exceeded");
@@ -113,6 +114,18 @@ template<class T> void roundtrip(dim3 dims, bool constant, double offset, bool s
         require(rejected,"invalid compression precision was accepted");
     }
     unsetenv("WALTZ_SMALL_PWE_SCALE");
+    if (constant) {
+        const T nan=std::numeric_limits<T>::quiet_NaN();
+        ck(cudaMemcpyAsync(source,&nan,sizeof(nan),cudaMemcpyHostToDevice,stream));
+        bool rejected=false;
+        try { WALTZ::d_compress<T>(config,source,archive,nullptr,stream); }
+        catch(const std::runtime_error&) { rejected=true; }
+        require(rejected,"default encoder accepted a nonfinite input");
+        rejected=false;
+        try { WALTZ::d_compress<T>(config,source,reinterpret_cast<char*>(source),nullptr,stream); }
+        catch(const std::invalid_argument&) { rejected=true; }
+        require(rejected,"default encoder accepted overlapping buffers");
+    }
     ck(cudaFree(source));ck(cudaFree(decoded));ck(cudaFree(archive));ck(cudaStreamDestroy(stream));
 }
 
@@ -128,7 +141,7 @@ int main() try {
     const auto& prop=WALTZ::gpu_config().properties;
     const bool short_z_supported=prop.sharedMemPerBlockOptin>=65536U &&
         prop.sharedMemPerMultiprocessor>=3U*65536U;
-    // Eligible FP32 plane shape: default/compact uses fused Z, scale 0
+    // Eligible FP32 plane shape: opt-in compact uses fused Z, default/scale 0
     // keeps bit-portable lifting. The same FP64 geometry keeps lifting.
     roundtrip<float>(dim3(72,70,25),false,100.0,short_z_supported);
     roundtrip<double>(dim3(72,70,25),false,100.0);

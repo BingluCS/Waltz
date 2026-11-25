@@ -83,14 +83,27 @@ wzp = (root / 'src/lossless/wzp.cu').read_text().split('\nvoid release()')[0]
 wzp = header(wzp)
 wzp = edit(wzp, '#include <cuda/atomic>\n', '')
 wzp = edit(wzp, '#include "lossless/wzp.hpp"\n#include "utils/Config.hpp"\n', '')
-wzp = edit(wzp, '    byte* __restrict__ cmpdata, unsigned int* __restrict__ group_done) {',
+wzp = edit(wzp, '    byte* __restrict__ cmpdata, unsigned int* __restrict__ group_done,\n'
+                '    unsigned long long* __restrict__ group_carry) {',
 '''    unsigned int* __restrict__ next_chunk) {''')
 wzp = edit(wzp, '__global__\n__launch_bounds__(TPB, 2048 / TPB)\nvoid encode_kernel',
-                'template<bool ByteSigns=false>\n__global__\n__launch_bounds__(TPB, 2048 / TPB)\nvoid encode_kernel')
+                'template<bool PackedCodes=false>\n__global__\n__launch_bounds__(TPB, 2048 / TPB)\nvoid encode_kernel')
 wzp = edit(wzp, 'if ((sign_bitmap[global >> 5u] >> (global & 31u)) & 1u)',
-                'if (ByteSigns ? reinterpret_cast<const uint8_t*>(sign_bitmap)[global] != 0 : '
-                '((sign_bitmap[global >> 5u] >> (global & 31u)) & 1u) != 0)')
-beg = wzp.index('__device__ unsigned int payload_counter;')
+                '''const unsigned c=mag[i];
+                    if constexpr(PackedCodes) {
+                        const unsigned m=c&32767u;
+                        reinterpret_cast<uint16_t*>(raw)[i]=m==32767u?
+                            reinterpret_cast<const uint16_t*>(sign_bitmap)[global]:uint16_t(m);
+                    }
+                    if (PackedCodes ? bool(c>>15) : ((sign_bitmap[global >> 5u] >> (global & 31u)) & 1u) != 0)''')
+wzp = edit(wzp,'                encoded = input + base;', '''                if constexpr(PackedCodes){
+                    int bytes=int(raw_bytes);
+                    // RAW slots contain magnitudes, not the sign-tagged staging words.
+                    d_iBIT_2(bytes,transformed,raw,temp);
+                    __syncthreads();
+                    encoded=raw;
+                }else encoded=input+base;''')
+beg = wzp.index('__device__ unsigned int payload_size;')
 end = wzp.index('__device__ __forceinline__ uint32_t load_meta24', beg)
 wzp = wzp[:beg] + '''__device__ __forceinline__ uint32_t ballot32(bool pred) {
     return uint32_t(__ballot(pred) >> (threadIdx.x & 32u));
@@ -113,7 +126,19 @@ beg = wzp.index('        if (!zero)\n            __syncthreads();\n        // Pu
 end = wzp.index('\ntemplate <int DirectLayout', beg)
 wzp = wzp[:beg] + '        __syncthreads();\n    }\n}\n' + wzp[end:]
 wzp = shuffles(wzp)
-wzp = edit(wzp, '__ballot_sync(0xffffffffU, nz)', 'ballot32(nz)')
-wzp = edit(wzp, '__ballot_sync(0xffffffffU, neg)', 'ballot32(neg)')
+# A wave64 lane expands 16 consecutive sparse signs with one block prefix.
+# The writer still consumes exactly the original halfword sign bitmap.
+decode = wzp.index('template <int DirectLayout')
+helper = ((root / 'platform/hip/sign_groups.cuh').read_text() + '\n' +
+          (root / 'platform/hip/rze_full.cuh').read_text())
+begin = wzp.index('        const uint32_t lane = threadIdx.x & 31U;', wzp.index('const byte* packed_sign = source + stored_bytes;',decode))
+end = wzp.index('        if constexpr (DirectLayout != 0)', begin)
+wzp = (wzp[:decode] + helper + '\n' + wzp[decode:begin] +
+       '        expand_sign_groups(mag, elements, packed_sign, sign_bytes, temp);\n'
+       '        auto* const sign_words = reinterpret_cast<uint32_t*>(temp);\n' + wzp[end:])
+wzp = edit(wzp, '        d_iRZE_1(compressed_bytes, encoded, expanded, temp);',
+                '        if(raw_bytes==CS && stored_bytes>=4){\n'
+                '            rze_full(encoded,stored_bytes,expanded,temp);compressed_bytes=CS;\n'
+                '        }else d_iRZE_1(compressed_bytes, encoded, expanded, temp);')
 assert not re.search(r'__shfl\w*_sync|__ballot_sync|cuda::atomic', wzp)
 (out / 'wzp_hip.cuh').write_text('#pragma once\n' + wzp + '\n} } // namespaces\n')

@@ -45,8 +45,9 @@ size_t d_WALTZ_decompress(
 
 // The caller resolves REL to conf.absErrorBound before entering this API.
 // Transform mode follows SPERR's dimension-only rule; no data sampling is performed.
-// Eligible FP32 plane volumes use fused short-Z convolution by default. The
-// canonical portable wrapper selects native repair/lifting via WALTZ_SMALL_PWE_SCALE=0.
+// Default output uses all-level lifting and ordered native repairs, matching
+// CPU/HIP without a second compression API or post-encode verification decode.
+// CUDA-only compact repairs are opt-in (WALTZ_SMALL_PWE_SCALE=16 or 64).
 template <typename T>
 size_t d_compress(
     const WALTZ::Config& config, T* d_oridata, char* d_cmpData, const char* cmpPath, void* stream) {

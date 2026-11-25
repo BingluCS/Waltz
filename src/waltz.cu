@@ -10,6 +10,8 @@
 #include "utils/Statistics.hpp"
 #include "utils/def.hpp"
 #include "small_pwe.cuh"
+#include "native_repairs.cuh"
+#include <cfenv>
 
 #include <algorithm>
 #include <cmath>
@@ -98,6 +100,7 @@ static __global__ void gather_sections(unsigned char* output,WaltzBlobHeader hea
     const unsigned padding=unsigned((8U-(bytes&7U))&7U);
     if(blockIdx.x+1==plan.block_ends[section] && threadIdx.x<padding)
         dst[bytes+threadIdx.x]=0;
+    if (!src) return; // Sorted directly into this span; only its padding was needed.
     if(section==2 && plan.prepared_small && pos<sizeof(SmallPweHeader)) {
         // The first two threads synthesize the compact header while assembling
         // their disjoint 16-byte chunks. Never read its uninitialized workspace.
@@ -163,7 +166,7 @@ static thread_local CompressionOverlap compression_overlap;
 static double small_pwe_scale() {
     const char* value = std::getenv("WALTZ_SMALL_PWE_SCALE");
     if (value == nullptr)
-        return 64.0;
+        return 0.0; // Same native residuals as CPU and HIP by default.
     char* end = nullptr;
     const double scale = std::strtod(value, &end);
     if (end == value || *end != '\0' ||
@@ -176,7 +179,7 @@ static double small_pwe_scale() {
 // decode, so an environment change cannot silently change repair arithmetic.
 static unsigned halo3d_mode() {
     const char* value=std::getenv("WALTZ_HALO3D");
-    // Default uses all-level scheduling with a short plane-Z fast path.
+    // Default uses all-level lifting. Compact CUDA presets can use short plane-Z.
     // Explicit old modes remain available only for diagnostic ablations.
     if(value==nullptr || std::strcmp(value,"auto")==0 || std::strcmp(value,"all")==0 || std::strcmp(value,"both")==0)
         return 7U;
@@ -204,7 +207,7 @@ static size_t Waltz_gather(void* output, bool use_dyadic,
                      uint32_t qout_count, const uint32_t* quant_index,
                      const int32_t* quant_value, double repair_step, cudaStream_t stream,
                      bool halo_inverse, const unsigned char* prepared_small,
-                     uint32_t prepared_bytes, bool all_levels, bool fused_plane_z) {
+                     uint32_t prepared_bytes, bool all_levels, bool fused_plane_z, bool ordered) {
     WaltzBlobHeader hdr{};
     const auto synthesis = all_levels ? Synthesis::HaloAllLevels :
         halo_inverse ? Synthesis::HaloLifting3D : Synthesis::Convolution;
@@ -248,10 +251,20 @@ static size_t Waltz_gather(void* output, bool use_dyadic,
     uint32_t blocks=0;
     for (unsigned i=0;i<5;++i) {
         plan.sections[i]=sections[i];plan.offsets[i]=offset;
-        blocks+=static_cast<uint32_t>((sections[i].bytes+4095U)/4096U);
+        const bool sorted = ordered && ((i==1 || i==2) ? pwe_count>1 : i>=3 && qout_count>1);
+        if (sorted) plan.sections[i].data=nullptr;
+        blocks+=sorted ? unsigned((sections[i].bytes&7U)!=0)
+                       : static_cast<uint32_t>((sections[i].bytes+4095U)/4096U);
         plan.block_ends[i]=blocks;
         offset=blob_align(offset+sections[i].bytes);
     }
+    static thread_local CompressionWorkspace sort_scratch;
+    if (ordered && pwe_count>1)
+        check_pwe_cuda(native_repairs::write_pairs(pwe_index,pwe_error,pwe_count,
+            cmpdata+plan.offsets[1],cmpdata+plan.offsets[2],sort_scratch,stream));
+    if (ordered && qout_count>1)
+        check_pwe_cuda(native_repairs::write_pairs(quant_index,quant_value,qout_count,
+            cmpdata+plan.offsets[3],cmpdata+plan.offsets[4],sort_scratch,stream));
     gather_sections<<<std::max(blocks,1U),256,0,stream>>>(cmpdata,hdr,plan);
     check_pwe_cuda(cudaGetLastError());
     check_pwe_cuda(cudaStreamSynchronize(stream));
@@ -363,7 +376,21 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
     const double repair_scale = small_pwe_scale();
     const unsigned requested_halo = halo3d_mode();
     const bool all_levels=(requested_halo&4U)!=0;
-
+    const bool ordered=all_levels && repair_scale==0.0;
+    if (!config.dimx || !config.dimy || !config.dimz || config.dimx>UINT32_MAX/2U ||
+        config.dimy>(UINT32_MAX/2U)/config.dimx ||
+        config.dimz>(UINT32_MAX/2U)/(config.dimx*config.dimy) ||
+        config.num!=config.dimx*config.dimy*config.dimz || !d_oridata || !d_cmpData)
+        throw std::invalid_argument("Waltz: invalid buffers or shape for WZP");
+    const uintptr_t src_address=reinterpret_cast<uintptr_t>(d_oridata);
+    const uintptr_t dst_address=reinterpret_cast<uintptr_t>(d_cmpData);
+    if (src_address<=dst_address ? dst_address-src_address<config.num*sizeof(T)
+                                 : src_address-dst_address<compressed_buffer_capacity<T>(config.num))
+        throw std::invalid_argument("Waltz: input and output buffers overlap");
+    if (!(real_error>0) || !std::isfinite(quantity) || !(T(quantity)>0) ||
+        !std::isfinite(T(quantity)) || !std::isfinite(T(1.0/quantity)) ||
+        (ordered && std::fegetround()!=FE_TONEAREST))
+        throw std::invalid_argument("Waltz: invalid bound or rounding mode");
 
     const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     if (g_host_outlier_counts == nullptr)
@@ -560,7 +587,14 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
     cudaStreamWaitEvent(cuda_stream1, timer.end, 0);
     cudaMemsetAsync(d_cnt, 0, sizeof(unsigned int), cuda_stream1);
     cudaEventRecord(overlap_begin, cuda_stream1);
-    if(all_levels) {
+    if(ordered) {
+        // Native repairs do not use the compact-payload counter. Check the
+        // reconstructed value here; never decompress the completed archive.
+        allhalo::inverse(d_q,d_data,tmp_data,data_dims,levels_xy,levels_z,use_dyadic,
+            native_repairs::Emit<T>{d_oridata,real_error,T(real_error),d_cnt,d_poi,d_poe,pout_cap,packed_counter},
+            cuda_stream1);
+        check_pwe_cuda(cudaGetLastError());
+    } else if(all_levels) {
         allhalo::inverse(
             d_q,d_data,tmp_data,data_dims,levels_xy,levels_z,use_dyadic,
             CDF97::Halo3DSynthEmit<T,true>{nullptr,d_oridata,real_error,std::nextafter(float(real_error),0.0f),d_cnt,d_poi,d_poe,pout_cap},cuda_stream1,fused_plane_z);
@@ -597,6 +631,8 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
     cudaEventElapsedTime(&pack_ms,compression_overlap.reconstructed,overlap_done);
     const unsigned int no = g_host_outlier_counts[0];
     const unsigned int nqo = g_host_outlier_counts[1];
+    if (ordered && (g_host_outlier_counts[2] || no>pout_cap || nqo>qout_cap))
+        throw std::runtime_error("Waltz: nonfinite input, pointwise bound failure or repair capacity exceeded");
     // The contiguous result-count copy above is a synchronization point.
     // Querying the already-complete events here preserves the
     // per-stage kernel timings without inserting bubbles between
@@ -607,7 +643,7 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
     // ---- assemble the compressed blob into d_cmpData (header + sections) ----
     blob_bytes = Waltz_gather<T>(d_cmpData, use_dyadic, reorder_bz, levels_xy, levels_z, quantity,
         static_cast<size_t>(magc), pwe_count, d_poi, d_poe, qout_count, d_qoi, d_qov,
-        repair_step,cuda_stream,halo_inverse,packed_storage,g_host_outlier_counts[2],all_levels,fused_plane_z);
+        repair_step,cuda_stream,halo_inverse,packed_storage,g_host_outlier_counts[2],all_levels,fused_plane_z,ordered);
 
     Waltz_print_compression<T>(bytes,
         {build_rank ? block_rank_timer.elapsed_ready() : 0.0, gpu_predict_ms, t_quant, t_mag, t_idwt, double(pack_ms)},

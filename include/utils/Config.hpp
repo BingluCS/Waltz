@@ -77,6 +77,7 @@ struct WZPConfig {
     static inline unsigned char* sign_slots = nullptr;
     static inline unsigned char* cmpdata = nullptr;
     static inline uint32_t* group_done = nullptr;
+    static inline unsigned long long* group_carry = nullptr;
     static inline size_t blob_capacity = 0;
     static inline uint32_t* host_results = nullptr;
     // Shared by serialized WZP operations; finish signed encode before reuse.

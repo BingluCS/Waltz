@@ -11,25 +11,30 @@ codec and a separate native AMD/DCU HIP backend.
 - The level count for each axis group is computed from its dimensions, capped
   at five. Equal XY and Z level counts select dyadic (XYZ at each level);
   otherwise plane applies all Z levels then all XY levels. No data sampling.
-- CUDA uses native halo/lifting across levels. Eligible FP32 planes with
+- CUDA defaults to native halo/lifting across levels. With compact repairs
+  explicitly enabled, eligible FP32 planes with
   `17 <= nz <= 128`, `nx % 4 == 0`, at least 64 XY columns, nonzero XY
   levels, and a GPU with at least 64 KiB opt-in shared memory per block and
   192 KiB per SM use one full-column convolution kernel per Z direction.
   Other shapes and FP64 retain lifting. Decode reverses the encoded schedule.
 - Finalized coefficients are quantized and reordered together. WZP decodes
   signed magnitudes directly into dequantized, row-major coefficients.
+  The CUDA encoder uses LC-style decoupled lookback across 16-chunk groups:
+  payload offsets follow logical group order, not CTA completion order.
+  This orders the WZP stream, not the separate repair records.
   Reusable scratch, timing events and geometry-dependent lookup tables are
   cached; every call recomputes coefficients and repair positions.
-- CUDA defaults to compact error repairs (`WALTZ_SMALL_PWE_SCALE=64`),
-  with native residual fallback. Scale `16` selects the coarser preset.
-  Scale `0` keeps native residuals and lifting for the portable profile.
+- The ordinary CUDA `WALTZ::d_compress` writes native residuals by default
+  and orders the sparse side records by index as it assembles the output.
+  This is the CPU/HIP byte-identical profile; no separate compression API or
+  post-encode decode is required. Scales `16` and `64` are explicit CUDA-only
+  compact-repair presets; their bytes need not match the default.
 
 The native archive header is 32 bytes with no magic or version field. A flag
 selects the matching inverse arithmetic; files made by the former workshop
-layout are not supported. The default CUDA output is **not** the canonical
-CPU/CUDA/HIP profile. The [portable build instructions](cpu/README.md)
-describe the explicit native-repair entry points for byte-identical encoding
-and interchange. WAW2, benchmark archives and prebuilt binaries are not
+layout are not supported. The [interoperability test instructions](cpu/README.md)
+show how to compare CPU and CUDA archives and verify both decoders.
+WAW2, benchmark archives and prebuilt binaries are not
 included in this checkout.
 
 ## Build

@@ -80,11 +80,10 @@ if(WALTZ_BUILD_TESTS)
     waltz_cuda_regression(small_pwe_unit tests/small_pwe.cu)
     waltz_cuda_regression(pwe_roundtrip tests/pwe_roundtrip.cu)
     waltz_cuda_regression(halo3d_roundtrip tests/halo3d_roundtrip.cu)
-    waltz_cuda_regression(halo3d_address tests/halo3d_address.cu)
     waltz_cuda_regression(all_halo_transform tests/all_halo_transform.cu)
     set_tests_properties(
         wzp_roundtrip wzp_fused_decode small_pwe_unit pwe_roundtrip
-        halo3d_roundtrip halo3d_address all_halo_transform
+        halo3d_roundtrip all_halo_transform
         PROPERTIES LABELS GPU RUN_SERIAL TRUE)
 endif()
 

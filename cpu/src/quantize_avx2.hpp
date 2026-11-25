@@ -2,7 +2,6 @@
 #define WALTZ_CPU_QUANTIZE_AVX2_HPP
 
 #include <cstdint>
-#include <cstddef>
 
 namespace waltz_cpu_detail {
 
@@ -36,15 +35,6 @@ bool quantize_f32(float* data, std::uint32_t n, float native_q, float native_inv
 bool quantize_f64(double* data, std::uint32_t n, double native_q, double native_inv,
                    std::int32_t* signed_magnitudes) noexcept;
 bool quantize_has_avx2() noexcept;
-// Brick-local quantization and immediate Morton transport; no volume temporary.
-bool quantize_morton_f32(float* data, uint32_t row, size_t plane,
- uint32_t nx,uint32_t ny,uint32_t nz,const uint16_t* rank,size_t base,
- float q,float inv,uint16_t* mag,uint32_t* sign,uint32_t* qi,uint32_t* qv,
- uint32_t& count,size_t origin) noexcept;
-bool quantize_morton_f64(double* data, uint32_t row, size_t plane,
- uint32_t nx,uint32_t ny,uint32_t nz,const uint16_t* rank,size_t base,
- double q,double inv,uint16_t* mag,uint32_t* sign,uint32_t* qi,uint32_t* qv,
- uint32_t& count,size_t origin) noexcept;
 
 } // namespace waltz_cpu_detail
 #endif

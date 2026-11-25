@@ -15,7 +15,6 @@ fi
 set -u
 native_flags=()
 if [[ ${WALTZ_HIP_TRACE:-0} == 1 ]]; then native_flags+=(-DWALTZ_HIP_TRACE); fi
-export WALTZ_HIP_FAST_ADDRESS=${WALTZ_HIP_FAST_ADDRESS:-1}
 python3 "$src/generate.py" "$root" "$out/generated"
 gccdir=$(dirname "$(g++ -print-libgcc-file-name)")
 hipcc --gcc-install-dir="$gccdir" --offload-arch="$arch" -std=c++17 -O3 -ffp-contract=off -fno-fast-math \

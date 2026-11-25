@@ -19,8 +19,9 @@ output. The HIP decoder does not support the optional CUDA-only compact
 repairs or fused short-Z convolution. See the [interop tests](../../cpu/README.md).
 
 On wave64 devices, the XY lifting kernels use a full wave for sufficiently
-wide FP32/FP64 forward strips and FP32 inverse strips. On one-plane inputs
-the waves own adjacent Y strips. A plane inverse reads the even/even band
+wide FP32/FP64 forward strips and FP32 inverse strips. A block usually spans
+adjacent Z planes. If more than half its subgroups would be idle and enough Y
+strips are available, the block spans Y instead. A plane inverse reads the even/even band
 from the previously reconstructed low-pass plane when present; other bands
 still come from the immutable coefficients. Smaller levels retain their
 narrower or generic kernels. The encoder marks pointwise

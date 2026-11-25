@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Materialize the HIP subset of the CUDA backend, without modifying CUDA."""
 import re
-import os
 import sys
 from pathlib import Path
 
@@ -46,12 +45,11 @@ warp = edit(warp, '''    #pragma unroll
 
 halo = (root / 'include/transformers/halo3d.cuh').read_text().split('// XY transforms of halo-expanded')[0]
 halo = edit(halo, '#include "warp97.cuh"', '#include "warp97_hip.cuh"')
-if os.getenv('WALTZ_HIP_FAST_ADDRESS') == '1':
-    # The HIP subset uses only fixed halo tiles: x overread <=59, y/z <=19.
-    # Supported volumes fit in uint32, so the GPU element offsets do too.
-    halo = edit(halo, 'if(n>=128) {', 'if(n>=64) {')
-    halo = edit(halo, 'const int r=periodic_mirror(p,n); return r/2+(r%2?(n+1)/2:0);',
-                'const int r=mirror(p,n); return r/2+((r&1)?(n+1)/2:0);')
+# The HIP subset uses only fixed halo tiles: x overread <=59, y/z <=19.
+# Supported volumes fit in uint32, so the GPU element offsets do too.
+halo = edit(halo, 'if(n>=128) {', 'if(n>=64) {')
+halo = edit(halo, 'const int r=periodic_mirror(p,n); return r/2+(r%2?(n+1)/2:0);',
+            'const int r=mirror(p,n); return r/2+((r&1)?(n+1)/2:0);')
 halo = edit(halo, '''    #pragma unroll
     for(int j=0;j<P;++j) {e[j]*=Constants<T>::IK; o[j]*=-Constants<T>::K;}
     #pragma unroll
@@ -68,12 +66,12 @@ halo = edit(halo, '''    #pragma unroll
 (out / 'halo3d_hip.cuh').write_text(halo + '} // namespace halo3d\n')
 
 fused = (root / 'include/transformers/all_halo.cuh').read_text()
-if os.getenv('WALTZ_HIP_FAST_ADDRESS') == '1':
-    fused = edit(fused, 'return (size_t(z)*full.y+y)*full.x+x;',
-                 'return (uint32_t(z)*full.y+uint32_t(y))*full.x+uint32_t(x);')
+fused = edit(fused, 'return (size_t(z)*full.y+y)*full.x+x;',
+             'return (uint32_t(z)*full.y+uint32_t(y))*full.x+uint32_t(x);')
 begin = fused.index('namespace WALTZ::allhalo {')
 end = fused.index('template<class T,bool Regular', begin)
-kernels = fused.index('template<int Z,class T,class Emit> __global__ void forward_xyz', end)
+# Both native and batched HIP transforms use the split XY/Z kernels.
+kernels = fused.index('template<class T,bool Inverse,class Emit,bool Batch=false> __global__ void xy', end)
 stop = fused.index('template<class T,bool Forward,class Emit> __global__ void identity', kernels)
 (out / 'fused_hip.cuh').write_text('#pragma once\n#include "halo3d_hip.cuh"\n'
                                  + fused[begin:end] + fused[kernels:stop] + '} // namespace\n')

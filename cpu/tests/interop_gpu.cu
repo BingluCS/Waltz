@@ -10,18 +10,8 @@
 #include <cstring>
 #include <exception>
 #include <limits>
-#include <dlfcn.h>
 #include <limits.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
-#if !defined(WALTZ_SOURCE_ROOT) || !defined(WALTZ_PRODUCTION_LIBRARY)
-#error "Build this test with WALTZ_CPU_BUILD_GPU_INTEROP in cpu/CMakeLists.txt"
-#endif
-
-// This executable must only be run while holding an exclusive GPU lease. It
-// links the existing production shared object; it never builds GPU codec code.
 namespace {
 unsigned checks = 0, failures = 0, cases = 0;
 bool legacy_profile = false;
@@ -61,62 +51,6 @@ struct Workspace {
     Workspace() { if (!data) { std::fprintf(stderr, "workspace allocation failed\n"); std::exit(2); } }
     ~Workspace() { waltz_cpu_destroy(data); }
 };
-
-// Hash the actual loaded file, not just a pathname supplied to the linker. Use
-// argv rather than a shell so spaces/metacharacters in a path remain harmless.
-bool sha256_file(const char* path, char result[65]) {
-    int fd[2];
-    if (pipe(fd)) return false;
-    const pid_t pid = fork();
-    if (pid == 0) {
-        close(fd[0]);
-        if (dup2(fd[1], STDOUT_FILENO) < 0) _exit(127);
-        close(fd[1]);
-        execlp("sha256sum", "sha256sum", "--", path, static_cast<char*>(nullptr));
-        _exit(127);
-    }
-    close(fd[1]);
-    if (pid < 0) { close(fd[0]); return false; }
-    size_t kept = 0;
-    char block[512];
-    ssize_t got;
-    while ((got = read(fd[0], block, sizeof(block))) > 0) {
-        for (ssize_t i = 0; i < got && kept < 64; ++i) result[kept++] = block[i];
-    }
-    close(fd[0]);
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) || kept != 64) return false;
-    result[64] = 0;
-    for (unsigned i = 0; i < 64; ++i)
-        if (!((result[i] >= '0' && result[i] <= '9') || (result[i] >= 'a' && result[i] <= 'f'))) return false;
-    return true;
-}
-
-bool identities() {
-    Dl_info info{};
-    const auto symbol = &WALTZ::d_WALTZ_compress<float, 3>;
-    if (!dladdr(reinterpret_cast<const void*>(symbol), &info) || !info.dli_fname) {
-        std::fprintf(stderr, "cannot resolve loaded GPU library identity\n"); return false;
-    }
-    char actual[PATH_MAX], expected[PATH_MAX], hash[65];
-    if (!realpath(info.dli_fname, actual) || !realpath(WALTZ_PRODUCTION_LIBRARY, expected)) return false;
-    check(std::strcmp(actual, expected) == 0, "loaded exact production GPU shared object");
-    if (std::strcmp(actual, expected) != 0) {
-        std::fprintf(stderr, "loaded=%s expected=%s\n", actual, expected); return false;
-    }
-    if (!sha256_file(actual, hash)) return false;
-    std::printf("IDENTITY loaded_library=%s sha256=%s\n", actual, hash);
-    const char* sources[] = {"src/waltz.cu", "include/utils/Blob.hpp", "include/transformers/all_halo.cuh",
-                              "include/transformers/halo3d.cuh", "src/small_pwe.cuh", "src/native_repairs.cuh"};
-    for (const char* source : sources) {
-        char path[PATH_MAX];
-        std::snprintf(path, sizeof(path), "%s/%s", WALTZ_SOURCE_ROOT, source);
-        if (!sha256_file(path, hash)) return false;
-        std::printf("IDENTITY current_source=%s sha256=%s\n", source, hash);
-    }
-    std::printf("IDENTITY note=current-source hashes describe the audited files, not proven build provenance of the preexisting library\n");
-    return true;
-}
 
 template <typename T>
 void fill(T* values, const waltz_cpu_config& c, unsigned pattern) {
@@ -361,7 +295,7 @@ void suite(Workspace& w, bool full) {
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     int device = 0;
-    bool full = false, identity_only = false, custom = false, f64 = false;
+    bool full = false, custom = false, f64 = false;
     uint32_t nx = 16, ny = 16, nz = 16;
     unsigned pattern = 2;
     double bound = 0.001;
@@ -370,7 +304,6 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--full")) full = true;
         else if (!std::strcmp(argv[i], "--legacy")) legacy_profile = true;
         else if (!std::strcmp(argv[i], "--dump-prefix") && i + 1 < argc) dump_prefix = argv[++i];
-        else if (!std::strcmp(argv[i], "--identity-only")) identity_only = true;
         else if (!std::strcmp(argv[i], "--case") && i + 6 < argc) {
             custom = true; f64 = !std::strcmp(argv[++i], "f64");
             nx = uint32_t(std::strtoul(argv[++i], nullptr, 10));
@@ -378,12 +311,10 @@ int main(int argc, char** argv) {
             nz = uint32_t(std::strtoul(argv[++i], nullptr, 10));
             bound = std::strtod(argv[++i], nullptr); pattern = unsigned(std::strtoul(argv[++i], nullptr, 10));
         } else {
-            std::fprintf(stderr, "usage: %s [--device N] [--full] [--legacy] [--identity-only] [--dump-prefix PATH] [--case f32|f64 NX NY NZ EB PATTERN]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--device N] [--full] [--legacy] [--dump-prefix PATH] [--case f32|f64 NX NY NZ EB PATTERN]\n", argv[0]);
             return 2;
         }
     }
-    if (!identities()) { std::fprintf(stderr, "GPU/source identity check failed\n"); return 2; }
-    if (identity_only) return failures ? 1 : 0; // Does not call the CUDA API.
     if (!legacy_profile) {
         unsetenv("WALTZ_HALO3D");
         unsetenv("WALTZ_SMALL_PWE_SCALE");

@@ -199,25 +199,14 @@ template<class T> size_t encode(waltz_cpu_workspace& w,const waltz_cpu_config& c
     std::memcpy(b.data,input,size_t(n)*sizeof(T));
     transform(b.data,b.scratch,s,lx,lz,dyadic,2,avx,false);
     std::memset(b.sign,0,((size_t(n)+31)/32)*4);
-    if(avx&&!WALTZ_CPU_FUSED_QUANTIZE){
+    if(avx){
         auto* temporary=reinterpret_cast<int32_t*>(b.scratch);bool valid;
         if constexpr(sizeof(T)==4)valid=quantize_f32(b.data,n,q,inv,temporary);
         else valid=quantize_f64(b.data,n,q,inv,temporary);
         if(!valid)fail("coefficient exceeds portable integer conversion domain");
     }
     uint32_t nq=0,np=0;
-    if(avx&&WALTZ_CPU_FUSED_QUANTIZE){
-        ranks(w,s,bz);size_t base=0,plane=size_t(s.nx)*s.ny;
-        for(uint32_t z=0;z<s.nz;z+=bz)for(uint32_t y=0;y<s.ny;y+=16)for(uint32_t x=0;x<s.nx;x+=16){
-            uint32_t nx=std::min(16U,s.nx-x),ny=std::min(16U,s.ny-y),nz=std::min(bz,s.nz-z);
-            unsigned slot=unsigned(nx!=16)|(unsigned(ny!=16)<<1)|(unsigned(nz!=bz)<<2);
-            size_t origin=size_t(z)*plane+size_t(y)*s.nx+x;bool valid;
-            if constexpr(sizeof(T)==4)valid=quantize_morton_f32(b.data+origin,s.nx,plane,nx,ny,nz,w.rank+slot*8192,base,q,inv,b.mag,b.sign,b.qidx,b.qval,nq,origin);
-            else valid=quantize_morton_f64(b.data+origin,s.nx,plane,nx,ny,nz,w.rank+slot*8192,base,q,inv,b.mag,b.sign,b.qidx,b.qval,nq,origin);
-            if(!valid)fail("coefficient exceeds portable integer conversion domain");
-            base+=size_t(nx)*ny*nz;
-        }
-    }else traverse(w,s,bz,[&](size_t at,size_t packed){
+    traverse(w,s,bz,[&](size_t at,size_t packed){
         bool negative;int32_t mag;
         if(avx){
             int32_t v;std::memcpy(&v,reinterpret_cast<const uint8_t*>(b.scratch)+at*4,4);

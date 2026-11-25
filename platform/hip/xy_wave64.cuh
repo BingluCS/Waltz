@@ -27,14 +27,21 @@ __device__ __forceinline__ void horizontal_pair(T& e,T& o) {
     }
 }
 
-template<bool Inverse,int Width,int Rows,bool Flat=false,bool Pairs=false,class T,class Emit>
+template<bool Inverse,int Width,int Rows,bool PackRows=false,bool Pairs=false,class T,class Emit>
 __global__ void xy_strip(WALTZ::allhalo::Read<T> src,dim3 n,Emit out) {
     constexpr int P=Rows/2+4;
     constexpr int Cols=2*Width-8;
-    const int lane=threadIdx.x%Width,w=threadIdx.x/Width;
-    const int z=Flat?0:int((256/Width)*blockIdx.z+w);
-    const int strip=Flat?int((256/Width)*blockIdx.y+w):int(blockIdx.y);
-    if(z>=n.z || strip*Rows>=n.y)return;
+    constexpr int groups=256/Width;
+    const int lane=threadIdx.x%Width,group=threadIdx.x/Width;
+    const int z=PackRows?int(blockIdx.z):int(groups*blockIdx.z+group);
+    const int strip=PackRows?int(groups*blockIdx.y+group):int(blockIdx.y);
+    if((!PackRows && z>=n.z) || strip*Rows>=n.y)return;
+    // Row-packed blocks own a plane. Share its offset across the lifting taps.
+    const unsigned plane=PackRows?unsigned(z)*src.full.x*src.full.y:0u;
+    auto xy_index=[&](int col,int row) -> size_t {
+        if constexpr(PackRows)return plane+unsigned(row)*src.full.x+unsigned(col);
+        else return src.index(col,row,z);
+    };
     const int x=int(blockIdx.x)*Cols-4+2*lane,y0=strip*Rows-4;
     const int xl=strip_index<Inverse>(x,n.x);
     const int xr=strip_index<Inverse>(x+1,n.x);
@@ -43,12 +50,12 @@ __global__ void xy_strip(WALTZ::allhalo::Read<T> src,dim3 n,Emit out) {
     for(int k=0;k<P;++k){
         const int ya=strip_index<Inverse>(y0+2*k,n.y);
         const int yb=strip_index<Inverse>(y0+2*k+1,n.y);
-        const T* a=src.base+src.index(0,ya,z), *b=src.base+src.index(0,yb,z);
+        const T* a=src.base+xy_index(0,ya), *b=src.base+xy_index(0,yb);
         // Reflection preserves parity. In a multi-level plane inverse only
         // even X / even Y reads the reconstructed LL plane (all z); high
         // bands still come from the original coefficient buffer.
         const T* ll=Inverse&&src.low?src.low:src.base;
-        e[k]=ll[src.index(xl,ya,z)];ee[k]=a[xr];o[k]=b[xl];oo[k]=b[xr];
+        e[k]=ll[xy_index(xl,ya)];ee[k]=a[xr];o[k]=b[xl];oo[k]=b[xr];
         if constexpr(Inverse){horizontal_pair<true,Width>(e[k],ee[k]);horizontal_pair<true,Width>(o[k],oo[k]);}
     }
     if constexpr(Inverse){halo3d::sz(e,o);halo3d::sz(ee,oo);}
@@ -60,19 +67,19 @@ __global__ void xy_strip(WALTZ::allhalo::Read<T> src,dim3 n,Emit out) {
         if(lane>=2&&lane<Width-2&&x<n.x&&y<n.y){
             if constexpr(Inverse){
                 if constexpr(Pairs){
-                    const unsigned at=src.index(x,y,z);
+                    const unsigned at=xy_index(x,y);
                     out.pair(e[k],ee[k],at);
                     if(y+1<n.y)out.pair(o[k],oo[k],at+src.full.x);
                 }else{
-                    out(e[k],src.index(x,y,z));if(x+1<n.x)out(ee[k],src.index(x+1,y,z));
-                    if(y+1<n.y){out(o[k],src.index(x,y+1,z));if(x+1<n.x)out(oo[k],src.index(x+1,y+1,z));}
+                    out(e[k],xy_index(x,y));if(x+1<n.x)out(ee[k],xy_index(x+1,y));
+                    if(y+1<n.y){out(o[k],xy_index(x,y+1));if(x+1<n.x)out(oo[k],xy_index(x+1,y+1));}
                 }
             }else{
                 const int lx=x>>1,hx=((n.x+1)>>1)+lx,ly=y>>1,hy=((n.y+1)>>1)+ly;
-                out(e[k],src.index(lx,ly,z),lx,ly,z);
-                if(x+1<n.x)out(ee[k],src.index(hx,ly,z),hx,ly,z);
-                if(y+1<n.y){out(o[k],src.index(lx,hy,z),lx,hy,z);
-                    if(x+1<n.x)out(oo[k],src.index(hx,hy,z),hx,hy,z);}
+                out(e[k],xy_index(lx,ly),lx,ly,z);
+                if(x+1<n.x)out(ee[k],xy_index(hx,ly),hx,ly,z);
+                if(y+1<n.y){out(o[k],xy_index(lx,hy),lx,hy,z);
+                    if(x+1<n.x)out(oo[k],xy_index(hx,hy),hx,hy,z);}
             }
         }
     }

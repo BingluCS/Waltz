@@ -145,40 +145,5 @@ bool quantize_f64(double* data, std::uint32_t n, double q, double inv, std::int3
 #endif
     return scalar(data, 0, n, q, inv, codes);
 }
-template<class T> bool quantize_morton(T* data,uint32_t row,size_t plane,
- uint32_t nx,uint32_t ny,uint32_t nz,const uint16_t* rank,size_t base,
- T q,T inv,uint16_t* mag,uint32_t* sign,uint32_t* qi,uint32_t* qv,
- uint32_t& count,size_t origin) noexcept {
-    alignas(32) int32_t codes[16];
-    if(nx>16||!valid_arguments(data,nx,q,inv,codes))return false;
-    const bool avx=quantize_has_avx2();
-    for(uint32_t z=0;z<nz;++z)for(uint32_t y=0;y<ny;++y){
-        const size_t at=size_t(z)*plane+size_t(y)*row;
-        bool ok;
-#if WALTZ_QUANT_X86
-        if(avx){
-            if constexpr(sizeof(T)==4)ok=vector_f32(data+at,nx,q,inv,codes);
-            else ok=vector_f64(data+at,nx,q,inv,codes);
-        }else
-#endif
-        ok=scalar(data+at,0,nx,q,inv,codes);
-        if(!ok)return false;
-        for(uint32_t x=0;x<nx;++x){
-            const int32_t v=codes[x];const uint32_t m=v<0?uint32_t(-v):uint32_t(v);
-            const size_t packed=base+rank[(z*ny+y)*nx+x];
-            mag[packed]=uint16_t(m>65535?65535:m);
-            if(v<0)sign[packed/32]|=1U<<(packed%32);
-            if(m>65535){qi[count]=uint32_t(origin+at+x);qv[count++]=m;}
-        }
-    }
-    return true;
-}
-#define MORTON_WRAPPER(S,T) \
-bool quantize_morton_##S(T* d,uint32_t row,size_t plane,uint32_t nx,uint32_t ny,uint32_t nz, \
- const uint16_t* r,size_t base,T q,T inv,uint16_t* m,uint32_t* s,uint32_t* qi,uint32_t* qv, \
- uint32_t& count,size_t origin) noexcept { \
- return quantize_morton(d,row,plane,nx,ny,nz,r,base,q,inv,m,s,qi,qv,count,origin); }
-MORTON_WRAPPER(f32,float)
-MORTON_WRAPPER(f64,double)
-#undef MORTON_WRAPPER
+
 } // namespace waltz_cpu_detail

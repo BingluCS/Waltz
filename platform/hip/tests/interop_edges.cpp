@@ -65,6 +65,7 @@ int main() try{
     auto cpu=std::unique_ptr<waltz_cpu_workspace,decltype(&waltz_cpu_destroy)>(waltz_cpu_create(),waltz_cpu_destroy);
     ok(gpu&&cpu,"session creation");unsigned tests=0;
     for(Shape d:{Shape{1,1,1},{31,1,1},{32,1,1},{33,1,1},{23,89,1},{16,16,8},{3,683,1},
+                 {95,83,2},{139,101,3},{139,101,4},
                  {127,63,16},{128,64,16},{129,65,17},{128,128,64},
                  {128,128,119},{132,129,135},{136,129,143},{130,128,121}}){
         for(unsigned p:{1u,0u}){

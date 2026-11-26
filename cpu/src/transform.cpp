@@ -362,9 +362,7 @@ WALTZ_CPU_AVX2 void axis_simd(T* data, T* scratch, Shape full, Shape active) {
 #define WALTZ_LINE_SCALAR 1
 #define WALTZ_LINE_TARGET
 #define whole_line whole_line_scalar
-#define compatibility_edges compatibility_edges_scalar
 #include "transform_nohalo.inc"
-#undef compatibility_edges
 #undef whole_line
 #undef WALTZ_LINE_TARGET
 #undef WALTZ_LINE_SCALAR

@@ -150,6 +150,8 @@ void roundtrip(Workspace& w, uint32_t nx, uint32_t ny, uint32_t nz, unsigned pat
     if (!decode(w, c, scalar, written, output, "scalar decode")) return;
     check(within_bound(reinterpret_cast<T*>(input.data), reinterpret_cast<T*>(output.data), n, bound, &max_error),
           "strict pointwise absolute error");
+    // Different destination contents expose accidentally unwritten archive padding.
+    std::memset(other.data,0x5a,other.size);
     rc = waltz_cpu_compress(w.value, &c, input.data, other.data, other.size, &written2);
     check(rc == 0 && written == written2 && std::memcmp(scalar.data, other.data, written) == 0,
           "reused workspace deterministic scalar archive");

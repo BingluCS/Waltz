@@ -49,10 +49,8 @@ struct Trace {
     void finish(){}
 #endif
 };
-size_t align8(size_t bytes){return (bytes+7)&~size_t(7);}
 unsigned blocks(size_t n,unsigned b=Threads){return unsigned((n+b-1)/b);}
 unsigned half(unsigned n){return (n+1)/2;}
-unsigned levels(unsigned n){unsigned l=0;while(n>8&&l<5){n=half(n);++l;}return l;}
 struct Profile {dim3 dims;uint32_t n,bz,lx,lz;bool dyadic;};
 bool regular_morton(Profile p){
     return p.dims.x%16==0&&p.dims.y%16==0&&p.dims.z%p.bz==0&&!(p.bz&(p.bz-1));
@@ -60,7 +58,7 @@ bool regular_morton(Profile p){
 Profile profile(const waltz_hip_config& c){
     require(c.width==4||c.width==8,"unsupported dtype");
     require(c.x&&c.y&&c.z&&uint64_t(c.x)*c.y<=uint64_t(INT32_MAX)/unsigned(c.width)/c.z,"invalid or oversized shape");
-    const unsigned lx=levels(std::min(c.x,c.y)),lz=levels(c.z);
+    const unsigned lx=WALTZ::dwt_levels(std::min(c.x,c.y)),lz=WALTZ::dwt_levels(c.z);
     const dim3 dims(c.x,c.y,c.z);
     return {dims,c.x*c.y*c.z,wzp::select_block_zband(dims,lz,lx==lz),lx,lz,lx==lz};
 }
@@ -78,11 +76,6 @@ struct Device {
 };
 using Header=WALTZ::WaltzBlobHeader;
 using WALTZ::BlobSize;
-struct Layout{
-    size_t pi,pv,qi,qv,end;
-    Layout(const Header& h):pi(align8(BlobSize+h.mag_comp_bytes)),pv(align8(pi+size_t(h.n_pwe)*4)),
-        qi(align8(pv+h.pwe_bytes)),qv(align8(qi+size_t(h.n_qo)*4)),end(align8(qv+size_t(h.n_qo)*4)){}
-};
 struct Stats {u64 side;unsigned payload,status;};
 struct HostReceipt {Header header;Stats stats;unsigned status;};
 }
@@ -602,7 +595,7 @@ size_t encode(waltz_hip_session& w,const waltz_hip_config& c,const T* src,uint8_
     h.mag_comp_bytes=size_t(groups)*4+size_t(chunks)*3+host.payload;
     h.n_pwe=uint32_t(host.side);h.n_qo=uint32_t(host.side>>32);h.pwe_bytes=h.n_pwe*sizeof(T);
     require(!(n>(1u<<20)&&h.n_qo>=(1u<<20))&&!(n>(1u<<22)&&h.n_pwe>=(1u<<22)),"portable side-channel capacity reached");
-    Layout l(h);require(l.end<=cap,"archive capacity too small");
+    const auto l=WALTZ::BlobLayout::checked(h);require(l.end<=cap,"archive capacity too small");
     prefix_header<<<1,64>>>(dst,h,l.pi,l.pv,l.qi,l.qv);launch_check();
     write_wzp<<<blocks(chunks,4),Threads>>>(dst+BlobSize,meta,slots,ss,nw,ow,n,chunks,groups);launch_check();
     trace.mark("write_records");
@@ -627,7 +620,7 @@ template<class T> void decode(waltz_hip_session& w,const waltz_hip_config& c,con
     require(h.mag_comp_bytes>=size_t(groups)*4+size_t(chunks)*3&&h.mag_comp_bytes<=size-BlobSize&&h.n_pwe<=p.n&&h.n_qo<=p.n
         &&h.pwe_bytes==size_t(h.n_pwe)*sizeof(T),"invalid section lengths");
     const T q=T(h.q);require(q>0&&std::isfinite(q),"invalid quantum");
-    const Layout l(h);require(l.end==size,"inconsistent archive size");
+    const auto l=WALTZ::BlobLayout::checked(h);require(l.end==size,"inconsistent archive size");
     auto* coeff=w.correction.get<T>(p.n);const auto* ranks=table(w,p);const auto d=p.dims;
     const unsigned bytes=p.n*2;
     const bool full=d.x%16==0&&d.y%16==0&&d.z%p.bz==0;
@@ -673,8 +666,8 @@ extern "C" size_t waltz_hip_max_bytes(const waltz_hip_config* c){
     try{
         const auto p=native::profile(*c);
         const auto chunks=native::blocks(p.n,8192),groups=native::blocks(chunks,16);
-        return native::align8(native::BlobSize+size_t(chunks)*3+size_t(groups)*4+size_t(p.n)*2+(p.n+7)/8)
-            +native::align8(size_t(p.n)*4)*3+native::align8(size_t(p.n)*c->width);
+        const size_t wzp=size_t(chunks)*3+size_t(groups)*4+size_t(p.n)*2+(p.n+7)/8;
+        return WALTZ::BlobLayout::checked(wzp,p.n,p.n*c->width,p.n).end;
     }catch(...){return 0;}
 }
 extern "C" int waltz_hip_encode(waltz_hip_session* w,const waltz_hip_config* c,const void* in,void* out,size_t cap,size_t* n){

@@ -21,29 +21,10 @@ namespace waltz_cpu_detail {
 // false WITHOUT writing anything if avx2 is false, unavailable, or the brick
 // is too narrow for the vector path; the caller then uses its scalar loop.
 // There are no allocations and no full-volume temporary.
-bool morton_decode_f32(const std::uint16_t* rank,
-                       const std::uint16_t* mag,
-                       const std::uint32_t* sign,
-                       std::size_t sign_base,
-                       float* output,
-                       std::size_t row_stride,
-                       std::size_t plane_stride,
-                       std::uint32_t nx,
-                       std::uint32_t ny,
-                       std::uint32_t nz,
-                       float q,
-                       bool avx2 = true);
-bool morton_decode_f64(const std::uint16_t* rank,
-                       const std::uint16_t* mag,
-                       const std::uint32_t* sign,
-                       std::size_t sign_base,
-                       double* output,
-                       std::size_t row_stride,
-                       std::size_t plane_stride,
-                       std::uint32_t nx,
-                       std::uint32_t ny,
-                       std::uint32_t nz,
-                       double q,
-                       bool avx2 = true);
+template<class T>
+bool morton_decode(const std::uint16_t* rank, const std::uint16_t* mag,
+                   const std::uint32_t* sign, std::size_t sign_base, T* output,
+                   std::size_t row_stride, std::size_t plane_stride,
+                   std::uint32_t nx, std::uint32_t ny, std::uint32_t nz, T q, bool avx2 = true);
 
 } // namespace waltz_cpu_detail

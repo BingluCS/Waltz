@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
@@ -84,9 +85,7 @@ bool oracle(const T* input, const T* reconstructed, uint32_t n, double bound,
 template <class T>
 bool invoke(const T* input, const T* reconstructed, uint32_t n, double bound,
               uint32_t* indices, T* errors, uint32_t* count) {
-    if constexpr (sizeof(T) == 4)
-        return waltz_cpu_detail::repairs_f32(input, reconstructed, n, bound, indices, errors, count);
-    else return waltz_cpu_detail::repairs_f64(input, reconstructed, n, bound, indices, errors, count);
+    return waltz_cpu_detail::collect_repairs(input,reconstructed,n,bound,indices,errors,count,true);
 }
 template <class T>
 bool scan(const T* input, uint32_t n) {
@@ -132,6 +131,13 @@ bool compare(const T* input, const T* reconstructed, uint32_t n, double bound, b
     bool input_finite = true, values_finite = true;
     for (uint32_t i = 0; i < n; ++i) { input_finite &= finite(input[i]); values_finite &= finite(reconstructed[i]); }
     check(scan(reinterpret_cast<T*>(source.data), n) == input_finite, "input finite scan equals bitwise oracle");
+    for (bool avx : {false, true}) {
+        Buffer copy(source.size, offset ? sizeof(T) : 0);
+        const bool ok=waltz_cpu_detail::copy_finite(input,reinterpret_cast<T*>(copy.data),n,avx);
+        check(ok==input_finite && (!ok || !n || std::memcmp(copy.data,input,source.size)==0),
+              "encoder finite copy preserves input bits or rejects");
+        check(copy.guards(), "encoder finite copy stays within destination");
+    }
     check(scan(reinterpret_cast<T*>(values.data), n) == values_finite, "reconstruction finite scan equals bitwise oracle");
     return got;
 }
@@ -242,6 +248,8 @@ void type_suite() {
         }
         std::feclearexcept(FE_ALL_EXCEPT);
         check(!scan(source, 19), "signaling NaN exponent rejects");
+        for (bool avx : {false, true})
+            check(!waltz_cpu_detail::copy_finite(source,values,19,avx), "finite copy rejects signaling NaN");
         check(!std::fetestexcept(FE_INVALID), "finite classification does not raise invalid for signaling NaN");
     }
 }

@@ -12,39 +12,6 @@ template<class T> struct ScalarLine {
 };
 #endif
 
-// A small number of legacy GPU outputs used contracted endpoint arithmetic.
-// Evaluate only those output expressions, not a halo tile. The original input
-// remains immutable until the complete line has been evaluated.
-template<class T,class S>
-WALTZ_LINE_TARGET void compatibility_edges(T* scratch,T* const* dest,
- std::size_t stride,uint32_t n,unsigned lanes,int tile,bool contiguous) {
-    using V=typename S::V;using C=Constants<T>;constexpr unsigned W=S::width;
-    auto raw=[&](int64_t p) WALTZ_LINE_TARGET {
-        const size_t at=coefficient(p,n)*stride;
-        if(contiguous)return S::load(dest[0]+at);
-        T values[W];for(unsigned l=0;l<W;++l)values[l]=dest[l][at];
-        return S::load(values);
-    };
-    const V kh=S::set(-C::k),kl=S::set(C::ik);
-    for(uint32_t start=0;start<n;start+=unsigned(tile)){
-        const int64_t left=int64_t(start)-2,right=int64_t(start)+tile+2;
-        auto ed=[&](int64_t p) WALTZ_LINE_TARGET {
-            V before=S::mul(raw(p-1),kh),after=S::mul(raw(p+1),kh);
-            V sum=p==left?S::fma(raw(p-1),kh,after):
-                  p==right?S::fma(raw(p+1),kh,before):S::add(before,after);
-            return S::fma(S::set(-C::d),sum,S::mul(raw(p),kl));
-        };
-        auto og=[&](int64_t p) WALTZ_LINE_TARGET {return S::fma(S::set(-C::g),S::add(ed(p-1),ed(p+1)),S::mul(raw(p),kh));};
-        auto eb=[&](int64_t p) WALTZ_LINE_TARGET {return S::fma(S::set(-C::b),S::add(og(p-1),og(p+1)),ed(p));};
-        auto oa=[&](int64_t p) WALTZ_LINE_TARGET {return S::fma(S::set(-C::a),S::add(eb(p-1),eb(p+1)),og(p));};
-        S::store(scratch+size_t(start)*W,eb(start));
-        if(start+1<n)S::store(scratch+size_t(start+1)*W,oa(start+1));
-        const uint64_t last=uint64_t(start)+tile-1;
-        if(last<n&&last!=start+1)S::store(scratch+size_t(last)*W,oa(last));
-    }
-    (void)lanes;
-}
-
 template<class T,bool Inverse,class S>
 WALTZ_LINE_TARGET void whole_line(T* scratch,T* const* dest,std::size_t stride,
  uint32_t n,int tile,bool folded,bool contiguous) {
@@ -108,9 +75,15 @@ WALTZ_LINE_TARGET void whole_line(T* scratch,T* const* dest,std::size_t stride,
         V e=S::load(scratch),o;
         if constexpr(Inverse){
             T values[W];for(unsigned l=0;l<W;++l)values[l]=dest[l][0];
-            o=S::mul(S::load(values),kh);
-            e=S::fma(d,S::add(o,o),e);o=S::fma(g,S::add(e,e),o);
-            e=S::fma(b,S::add(o,o),e);
+            const V raw=S::load(values);
+            o=S::mul(raw,kh);
+            const V center=S::fma(d,S::add(o,o),e);
+            // The folded GPU tile contracts the left neighbor at position -2.
+            // All other neighbors reflect to the same sample, without contraction.
+            const V left=folded?S::fma(d,S::fma(raw,kh,o),e):center;
+            const V odd_left=S::fma(g,S::add(left,center),o);
+            const V odd_right=S::fma(g,S::add(center,center),o);
+            e=S::fma(b,S::add(odd_left,odd_right),center);
         }else{
             o=e;o=S::fma(a,S::add(e,e),o);e=S::fma(b,S::add(o,o),e);
             o=S::fma(g,S::add(e,e),o);e=S::fma(d,S::add(o,o),e);e=S::mul(e,kl);
@@ -126,7 +99,6 @@ WALTZ_LINE_TARGET void whole_line(T* scratch,T* const* dest,std::size_t stride,
         }
         else {stage(1,a);stage(0,b);stage(1,g);stage(0,d);}
     }
-    if constexpr(Inverse)if(folded&&n==1)compatibility_edges<T,S>(scratch,dest,stride,n,W,tile,contiguous);
     for(uint32_t p=0;p<n;++p){
         V v=S::load(scratch+size_t(p)*W);
         if constexpr(!Inverse)if(n!=1)v=S::mul(v,p%2?kh:kl);

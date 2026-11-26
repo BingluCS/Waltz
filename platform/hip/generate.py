@@ -82,7 +82,7 @@ wzp = header(wzp)
 wzp = edit(wzp, '#include <cuda/atomic>\n', '')
 wzp = edit(wzp, '#include "lossless/wzp.hpp"\n#include "utils/Config.hpp"\n', '')
 wzp = edit(wzp, '    byte* __restrict__ cmpdata, unsigned int* __restrict__ group_done,\n'
-                '    unsigned long long* __restrict__ group_carry) {',
+                '    unsigned long long* __restrict__ group_carry, uint32_t* archive_payload) {',
 '''    unsigned int* __restrict__ next_chunk) {''')
 wzp = edit(wzp, '__global__\n__launch_bounds__(TPB, 2048 / TPB)\nvoid encode_kernel',
                 'template<bool PackedCodes=false>\n__global__\n__launch_bounds__(TPB, 2048 / TPB)\nvoid encode_kernel')
@@ -113,7 +113,7 @@ wzp = edit(wzp, '''    __shared__ uint32_t block_nnz;
     if (threadIdx.x == 0) block_nnz = 0U;''', '')
 wzp = edit(wzp, 'atomicAdd(&chunk_counter, 1ull)', 'atomicAdd(next_chunk, 1u)')
 wzp = edit(wzp, '''        if (chunk >= chunks) {
-            if (threadIdx.x == 0 && block_nnz != 0U)
+            if (!archive_payload && threadIdx.x == 0 && block_nnz != 0U)
                 atomicAdd(&nnz_counter, block_nnz);
             return;
         }''', '        if (chunk >= chunks) return;')

@@ -1,5 +1,6 @@
 #include "quantize_avx2.hpp"
 
+#include <algorithm>
 #include <cfenv>
 #include <cmath>
 #include <cstdint>
@@ -190,6 +191,36 @@ void type_suite() {
     _mm_setcsr(csr);
 #endif
 }
+// Feed the fused path exact half ties, an adjacent nonzero, and a wide code.
+// Reverse ranks and an unaligned sign base catch accidental row-order stores.
+void brick_rows() {
+    using T=float;
+    for (uint32_t width : {15u,16u}) {
+        constexpr uint32_t stride=19, base=11, origin=37;
+        T data[3*stride]{}, ref[3*stride]{};
+        uint16_t rank[48]{}, mag[48];
+        uint32_t signs[2]={1,0}, want_signs[2]={1,0}, indices[48]{}, values[48]{}, count=0;
+        int32_t codes[48]{};
+        for(uint32_t x=0;x<width;++x){
+            data[x]=x%2 ? T(-0.5) : T(0.5);
+            data[stride+x]=x==3 ? T(-70000) : x==5 ? std::nextafter(T(0.5),T(1)) : T(-1.5);
+            data[2*stride+x]=x%3==0 ? T(-65535) : x%3==1 ? T(25) : T(-0.25);
+        }
+        std::memcpy(ref,data,sizeof(data)); std::memset(mag,0xab,sizeof(mag));
+        for(uint32_t i=0;i<3*width;++i)rank[i]=uint16_t(3*width-1-i);
+        for(uint32_t y=0;y<3;++y)oracle(ref+y*stride,width,T(1),T(1),codes+y*width);
+        check(waltz_cpu_detail::quantize_morton_f32(data,{stride,3,1},{width,3,1},rank,mag,
+              signs,origin,base,T(1),T(1),indices,values,count),"fused brick status");
+        for(uint32_t i=0;i<3*width;++i){
+            int32_t v=codes[i];const auto bit=base+rank[i];
+            if(v<0)want_signs[bit/32]|=1U<<(bit%32);
+            check(mag[rank[i]]==uint16_t(std::min(std::abs(v),65535)),"fused Morton magnitude");
+        }
+        check(!std::memcmp(ref,data,sizeof(data)),"fused native values, including +0 and padding");
+        check(!std::memcmp(signs,want_signs,sizeof(signs)),"fused sign bits");
+        check(count==1 && indices[0]==origin+stride+3 && values[0]==70000,"fused wide index/value");
+    }
+}
 } // namespace
 
 int main() {
@@ -205,6 +236,7 @@ int main() {
     std::printf("Waltz quantizer AVX2/FMA dispatch=%u\n", unsigned(waltz_cpu_detail::quantize_has_avx2()));
     type_suite<float>();
     type_suite<double>();
+    if(waltz_cpu_detail::quantize_has_avx2())brick_rows();
     std::fesetenv(&old);
 #if defined(__x86_64__) || defined(__i386__)
     _mm_setcsr(csr);

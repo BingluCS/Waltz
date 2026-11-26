@@ -1,4 +1,5 @@
 #include "waltz_cpu.h"
+#include "../../include/utils/Blob.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -105,7 +106,7 @@ void benchmark(std::uint32_t nx, std::uint32_t ny, std::uint32_t nz, bool dyadic
                             absolute_error, WALTZ_CPU_SCALAR};
     const std::size_t count = std::size_t(nx) * ny * nz, bytes = count * sizeof(T);
     const std::size_t capacity = waltz_cpu_max_compressed_bytes(&config);
-    require(capacity >= 40, "invalid maximum archive capacity");
+    require(capacity >= WALTZ::BlobSize, "invalid maximum archive capacity");
     Buffer input(bytes), saved_input(bytes), output(bytes), scalar_output(bytes);
     Buffer archive(capacity), scalar_archive(capacity);
     fill(reinterpret_cast<T*>(input.data), config);
@@ -125,8 +126,10 @@ void benchmark(std::uint32_t nx, std::uint32_t ny, std::uint32_t nz, bool dyadic
                                                       archive.data, capacity, &archive_bytes);
             const auto end_compress = Clock::now();
             api_result(compressed, workspace, "compress");
-            require(archive_bytes >= 40 && archive_bytes <= capacity, "invalid encoded size");
-            require(archive.data[8] == unsigned(dyadic), "unexpected transform schedule");
+            require(archive_bytes >= WALTZ::BlobSize && archive_bytes <= capacity, "invalid encoded size");
+            WALTZ::WaltzBlobHeader header;
+            std::memcpy(&header,archive.data,sizeof(header));
+            require(header.use_dyadic() == dyadic, "unexpected transform schedule");
             const auto begin_decompress = Clock::now();
             const int decompressed = waltz_cpu_decompress(workspace.value, &config, archive.data,
                                                           archive_bytes, output.data, bytes);

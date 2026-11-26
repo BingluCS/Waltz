@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from pywaltz._raw_chunks import RawFrames, pack
-from pywaltz.gpu_dataloader import WaltzGPUDataLoader
+from pywaltz.gpu_dataloader import WaltzGPUDataLoader, _Decoder
 from pywaltz.hdf5 import create_dataset
 
 
@@ -55,6 +55,30 @@ class RawChunkTests(unittest.TestCase):
 
 @unittest.skipUnless(os.getenv("WALTZ_TEST_GPU_LOADER")=="1", "opt-in native device test")
 class DeviceTests(unittest.TestCase):
+    @unittest.skipUnless(torch.version.hip, "HIP serial-session lifecycle")
+    def test_lazy_hip_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/"lazy.h5"
+            ref = fixture(path)["frames"][:1].tobytes()
+            ds = RawFrames(path, "frames", 0)
+            wire = pack([ds[0]], indexed=True)
+            device = torch.device("cuda", torch.cuda.current_device())
+            for mode in ("batch", "auto", "serial"):
+                decoder = _Decoder(ds, device, None, mode)
+                try:
+                    self.assertIsNone(decoder.session)
+                    self.assertEqual(decoder.batch(ds, wire).cpu().numpy().tobytes(), ref)
+                    if mode != "serial":
+                        self.assertIsNone(decoder.session)
+                    if mode == "batch":
+                        continue
+                    decoder.multi = None  # Exercise auto fallback after a successful batch.
+                    self.assertEqual(decoder.batch(ds, wire).cpu().numpy().tobytes(), ref)
+                    self.assertIsNotNone(decoder.session)
+                finally:
+                    decoder.close()
+                self.assertIsNone(decoder.session)
+
     def test_gpu_matches_h5py(self):
         self.assertTrue(torch.cuda.is_available())
         with tempfile.TemporaryDirectory() as tmp:

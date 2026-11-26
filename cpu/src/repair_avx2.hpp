@@ -24,18 +24,18 @@ namespace waltz_cpu_detail {
 // The caller must establish FE_TONEAREST and preserve subnormals (FTZ/DAZ off),
 // as codec FPGuard does. Invalid environment/bound/arguments return false.
 // AVX2/FMA is runtime gated; unsupported CPUs use the same scalar rule.
-bool repairs_f32(const float* original, const float* reconstructed,
-                   std::uint32_t n, double bound, std::uint32_t* indices,
-                   float* errors, std::uint32_t* count) noexcept;
-bool repairs_f64(const double* original, const double* reconstructed,
-                   std::uint32_t n, double bound, std::uint32_t* indices,
-                   double* errors, std::uint32_t* count) noexcept;
+template<class T>
+bool collect_repairs(const T* original,const T* reconstructed,std::uint32_t n,double bound,
+                     std::uint32_t* indices,T* errors,std::uint32_t* count,bool avx2) noexcept;
 
 // Bitwise exponent classification: finite scans do not require a particular
 // floating-point environment and do not raise FP exceptions for signaling
 // NaNs. Empty scans accept null; nonempty null scans return false.
 bool finite_f32(const float* values, std::uint32_t n) noexcept;
 bool finite_f64(const double* values, std::uint32_t n) noexcept;
+// Encoder-only destination is private scratch and may be partially filled on failure.
+template<class T>
+bool copy_finite(const T* input,T* dest,std::uint32_t n,bool avx2) noexcept;
 bool repair_has_avx2() noexcept;
 
 } // namespace waltz_cpu_detail

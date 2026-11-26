@@ -81,22 +81,11 @@ uint32_t validate(const waltz_cpu_config* c,bool encoding) {
     return uint32_t(n);
 }
 bool use_avx(const waltz_cpu_config& c) {return c.backend!=WALTZ_CPU_SCALAR&&waltz_cpu::transform_has_avx2();}
-bool within_bound(double a,double b,double bound) {
-    // Compare the exact native difference to the double bound, independently
-    // of whether the host long double has 64, 80, or 128 bits. TwoDiff's tail
-    // matters only when the rounded high part equals the bound.
-    double high=a-b,magnitude=std::fabs(high);
-    if(!std::isfinite(high)||magnitude>bound)return false;
-    if(magnitude<bound)return true;
-    double bv=a-high,av=high+bv,br=bv-b,ar=a-av,low=ar+br;
-    return !((high>0&&low>0)||(high<0&&low<0));
-}
 void disjoint(const void* a,size_t as,const void* b,size_t bs) {
     uintptr_t x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);
     if(as>UINTPTR_MAX-x||bs>UINTPTR_MAX-y)fail("pointer range overflow");
     if(x<y+bs&&y<x+as)fail("input and output must not overlap");
 }
-uint8_t levels(uint32_t n) {uint8_t l=0;while(n>8&&l<5){n=n/2+n%2;++l;}return l;}
 uint32_t zband(Shape d,uint8_t lz,bool dyadic) {
     if(dyadic)return std::min(16U,(d.nz+((1U<<lz)-1U))>>lz);
     if(d.nz<4)return d.nz;
@@ -125,16 +114,21 @@ void ranks(waltz_cpu_workspace& w,Shape d,uint32_t bz) {
     }
     w.nx=d.nx;w.ny=d.ny;w.nz=d.nz;w.bz=bz;
 }
-template<class F> void traverse(waltz_cpu_workspace& w,Shape d,uint32_t bz,F fn) {
+template<class F> void for_each_brick(waltz_cpu_workspace& w,Shape d,uint32_t bz,F fn) {
     ranks(w,d,bz);size_t base=0,plane=size_t(d.nx)*d.ny;
     for(uint32_t z0=0;z0<d.nz;z0+=bz)for(uint32_t y0=0;y0<d.ny;y0+=16)for(uint32_t x0=0;x0<d.nx;x0+=16){
         uint32_t nx=std::min(16U,d.nx-x0),ny=std::min(16U,d.ny-y0),nz=std::min(bz,d.nz-z0);
         unsigned s=unsigned(nx!=16)|(unsigned(ny!=16)<<1)|(unsigned(nz!=bz)<<2);
-        const uint16_t* r=w.rank+s*8192;
-        for(uint32_t z=0;z<nz;++z)for(uint32_t y=0;y<ny;++y)for(uint32_t x=0;x<nx;++x)
-            fn((z0+z)*plane+size_t(y0+y)*d.nx+x0+x,base+r[(z*ny+y)*nx+x]);
+        fn(size_t(z0)*plane+size_t(y0)*d.nx+x0,base,w.rank+s*8192,Shape{nx,ny,nz});
         base+=size_t(nx)*ny*nz;
     }
+}
+template<class F> void traverse(waltz_cpu_workspace& w,Shape d,uint32_t bz,F fn) {
+    const size_t plane=size_t(d.nx)*d.ny;
+    for_each_brick(w,d,bz,[&](size_t origin,size_t base,const uint16_t* rank,Shape b){
+        for(uint32_t z=0;z<b.nz;++z)for(uint32_t y=0;y<b.ny;++y)for(uint32_t x=0;x<b.nx;++x)
+            fn(origin+size_t(z)*plane+size_t(y)*d.nx+x,base+rank[(z*b.ny+y)*b.nx+x]);
+    });
 }
 template<class T> struct Buffers {
     T *data,*scratch,*errors;
@@ -144,26 +138,20 @@ template<class T> struct Buffers {
 };
 template<class T> void inverse_reorder(waltz_cpu_workspace& w,Shape d,uint32_t bz,
                                       const uint16_t* mag,const uint32_t* sign,T* output,T q,bool avx) {
-    ranks(w,d,bz);size_t base=0,plane=size_t(d.nx)*d.ny;
-    for(uint32_t z0=0;z0<d.nz;z0+=bz)for(uint32_t y0=0;y0<d.ny;y0+=16)for(uint32_t x0=0;x0<d.nx;x0+=16){
-        const uint32_t nx=std::min(16U,d.nx-x0),ny=std::min(16U,d.ny-y0),nz=std::min(bz,d.nz-z0);
-        const unsigned s=unsigned(nx!=16)|(unsigned(ny!=16)<<1)|(unsigned(nz!=bz)<<2);
-        const uint16_t* r=w.rank+s*8192;T* tile=output+size_t(z0)*plane+size_t(y0)*d.nx+x0;
-        bool done=false;
-        if(avx){
-            if constexpr(sizeof(T)==4)done=morton_decode_f32(r,mag+base,sign,base,tile,d.nx,plane,nx,ny,nz,q);
-            else done=morton_decode_f64(r,mag+base,sign,base,tile,d.nx,plane,nx,ny,nz,q);
-        }
-        if(!done)for(uint32_t z=0;z<nz;++z)for(uint32_t y=0;y<ny;++y)for(uint32_t x=0;x<nx;++x){
-            const size_t packed=base+r[(z*ny+y)*nx+x];T v=T(mag[packed])*q;
+    const size_t plane=size_t(d.nx)*d.ny;
+    for_each_brick(w,d,bz,[&](size_t origin,size_t base,const uint16_t* rank,Shape b){
+        T* tile=output+origin;
+        if(avx&&morton_decode(rank,mag+base,sign,base,tile,d.nx,plane,b.nx,b.ny,b.nz,q))return;
+        for(uint32_t z=0;z<b.nz;++z)for(uint32_t y=0;y<b.ny;++y)for(uint32_t x=0;x<b.nx;++x){
+            const size_t packed=base+rank[(z*b.ny+y)*b.nx+x];T v=T(mag[packed])*q;
             tile[size_t(z)*plane+size_t(y)*d.nx+x]=(sign[packed/32]>>(packed%32)&1U)?-v:v;
         }
-        base+=size_t(nx)*ny*nz;
-    }
+    });
 }
-template<class T> Buffers<T> buffers(waltz_cpu_workspace& w,uint32_t n,Shape d) {
-    size_t sizes[]={mul(n,sizeof(T)),mul(waltz_cpu::workspace_elements(d),sizeof(T)),mul(n,sizeof(T)),
-        mul(n,2),mul((size_t(n)+31)/32,4),mul(n,4),mul(n,4),mul(n,4),n};
+template<class T> Buffers<T> buffers(waltz_cpu_workspace& w,uint32_t n,Shape d,
+                                     uint32_t qout_slots,uint32_t repair_slots) {
+    size_t sizes[]={mul(n,sizeof(T)),mul(waltz_cpu::workspace_elements(d),sizeof(T)),mul(repair_slots,sizeof(T)),
+        mul(n,2),mul((size_t(n)+31)/32,4),mul(qout_slots,4),mul(qout_slots,4),mul(repair_slots,4),n};
     size_t total=0;for(size_t s:sizes)total=add(total,align(s,64));
     if(total>w.capacity){void* p=std::aligned_alloc(64,align(total,64));if(!p)throw std::bad_alloc();std::free(w.memory);w.memory=p;w.capacity=total;}
     uint8_t* p=static_cast<uint8_t*>(w.memory);void* starts[9];
@@ -187,42 +175,51 @@ void sort_pairs(uint32_t* index,uint32_t* value,uint32_t count) {
     for(uint32_t end=count;end>1;--end){std::swap(index[0],index[end-1]);std::swap(value[0],value[end-1]);sift(0,end-1);}
 }
 template<class T> size_t encode(waltz_cpu_workspace& w,const waltz_cpu_config& c,const T* input,uint8_t* out,size_t cap,uint32_t n) {
-    Shape s{c.nx,c.ny,c.nz};auto b=buffers<T>(w,n,s);bool avx=use_avx(c);
-    uint8_t lx=levels(std::min(c.nx,c.ny)),lz=levels(c.nz);bool dyadic=lx==lz;
+    Shape s{c.nx,c.ny,c.nz};auto b=buffers<T>(w,n,s,n,n);bool avx=use_avx(c);
+    uint8_t lx=dwt_levels(std::min(c.nx,c.ny)),lz=dwt_levels(c.nz);bool dyadic=lx==lz;
     uint32_t bz=zband(s,lz,dyadic);double quantum=1.5*c.absolute_error;
     T q=T(quantum),inv=T(1.0/quantum);
     if(!(q>T(0))||!std::isfinite(q)||!std::isfinite(inv))fail("quantum not representable in native type");
-    if(avx){
-        bool finite;if constexpr(sizeof(T)==4)finite=finite_f32(input,n);else finite=finite_f64(input,n);
-        if(!finite)fail("nonfinite input is unsupported");
-    } else for(uint32_t i=0;i<n;++i)if(!std::isfinite(input[i]))fail("nonfinite input is unsupported");
-    std::memcpy(b.data,input,size_t(n)*sizeof(T));
+    if(!copy_finite(input,b.data,n,avx))fail("nonfinite input is unsupported");
     transform(b.data,b.scratch,s,lx,lz,dyadic,2,avx,false);
     std::memset(b.sign,0,((size_t(n)+31)/32)*4);
-    if(avx){
-        auto* temporary=reinterpret_cast<int32_t*>(b.scratch);bool valid;
-        if constexpr(sizeof(T)==4)valid=quantize_f32(b.data,n,q,inv,temporary);
-        else valid=quantize_f64(b.data,n,q,inv,temporary);
-        if(!valid)fail("coefficient exceeds portable integer conversion domain");
-    }
     uint32_t nq=0,np=0;
-    traverse(w,s,bz,[&](size_t at,size_t packed){
-        bool negative;int32_t mag;
+    bool packed=false;
+    if constexpr(sizeof(T)==4) {
         if(avx){
-            int32_t v;std::memcpy(&v,reinterpret_cast<const uint8_t*>(b.scratch)+at*4,4);
-            negative=v<0;mag=negative?-v:v;
-        }else{
-            T scaled=b.data[at]*inv;
-            if(!std::isfinite(scaled)||std::fabs(static_cast<long double>(scaled))>=9223372036854775808.0L)
-                fail("coefficient exceeds portable integer conversion domain");
-            long long v=std::llrint(scaled);negative=v<0;
-            uint64_t mag64=uint64_t(negative?-v:v);mag=int32_t(std::min<uint64_t>(mag64,INT32_MAX));
-            b.data[at]=mag?T(negative?-mag:mag)*q:T(0);
+            for_each_brick(w,s,bz,[&](size_t origin,size_t base,const uint16_t* rank,Shape brick){
+                if(!quantize_morton_f32(b.data+origin,s,brick,rank,b.mag+base,b.sign,
+                                        origin,base,q,inv,b.qidx,b.qval,nq))
+                    fail("coefficient exceeds portable integer conversion domain");
+            });
+            packed=true;
         }
-        b.mag[packed]=uint16_t(std::min(mag,65535));
-        if(negative&&mag)b.sign[packed/32]|=1U<<(packed%32);
-        if(mag>65535){b.qidx[nq]=uint32_t(at);b.qval[nq++]=uint32_t(mag);}
-    });
+    }
+    if(!packed){
+        if(avx){
+            auto* temporary=reinterpret_cast<int32_t*>(b.scratch);bool valid;
+            if constexpr(sizeof(T)==4)valid=quantize_f32(b.data,n,q,inv,temporary);
+            else valid=quantize_f64(b.data,n,q,inv,temporary);
+            if(!valid)fail("coefficient exceeds portable integer conversion domain");
+        }
+        traverse(w,s,bz,[&](size_t at,size_t packed){
+            bool negative;int32_t mag;
+            if(avx){
+                int32_t v;std::memcpy(&v,reinterpret_cast<const uint8_t*>(b.scratch)+at*4,4);
+                negative=v<0;mag=negative?-v:v;
+            }else{
+                T scaled=b.data[at]*inv;
+                if(!std::isfinite(scaled)||std::fabs(static_cast<long double>(scaled))>=9223372036854775808.0L)
+                    fail("coefficient exceeds portable integer conversion domain");
+                long long v=std::llrint(scaled);negative=v<0;
+                uint64_t mag64=uint64_t(negative?-v:v);mag=int32_t(std::min<uint64_t>(mag64,INT32_MAX));
+                b.data[at]=mag?T(negative?-mag:mag)*q:T(0);
+            }
+            b.mag[packed]=uint16_t(std::min(mag,65535));
+            if(negative&&mag)b.sign[packed/32]|=1U<<(packed%32);
+            if(mag>65535){b.qidx[nq]=uint32_t(at);b.qval[nq++]=uint32_t(mag);}
+        });
+    }
     // Morton traversal is not native index order. Portable side channels are
     // built in row-major order below, with no comparison-sort allocation.
     if(nq<=n/64) {
@@ -236,31 +233,25 @@ template<class T> size_t encode(waltz_cpu_workspace& w,const waltz_cpu_config& c
     uint32_t qi=0;for(uint32_t i=0;i<n;++i)if(b.seen[i]){b.qidx[qi]=i;std::memcpy(b.qval+qi,reinterpret_cast<uint8_t*>(b.scratch)+size_t(i)*4,4);++qi;}
     }
     transform(b.data,b.scratch,s,lx,lz,dyadic,2,avx,true);
-    if(avx){
-        bool valid;
-        if constexpr(sizeof(T)==4)valid=repairs_f32(input,b.data,n,c.absolute_error,b.pidx,b.errors,&np);
-        else valid=repairs_f64(input,b.data,n,c.absolute_error,b.pidx,b.errors,&np);
-        if(!valid)fail("native repair cannot meet strict bound or nonfinite reconstruction");
-    } else for(uint32_t i=0;i<n;++i){
-        T value=b.data[i],e=value-input[i];
-        if(!std::isfinite(value)||!std::isfinite(e))fail("nonfinite synthesis/correction unsupported in portable profile");
-        // Precisely match Halo3DSynthEmit, including its native FP32 bound.
-        bool patch=sizeof(T)==4?std::fabs(e)>T(c.absolute_error):std::fabs(e)>c.absolute_error;
-        if(patch){b.pidx[np]=i;b.errors[np++]=e;value=value-e;}
-        if(!std::isfinite(value)||!within_bound(double(value),double(input[i]),c.absolute_error))
-            fail("native repair cannot meet strict bound for this input; no invalid archive emitted");
-    }
+    if(!collect_repairs(input,b.data,n,c.absolute_error,b.pidx,b.errors,&np,avx))
+        fail("native repair cannot meet strict bound or nonfinite reconstruction");
     // Match the existing GPU's finite auxiliary-buffer domain explicitly.
     if((n>(1U<<20)&&nq>=(1U<<20))||(n>(1U<<22)&&np>=(1U<<22)))fail("portable GPU side-channel capacity reached");
     if(cap<BlobSize)fail("archive capacity too small");
     size_t wb=wzp_encode(b.mag,b.sign,n,out+BlobSize,cap-BlobSize,avx);
-    size_t pi=align(add(BlobSize,wb)),pe=align(add(pi,mul(np,4))),qo=align(add(pe,mul(np,sizeof(T)))),qv=align(add(qo,mul(nq,4))),end=align(add(qv,mul(nq,4)));
+    const auto [pi,pe,qo,qv,end]=BlobLayout::checked(wb,np,uint32_t(np*sizeof(T)),nq);
     if(end>cap)fail("archive capacity too small");
     out[0]=WaltzBlobHeader::pack_flags(dyadic,sizeof(T),PweEncoding::Native,Synthesis::HaloAllLevels);
     out[1]=lx;out[2]=lz;out[3]=uint8_t(bz);wr32(out+BlobPweBytes,uint32_t(np*sizeof(T)));
     write_real(out+BlobQuantum,quantum);wr64(out+BlobWzpBytes,wb);wr32(out+BlobPweCount,np);wr32(out+BlobQoutCount,nq);
     std::memset(out+BlobSize+wb,0,pi-BlobSize-wb);
-    std::memset(out+pi,0,end-pi);
+    // The four arrays below are written in full. Only odd-length 32-bit
+    // arrays leave a four-byte gap at the next 8-byte section boundary.
+    if(np & 1U){
+        wr32(out+pe-4,0);
+        if constexpr(sizeof(T)==4)wr32(out+qo-4,0);
+    }
+    if(nq & 1U){wr32(out+qv-4,0);wr32(out+end-4,0);}
     for(uint32_t i=0;i<np;++i){wr32(out+pi+size_t(i)*4,b.pidx[i]);write_real(out+pe+size_t(i)*sizeof(T),b.errors[i]);}
     for(uint32_t i=0;i<nq;++i){wr32(out+qo+size_t(i)*4,b.qidx[i]);wr32(out+qv+size_t(i)*4,b.qval[i]);}
     return end;
@@ -290,16 +281,18 @@ template<class T> void decode(waltz_cpu_workspace& w,const waltz_cpu_config& c,c
     uint8_t lx=in[1],lz=in[2],bz=in[3];bool dyadic=in[0]&1;
     if(synthesis!=Synthesis::HaloAllLevels)fail("unsupported Waltz synthesis mode");
     if(lx>5||lz>5||bz<1||bz>32||(dyadic&&lx!=lz))fail("invalid levels or z band");
-    if(lx!=levels(std::min(c.nx,c.ny))||lz!=levels(c.nz))fail("dimensions/levels mismatch");
+    if(lx!=dwt_levels(std::min(c.nx,c.ny))||lz!=dwt_levels(c.nz))fail("dimensions/levels mismatch");
     double quantum=read_real<double>(in+BlobQuantum);T q=T(quantum);
     if(!(quantum>0)||!std::isfinite(quantum)||!(q>T(0))||!std::isfinite(q))fail("invalid quantum");
     uint64_t w64=rd64(in+BlobWzpBytes);uint32_t np=rd32(in+BlobPweCount),nq=rd32(in+BlobQoutCount),pb=rd32(in+BlobPweBytes);
     if(w64>SIZE_MAX||np>n||nq>n)fail("invalid section counts");
-    size_t wb=size_t(w64),pi=align(add(BlobSize,wb)),pe=align(add(pi,mul(np,4))),qo=align(add(pe,pb)),qv=align(add(qo,mul(nq,4))),end=align(add(qv,mul(nq,4)));
+    const size_t wb=size_t(w64);
+    const auto [pi,pe,qo,qv,end]=BlobLayout::checked(wb,np,pb,nq);
     if(end!=size)fail("truncated archive or trailing data");
     if(!compact&&pb!=size_t(np)*sizeof(T))fail("invalid native correction section");
     if(compact&&(!np||pb<24+size_t((np+31)/32)*8||pb>=size_t(np)*sizeof(T)))fail("invalid compact correction section");
-    Shape s{c.nx,c.ny,c.nz};auto b=buffers<T>(w,n,s);const bool avx=use_avx(c);
+    // Q-outliers are read in place; only the validated repairs need staging.
+    Shape s{c.nx,c.ny,c.nz};auto b=buffers<T>(w,n,s,0,np);const bool avx=use_avx(c);
     wzp_decode(in+BlobSize,wb,n,b.mag,b.sign,avx);
     inverse_reorder(w,s,bz,b.mag,b.sign,b.data,q,avx);
     validate_indices(in+qo,nq,n,b.seen);
@@ -348,7 +341,7 @@ waltz_cpu_workspace* waltz_cpu_create(void) {return static_cast<waltz_cpu_worksp
 void waltz_cpu_destroy(waltz_cpu_workspace* w) {if(w){std::free(w->memory);std::free(w);}}
 const char* waltz_cpu_last_error(const waltz_cpu_workspace* w) {return w?w->error:"null workspace";}
 int waltz_cpu_has_avx2(void) {return waltz_cpu::transform_has_avx2()?1:0;}
-size_t waltz_cpu_max_compressed_bytes(const waltz_cpu_config* c) {try{uint32_t n=validate(c,true);size_t z=BlobSize;z=add(z,align(wzp_max_bytes(n)));z=add(z,align(mul(n,unsigned(c->type))));for(int i=0;i<3;++i)z=add(z,align(mul(n,4)));return z;}catch(...){return 0;}}
+size_t waltz_cpu_max_compressed_bytes(const waltz_cpu_config* c) {try{uint32_t n=validate(c,true);return BlobLayout::checked(wzp_max_bytes(n),n,n*unsigned(c->type),n).end;}catch(...){return 0;}}
 int waltz_cpu_compress(waltz_cpu_workspace* w,const waltz_cpu_config* c,const void* input,void* archive,size_t cap,size_t* written) {
     if(written)*written=0;
     try{if(!w||!input||!archive||!written)fail("null argument");w->error[0]=0;uint32_t n=validate(c,true);if(reinterpret_cast<uintptr_t>(input)%unsigned(c->type))fail("input must have native type alignment");disjoint(input,size_t(n)*unsigned(c->type),archive,cap);FPGuard guard;

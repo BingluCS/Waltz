@@ -3,6 +3,7 @@
 #include <cfenv>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
@@ -144,6 +145,76 @@ bool quantize_f64(double* data, std::uint32_t n, double q, double inv, std::int3
     if (quantize_has_avx2()) return vector_f64(data, n, q, inv, codes);
 #endif
     return scalar(data, 0, n, q, inv, codes);
+}
+
+#if WALTZ_QUANT_X86
+namespace {
+// Full Morton rows are 16 samples wide. At ties, nearest-even produces +0.
+WALTZ_QUANT_AVX2
+bool clear_zero_row(float* data, float inv) noexcept {
+    const auto scale = _mm256_set1_ps(inv), half = _mm256_set1_ps(.5f);
+    const auto mask = _mm256_castsi256_ps(_mm256_set1_epi32(INT32_MAX));
+    auto a = _mm256_and_ps(mask, _mm256_mul_ps(_mm256_loadu_ps(data), scale));
+    auto b = _mm256_and_ps(mask, _mm256_mul_ps(_mm256_loadu_ps(data+8), scale));
+    auto ok = _mm256_and_ps(_mm256_cmp_ps(a, half, _CMP_LE_OQ), _mm256_cmp_ps(b, half, _CMP_LE_OQ));
+    if (_mm256_movemask_ps(ok) != 255) return false;
+    _mm256_storeu_ps(data, _mm256_setzero_ps());
+    _mm256_storeu_ps(data+8, _mm256_setzero_ps());
+    return true;
+}
+
+// Return false for the uncommon wide-magnitude row; its exceptions are
+// recorded by the ordinary loop. No exception or sign is emitted for zero.
+WALTZ_QUANT_AVX2
+bool scatter_narrow(const int32_t* codes,const uint16_t* rank,uint16_t* mag,
+                    uint32_t* sign,size_t base) noexcept {
+    const __m256i a=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes));
+    const __m256i b=_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes+8));
+    const __m256i aa=_mm256_abs_epi32(a),ab=_mm256_abs_epi32(b);
+    const __m256i limit=_mm256_set1_epi32(65535);
+    if(!_mm256_testz_si256(_mm256_or_si256(aa,ab),_mm256_xor_si256(limit,_mm256_set1_epi32(-1))))return false;
+    const __m256i zero=_mm256_setzero_si256();
+    unsigned nz=unsigned(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(aa,zero))))
+               |(unsigned(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(ab,zero))))<<8);
+    unsigned neg=unsigned(_mm256_movemask_ps(_mm256_castsi256_ps(a)))
+               |(unsigned(_mm256_movemask_ps(_mm256_castsi256_ps(b)))<<8);
+    for(;nz;nz&=nz-1){unsigned x=__builtin_ctz(nz);int32_t v=codes[x];mag[rank[x]]=uint16_t(v<0?-v:v);}
+    for(;neg;neg&=neg-1){unsigned x=__builtin_ctz(neg);size_t bit=base+rank[x];sign[bit/32]|=1U<<(bit%32);}
+    return true;
+}
+} // namespace
+#endif
+
+// Dispatch is performed once by the outer encoder; scalar and FP64 keep the
+// original traversal. Partial brick rows use the same quantizer with its tail.
+WALTZ_QUANT_AVX2
+bool quantize_morton_f32(float* data,waltz_cpu::Shape field,waltz_cpu::Shape b,
+                         const uint16_t* rank,uint16_t* mag,uint32_t* sign,
+                         size_t origin,size_t base,float q,float inv,
+                         uint32_t* indices,uint32_t* values,uint32_t& count) noexcept {
+#if WALTZ_QUANT_X86
+    const size_t plane=size_t(field.nx)*field.ny;
+    std::memset(mag,0,size_t(b.nx)*b.ny*b.nz*sizeof(*mag));
+    for(uint32_t z=0;z<b.nz;++z)for(uint32_t y=0;y<b.ny;++y,rank+=b.nx){
+        const size_t at=z*plane+size_t(y)*field.nx;
+        float* row=data+at;
+        if(b.nx==16 && clear_zero_row(row,inv))continue;
+        int32_t codes[16];
+        if(!vector_f32(row,b.nx,q,inv,codes))return false;
+        if(b.nx==16 && scatter_narrow(codes,rank,mag,sign,base))continue;
+        for(uint32_t x=0;x<b.nx;++x){
+            const int32_t code=codes[x];
+            if(!code)continue;
+            const uint32_t magnitude=code<0?-code:code, r=rank[x];
+            mag[r]=uint16_t(magnitude>65535?65535:magnitude);
+            if(code<0){const size_t bit=base+r;sign[bit/32]|=1U<<(bit%32);}
+            if(magnitude>65535){indices[count]=uint32_t(origin+at+x);values[count++]=magnitude;}
+        }
+    }
+    return true;
+#else
+    return false; // Unreachable: quantize_has_avx2() is false on this build.
+#endif
 }
 
 } // namespace waltz_cpu_detail

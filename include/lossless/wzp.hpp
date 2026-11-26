@@ -28,6 +28,11 @@ void wzp_encode(const uint16_t* input,
                                  uint32_t n,
                                  cudaStream_t stream = 0);
 size_t wzp_encode_with_sign_finish(uint32_t* nnz, double* ms);
+// Full codec: return fixed metadata bytes now and write the variable payload
+// size to a device counter for the caller's existing completion readback.
+size_t wzp_enqueue(const uint16_t* input,const uint32_t* sign_bitmap,uint32_t n,
+                   uint32_t* archive_payload,cudaStream_t stream);
+double wzp_elapsed(); // only after the operation's stream has completed
 const void* wzp_encoded_buf();
 // Requires completion of the decode stream, before reusing WZP's timing events.
 double wzp_decode_elapsed();

@@ -41,34 +41,6 @@ __device__ __forceinline__ uint32_t approx_len_dev(uint32_t n, int lev) {
     return low;
 }
 
-// whole-sample symmetric (mirror, no edge repeat) folding -- SPERR's symmetric_idx
-__device__ __forceinline__ uint32_t sym_idx(int64_t idx, int64_t last) {
-    while (idx < 0 || idx > last) {
-        if (idx < 0)
-            idx = -idx;
-        if (idx > last) {
-            // Form the full 64-bit reflection with explicit carry/borrow.
-            // Avoid the sm120 codegen issue in the C++ expression 2*last-idx.
-            int64_t reflected;
-            asm volatile(
-                "{\n\t"
-                ".reg .b32 a0, a1, b0, b1, t0, t1, r0, r1;\n\t"
-                "mov.b64 {a0, a1}, %1;\n\t"
-                "mov.b64 {b0, b1}, %2;\n\t"
-                "add.cc.u32 t0, a0, a0;\n\t"
-                "addc.u32 t1, a1, a1;\n\t"
-                "sub.cc.u32 r0, t0, b0;\n\t"
-                "subc.u32 r1, t1, b1;\n\t"
-                "mov.b64 %0, {r0, r1};\n\t"
-                "}"
-                : "=l"(reflected)
-                : "l"(last), "l"(idx));
-            idx = reflected;
-        }
-    }
-    return static_cast<uint32_t>(idx);
-}
-
 // Local synthesis windows reach at most seven samples beyond either edge.
 // For lengths >= 9 a single mirror fold suffices; shorter axes may need
 // repeated folds. Global buffer offsets remain 64-bit.

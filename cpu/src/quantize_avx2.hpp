@@ -2,6 +2,8 @@
 #define WALTZ_CPU_QUANTIZE_AVX2_HPP
 
 #include <cstdint>
+#include <cstddef>
+#include "transform.hpp"
 
 namespace waltz_cpu_detail {
 
@@ -35,6 +37,13 @@ bool quantize_f32(float* data, std::uint32_t n, float native_q, float native_inv
 bool quantize_f64(double* data, std::uint32_t n, double native_q, double native_inv,
                    std::int32_t* signed_magnitudes) noexcept;
 bool quantize_has_avx2() noexcept;
+
+// Internal codec path. The caller has validated q/inv and the FP environment.
+// data/mag point to this brick, sign and exceptions to the full volume.
+bool quantize_morton_f32(float* data, waltz_cpu::Shape field, waltz_cpu::Shape brick,
+                    const std::uint16_t* rank, std::uint16_t* mag, std::uint32_t* sign,
+                    std::size_t origin, std::size_t base, float q, float inv,
+                    std::uint32_t* indices, std::uint32_t* values, std::uint32_t& count) noexcept;
 
 } // namespace waltz_cpu_detail
 #endif

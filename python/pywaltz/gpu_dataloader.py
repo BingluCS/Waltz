@@ -25,6 +25,7 @@ class _Decoder:
         self.device = device
         self.mode = mode
         self.hip = bool(torch.version.hip)
+        self.session = None
         var = "WALTZ_HIP_LIBRARY" if self.hip else "WALTZ_CUDA_LIBRARY"
         name = "libwaltz_hip_native.so" if self.hip else "libwaltz.so"
         try:
@@ -33,8 +34,10 @@ class _Decoder:
             self.multi = (self._bind("waltz_gpu_decode_batch", C.c_char_p,
                           [C.POINTER(_BatchShape),p,p,sz,p,sz,p,sz,C.c_double,p])
                           if hasattr(self.lib,"waltz_gpu_decode_batch") else None)
-            if mode == "batch" and self.multi is None:
-                raise RuntimeError("batch decoder unavailable; rebuild the native Waltz library")
+            if mode == "batch":
+                if self.multi is None:
+                    raise RuntimeError("batch decoder unavailable; rebuild the native Waltz library")
+                return  # No single-chunk entry points are needed in this mode.
             if self.hip:
                 self.config = _HipConfig(*dataset.xyz, dataset.width, dataset.bound)
                 self._bind("waltz_hip_create", p, [C.c_int])
@@ -42,9 +45,6 @@ class _Decoder:
                 self._bind("waltz_hip_error", C.c_char_p, [p])
                 self.decode = self._bind("waltz_hip_decode", C.c_int,
                                          [p, C.POINTER(_HipConfig), p, sz, p, sz])
-                self.session = self.lib.waltz_hip_create(device.index)
-                if not self.session:
-                    raise RuntimeError("cannot create Waltz HIP wave64 decoder")
             else:
                 self.decode = self._bind("waltz_cuda_decode_chunk", C.c_char_p,
                                          [C.c_uint32]*3 + [C.c_int, p, sz, p, sz, p])
@@ -57,12 +57,17 @@ class _Decoder:
         return fn
 
     def close(self):
-        if self.hip:
+        if self.session is not None:
             self.lib.waltz_hip_destroy(self.session)
+            self.session = None
 
     def tile_into(self, d, ptr, size, out, stream):
         args = (ptr, size, out.data_ptr(), out.numel()*d.width)
         if self.hip:
+            if self.session is None:
+                self.session = self.lib.waltz_hip_create(self.device.index)
+                if not self.session:
+                    raise RuntimeError("cannot create Waltz HIP wave64 decoder")
             rc = self.decode(self.session, C.byref(self.config), *args)
             error = self.lib.waltz_hip_error(self.session) if rc else None
         else:

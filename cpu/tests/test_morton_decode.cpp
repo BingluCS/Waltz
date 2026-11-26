@@ -9,7 +9,6 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
-#include <type_traits>
 #include <vector>
 
 #if defined(__unix__)
@@ -72,18 +71,7 @@ void scalar(const std::uint16_t* rank, const std::uint16_t* mag,
             }
 }
 
-template<class T>
-bool simd(const std::uint16_t* rank, const std::uint16_t* mag,
-          const std::uint32_t* sign, std::size_t sign_base,
-          T* output, std::size_t row_stride, std::size_t plane_stride,
-          std::uint32_t nx, std::uint32_t ny, std::uint32_t nz, T q, bool avx2 = true) {
-    if constexpr (std::is_same_v<T, float>)
-        return waltz_cpu_detail::morton_decode_f32(rank, mag, sign, sign_base, output,
-                                                  row_stride, plane_stride, nx, ny, nz, q, avx2);
-    else
-        return waltz_cpu_detail::morton_decode_f64(rank, mag, sign, sign_base, output,
-                                                  row_stride, plane_stride, nx, ny, nz, q, avx2);
-}
+using waltz_cpu_detail::morton_decode;
 
 template<class T>
 void round_trips() {
@@ -123,13 +111,13 @@ void round_trips() {
                     for (const T q : scales) {
                         std::fill(expected.begin(), expected.end(), T(-123.5));
                         std::fill(output.begin(), output.end(), T(-123.5));
-                        require(!simd(rank, mag, signs.data(), base, output.data() + 1u,
+                        require(!morton_decode(rank, mag, signs.data(), base, output.data() + 1u,
                                       row, plane, nx, ny, nz, q, false), "disabled AVX path handled a brick");
                         require(std::memcmp(output.data(), expected.data(), output_size * sizeof(T)) == 0,
                                 "disabled AVX path wrote output");
                         scalar(rank, mag, signs.data(), base, expected.data() + 1u,
                                row, plane, nx, ny, nz, q);
-                        const bool used = simd(rank, mag, signs.data(), base, output.data() + 1u,
+                        const bool used = morton_decode(rank, mag, signs.data(), base, output.data() + 1u,
                                                row, plane, nx, ny, nz, q);
                         if (!used)
                             scalar(rank, mag, signs.data(), base, output.data() + 1u,
@@ -184,9 +172,9 @@ void protected_boundary_tests() {
     scalar(rank, mag, sign, 31, expected_d, n, n, n, 1, 1, 0.0015);
     auto* f = static_cast<float*>(float_mem.data);
     auto* d = static_cast<double*>(double_mem.data);
-    if (!simd(rank, mag, sign, 31, f, n, n, n, 1, 1, 0.0015f))
+    if (!morton_decode(rank, mag, sign, 31, f, n, n, n, 1, 1, 0.0015f))
         scalar(rank, mag, sign, 31, f, n, n, n, 1, 1, 0.0015f);
-    if (!simd(rank, mag, sign, 31, d, n, n, n, 1, 1, 0.0015))
+    if (!morton_decode(rank, mag, sign, 31, d, n, n, n, 1, 1, 0.0015))
         scalar(rank, mag, sign, 31, d, n, n, n, 1, 1, 0.0015);
     require(std::memcmp(f, expected_f, sizeof(expected_f)) == 0 &&
             std::memcmp(d, expected_d, sizeof(expected_d)) == 0, "protected-boundary output mismatch");
@@ -211,7 +199,7 @@ void volume_decode(Volume v, const std::uint16_t* const* tables,
                 const unsigned shape = unsigned(nx != 16u) | (unsigned(ny != 16u) << 1u) |
                                        (unsigned(nz != v.bz) << 2u);
                 T* const output = out + std::size_t(z) * plane + std::size_t(y) * v.nx + x;
-                if (!avx2 || !simd(tables[shape], mag + base, sign, base, output,
+                if (!avx2 || !morton_decode(tables[shape], mag + base, sign, base, output,
                                    v.nx, plane, nx, ny, nz, q))
                     scalar(tables[shape], mag + base, sign, base, output,
                            v.nx, plane, nx, ny, nz, q);

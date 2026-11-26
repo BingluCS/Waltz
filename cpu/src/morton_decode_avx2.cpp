@@ -49,7 +49,7 @@ void tail(const std::uint16_t* rank, const std::uint16_t* mag,
 }
 
 #if WALTZ_MORTON_X86
-WALTZ_MORTON_AVX2 void decode_f32(const std::uint16_t* rank, const std::uint16_t* mag,
+WALTZ_MORTON_AVX2 void decode_vectors(const std::uint16_t* rank, const std::uint16_t* mag,
                                  const std::uint32_t* sign, std::size_t sign_base,
                                  float* output, std::size_t row_stride, std::size_t plane_stride,
                                  std::uint32_t nx, std::uint32_t ny, std::uint32_t nz, float q) {
@@ -88,7 +88,7 @@ WALTZ_MORTON_AVX2 void decode_f32(const std::uint16_t* rank, const std::uint16_t
     }
 }
 
-WALTZ_MORTON_AVX2 void decode_f64(const std::uint16_t* rank, const std::uint16_t* mag,
+WALTZ_MORTON_AVX2 void decode_vectors(const std::uint16_t* rank, const std::uint16_t* mag,
                                  const std::uint32_t* sign, std::size_t sign_base,
                                  double* output, std::size_t row_stride, std::size_t plane_stride,
                                  std::uint32_t nx, std::uint32_t ny, std::uint32_t nz, double q) {
@@ -128,14 +128,16 @@ WALTZ_MORTON_AVX2 void decode_f64(const std::uint16_t* rank, const std::uint16_t
 
 } // namespace
 
-bool morton_decode_f32(const std::uint16_t* rank, const std::uint16_t* mag,
-                       const std::uint32_t* sign, std::size_t sign_base, float* output,
-                       std::size_t row_stride, std::size_t plane_stride,
-                       std::uint32_t nx, std::uint32_t ny, std::uint32_t nz, float q, bool avx2) {
-    if (!valid(rank, mag, sign, sign_base, output, row_stride, plane_stride, nx, ny, nz, 8, avx2))
+template<class T>
+bool morton_decode(const std::uint16_t* rank, const std::uint16_t* mag,
+                   const std::uint32_t* sign, std::size_t sign_base, T* output,
+                   std::size_t row_stride, std::size_t plane_stride,
+                   std::uint32_t nx, std::uint32_t ny, std::uint32_t nz, T q, bool avx2) {
+    constexpr std::uint32_t lanes = 32 / sizeof(T); // one AVX2 register
+    if (!valid(rank, mag, sign, sign_base, output, row_stride, plane_stride, nx, ny, nz, lanes, avx2))
         return false;
 #if WALTZ_MORTON_X86
-    decode_f32(rank, mag, sign, sign_base, output, row_stride, plane_stride, nx, ny, nz, q);
+    decode_vectors(rank, mag, sign, sign_base, output, row_stride, plane_stride, nx, ny, nz, q);
     return true;
 #else
     (void)q;
@@ -143,19 +145,9 @@ bool morton_decode_f32(const std::uint16_t* rank, const std::uint16_t* mag,
 #endif
 }
 
-bool morton_decode_f64(const std::uint16_t* rank, const std::uint16_t* mag,
-                       const std::uint32_t* sign, std::size_t sign_base, double* output,
-                       std::size_t row_stride, std::size_t plane_stride,
-                       std::uint32_t nx, std::uint32_t ny, std::uint32_t nz, double q, bool avx2) {
-    if (!valid(rank, mag, sign, sign_base, output, row_stride, plane_stride, nx, ny, nz, 4, avx2))
-        return false;
-#if WALTZ_MORTON_X86
-    decode_f64(rank, mag, sign, sign_base, output, row_stride, plane_stride, nx, ny, nz, q);
-    return true;
-#else
-    (void)q;
-    return false;
-#endif
-}
+template bool morton_decode<float>(const std::uint16_t*, const std::uint16_t*, const std::uint32_t*, std::size_t,
+    float*, std::size_t, std::size_t, std::uint32_t, std::uint32_t, std::uint32_t, float, bool);
+template bool morton_decode<double>(const std::uint16_t*, const std::uint16_t*, const std::uint32_t*, std::size_t,
+    double*, std::size_t, std::size_t, std::uint32_t, std::uint32_t, std::uint32_t, double, bool);
 
 } // namespace waltz_cpu_detail

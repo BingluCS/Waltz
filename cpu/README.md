@@ -17,6 +17,11 @@ cpu/build/waltz_cpu_cli c f32 72 70 25 0.001 input.f32 field.waltz auto
 cpu/build/waltz_cpu_cli d f32 72 70 25 0.001 field.waltz output.f32 auto
 ```
 
+On AVX2/FMA CPUs, `auto` fuses FP32 quantization and Morton ordering: each
+brick writes magnitudes and signs directly for the existing WZP encoder.
+This avoids a full-volume intermediate pass without changing the archive
+bytes. FP64 and scalar encoding keep their original paths.
+
 For CUDA interchange, use the normal [WALTZ::d_compress](../include/waltz.hpp)
 API with default settings. Build the interop test against the CUDA library
 from this checkout:

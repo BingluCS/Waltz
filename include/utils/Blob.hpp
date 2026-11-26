@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <stdexcept>
 
 namespace WALTZ {
 
@@ -16,6 +17,16 @@ enum class Synthesis : uint8_t {
     Convolution = 0, HaloLifting3D = 1, HaloAllLevels = 2,
     // Values 3–6 were experimental layouts and are not accepted.
 };
+
+// Archive geometry: stop once the low band fits in eight samples, at most five levels.
+inline constexpr uint8_t dwt_levels(uint32_t length) {
+    uint8_t levels = 0;
+    while (length > 8 && levels < 5) {
+        length -= length / 2;
+        ++levels;
+    }
+    return levels;
+}
 
 // Little-endian archive header; 8-byte-aligned sections follow:
 // WZP magnitude/sign stream, PWE indices/errors, quantization outlier indices/values.
@@ -54,6 +65,29 @@ inline constexpr size_t BlobPweCount = offsetof(WaltzBlobHeader, n_pwe);
 inline constexpr size_t BlobQoutCount = offsetof(WaltzBlobHeader, n_qo);
 static_assert(BlobSize == 32 && BlobPweBytes == 4 && BlobQuantum == 8 &&
               BlobWzpBytes == 16 && BlobPweCount == 24 && BlobQoutCount == 28);
+
+// Host-side view of the wire offsets (not part of the archive). Device callers
+// use from_sizes only after the host has checked the same chunk header.
+struct BlobLayout {
+    uint64_t pi, pv, qi, qv, end; // PWE indices/values, quantizer indices/values
+    WALTZ_BLOB_HD static constexpr uint64_t pad(uint64_t n) { return (n+7)&~uint64_t(7); }
+    WALTZ_BLOB_HD static constexpr BlobLayout from_sizes(uint64_t wzp, uint32_t np,
+                                                         uint32_t repairs, uint32_t nq) {
+        const uint64_t pi=BlobSize+pad(wzp), pv=pi+pad(uint64_t(np)*4);
+        const uint64_t qi=pv+pad(repairs), qbytes=pad(uint64_t(nq)*4);
+        return {pi,pv,qi,qi+qbytes,qi+2*qbytes};
+    }
+    static BlobLayout checked(uint64_t wzp,uint32_t np,uint32_t repairs,uint32_t nq) {
+        // All sections except WZP are bounded by 32-bit fields.
+        const uint64_t fixed=from_sizes(0,np,repairs,nq).end;
+        constexpr uint64_t limit=uint64_t(SIZE_MAX)&~uint64_t(7);
+        if (fixed>limit || wzp>limit-fixed) throw std::overflow_error("Waltz archive size overflow");
+        return from_sizes(wzp,np,repairs,nq);
+    }
+    static BlobLayout checked(const WaltzBlobHeader& h) {
+        return checked(h.mag_comp_bytes,h.n_pwe,h.pwe_bytes,h.n_qo);
+    }
+};
 #undef WALTZ_BLOB_HD
 
 inline constexpr uint32_t SMALL_PWE_MAGIC = 0x31575057U; // WPW1

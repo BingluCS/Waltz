@@ -64,10 +64,6 @@ class CompressionWorkspace {
 
 static thread_local CompressionWorkspace compression_workspace;
 
-static inline size_t blob_align(size_t v) {
-    return (v + 7) & ~static_cast<size_t>(7);
-}
-
 struct BlobSection {
     const void* data;
     size_t bytes;
@@ -236,7 +232,6 @@ static size_t Waltz_gather(void* output, bool use_dyadic,
         use_prepared ? PweEncoding::Small : PweEncoding::Native, synthesis);
     if (fused_plane_z) hdr.flags |= WaltzBlobHeader::CudaFusedPlaneZ;
     hdr.pwe_bytes = static_cast<uint32_t>(error_bytes);
-    // Keep section order and 8-byte alignment identical to Waltz_scatter.
     const BlobSection sections[] = {
         {lossless::wzp_encoded_buf(), mag_bytes},
         {pwe_index, pwe_count * sizeof(uint32_t)},
@@ -245,18 +240,17 @@ static size_t Waltz_gather(void* output, bool use_dyadic,
         {quant_value, qout_count * sizeof(int32_t)},
     };
     auto* cmpdata = static_cast<unsigned char*>(output);
-    size_t offset = blob_align(sizeof(hdr));
-    GatherPlan plan{};
+    const auto layout=BlobLayout::checked(hdr);
+    GatherPlan plan{{}, {BlobSize,layout.pi,layout.pv,layout.qi,layout.qv}};
     plan.small_header=small_header;plan.prepared_small=use_prepared;
     uint32_t blocks=0;
     for (unsigned i=0;i<5;++i) {
-        plan.sections[i]=sections[i];plan.offsets[i]=offset;
+        plan.sections[i]=sections[i];
         const bool sorted = ordered && ((i==1 || i==2) ? pwe_count>1 : i>=3 && qout_count>1);
         if (sorted) plan.sections[i].data=nullptr;
         blocks+=sorted ? unsigned((sections[i].bytes&7U)!=0)
                        : static_cast<uint32_t>((sections[i].bytes+4095U)/4096U);
         plan.block_ends[i]=blocks;
-        offset=blob_align(offset+sections[i].bytes);
     }
     static thread_local CompressionWorkspace sort_scratch;
     if (ordered && pwe_count>1)
@@ -268,7 +262,7 @@ static size_t Waltz_gather(void* output, bool use_dyadic,
     gather_sections<<<std::max(blocks,1U),256,0,stream>>>(cmpdata,hdr,plan);
     check_pwe_cuda(cudaGetLastError());
     check_pwe_cuda(cudaStreamSynchronize(stream));
-    return offset;
+    return layout.end;
 }
 
 struct BlobView {
@@ -279,31 +273,6 @@ struct BlobView {
     const unsigned char* quant_value;
     size_t bytes;
 };
-
-// Split the blob into device views, without allocating or copying payloads.
-template <typename T>
-static BlobView Waltz_scatter(const void* input, const WaltzBlobHeader& hdr) {
-    const auto* cmpdata = static_cast<const unsigned char*>(input);
-    const size_t sizes[] = {
-        static_cast<size_t>(hdr.mag_comp_bytes),
-        hdr.n_pwe * sizeof(uint32_t),
-        size_t(hdr.pwe_bytes),
-        hdr.n_qo * sizeof(uint32_t),
-        hdr.n_qo * sizeof(int32_t),
-    };
-    BlobView view{};
-    const unsigned char** sections[] = {
-        &view.magnitude, &view.pwe_index, &view.pwe_error,
-        &view.quant_index, &view.quant_value,
-    };
-    size_t offset = blob_align(sizeof(hdr));
-    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
-        *sections[i] = cmpdata + offset;
-        offset = blob_align(offset + sizes[i]);
-    }
-    view.bytes = offset;
-    return view;
-}
 
 // Decompression: apply the exact, original-precision PWE error.
 template <typename T>
@@ -330,18 +299,9 @@ apply_q_outliers(T* iq, const uint32_t* qidx, const int32_t* qval, uint32_t n, d
 static unsigned int* g_host_outlier_counts = nullptr;
 static WaltzBlobHeader* g_pipeline_host_header = nullptr;
 
-static uint8_t calculate_dwt_levels_1d(size_t len) {
-    uint8_t levels = 0;
-    while (len > 8 && levels < 5) {
-        len = (len + 1) / 2;
-        ++levels;
-    }
-    return levels;
-}
-
 void calculate_dwt_levels(dim3 data_dims, uint8_t& levels_xy, uint8_t& levels_z) {
-    levels_xy = calculate_dwt_levels_1d(std::min(data_dims.x, data_dims.y));
-    levels_z = calculate_dwt_levels_1d(data_dims.z);
+    levels_xy = dwt_levels(std::min(data_dims.x, data_dims.y));
+    levels_z = dwt_levels(data_dims.z);
 }
 
 // Conservatively map forward flat-column tiles to inverse row tiles. Only the
@@ -394,7 +354,7 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
 
     const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     if (g_host_outlier_counts == nullptr)
-        cudaMallocHost(reinterpret_cast<void**>(&g_host_outlier_counts), 3U * sizeof(unsigned int));
+        check_pwe_cuda(cudaMallocHost(reinterpret_cast<void**>(&g_host_outlier_counts), 4U * sizeof(unsigned int)));
 
     uint8_t levels_xy = 0, levels_z = 0;
     calculate_dwt_levels(data_dims, levels_xy, levels_z);
@@ -479,7 +439,7 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
         static_cast<size_t>(qout_cap) * (sizeof(uint32_t) + sizeof(int32_t)),
         static_cast<size_t>(pout_cap) * (sizeof(T) + sizeof(uint32_t)),
         0U, // Geometry rank lookup now has its own cache.
-        3U * sizeof(unsigned int),
+        4U * sizeof(unsigned int), // PWE count, Q-outlier count, repair status/size, WZP payload
     };
     size_t scratch_bytes = 0;
     for (size_t size : scratch_sizes)
@@ -579,10 +539,7 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
     compression_overlap.ensure();
     const cudaStream_t cuda_stream1=compression_overlap.stream;
     const cudaEvent_t overlap_done=compression_overlap.done, overlap_begin=compression_overlap.begin;
-    long long magc;
-    double t_mag;
-
-    WALTZ::lossless::wzp_encode(d_q_abs, d_q_sign, datasize, cuda_stream);
+    const size_t wzp_metadata = WALTZ::lossless::wzp_enqueue(d_q_abs,d_q_sign,datasize,d_cnt+3,cuda_stream);
 
     cudaStreamWaitEvent(cuda_stream1, timer.end, 0);
     cudaMemsetAsync(d_cnt, 0, sizeof(unsigned int), cuda_stream1);
@@ -618,12 +575,11 @@ size_t d_WALTZ_compress(T* d_oridata, char* d_cmpData, const WALTZ::Config& conf
     }
     cudaEventRecord(overlap_done, cuda_stream1);
 
-    // WZP packs magnitude and sign together in independently decodable groups.
-    magc = static_cast<long long>(WALTZ::lossless::wzp_encode_with_sign_finish(nullptr, &t_mag));
-
     check_pwe_cuda(cudaStreamWaitEvent(cuda_stream,overlap_done,0));
-    check_pwe_cuda(cudaMemcpyAsync(g_host_outlier_counts,d_cnt,3U*sizeof(unsigned int),cudaMemcpyDeviceToHost,cuda_stream));
+    check_pwe_cuda(cudaMemcpyAsync(g_host_outlier_counts,d_cnt,4U*sizeof(unsigned int),cudaMemcpyDeviceToHost,cuda_stream));
     check_pwe_cuda(cudaStreamSynchronize(cuda_stream));
+    const size_t magc = wzp_metadata + g_host_outlier_counts[3];
+    const double t_mag = WALTZ::lossless::wzp_elapsed();
     float overlap_ms = 0.0f;
     cudaEventElapsedTime(&overlap_ms, overlap_begin, compression_overlap.reconstructed);
     const double t_idwt = overlap_ms;
@@ -669,6 +625,7 @@ static size_t decode_impl(
                                    cudaMemcpyDeviceToHost, cuda_stream));
     check_pwe_cuda(cudaStreamSynchronize(cuda_stream));
     hdr = *g_pipeline_host_header;
+    const auto layout=BlobLayout::checked(hdr);
     const uint32_t N = config.num;
     dim3 dims(config.dimx, config.dimy, config.dimz);
     if (canonical_bytes) {
@@ -684,9 +641,7 @@ static size_t decode_impl(
             hdr.mag_comp_bytes < 3*chunks + 4*((chunks+15)/16) ||
             hdr.mag_comp_bytes > canonical_bytes - BlobSize ||
             hdr.n_pwe > N || hdr.n_qo > N || hdr.pwe_bytes != size_t(hdr.n_pwe)*sizeof(T) ||
-            canonical_bytes != BlobSize + blob_align(hdr.mag_comp_bytes) +
-                blob_align(size_t(hdr.n_pwe)*4) + blob_align(hdr.pwe_bytes) +
-                2*blob_align(size_t(hdr.n_qo)*4))
+            canonical_bytes != layout.end)
             throw std::runtime_error("invalid canonical Waltz chunk shape, header or length");
     }
     const bool fused_plane_z=(hdr.flags&WaltzBlobHeader::CudaFusedPlaneZ)!=0;
@@ -722,7 +677,8 @@ static size_t decode_impl(
     const uint32_t dec_quant_bz = hdr.reorder_bz;
     if (dec_quant_bz < 1U || dec_quant_bz > 32U)
         throw std::runtime_error("invalid Waltz reorder z-band");
-    const BlobView sections = Waltz_scatter<T>(d_cmpData, hdr);
+    const auto* src=reinterpret_cast<const unsigned char*>(d_cmpData);
+    const BlobView sections{src+BlobSize,src+layout.pi,src+layout.pv,src+layout.qi,src+layout.qv,layout.end};
 
     const bool full_reorder_bricks = dims.x % 16U == 0U && dims.y % 16U == 0U &&
                                       dims.z % dec_quant_bz == 0U;

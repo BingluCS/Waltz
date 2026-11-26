@@ -73,9 +73,13 @@ bool scalar_repairs(const T* original, const T* reconstructed, std::uint32_t beg
     return true;
 }
 
-template <class T>
-bool scalar_finite(const T* values, std::uint32_t begin, std::uint32_t n) noexcept {
-    for (std::uint32_t i = begin; i < n; ++i) if (!finite_one(values[i])) return false;
+template <bool Copy=false, class T>
+bool scalar_finite(const T* values, std::uint32_t begin, std::uint32_t n, T* dest=nullptr) noexcept {
+    for (std::uint32_t i=begin; i<n; ++i) {
+        const T v=values[i];
+        if (!finite_one(v)) return false;
+        if constexpr (Copy) dest[i]=v;
+    }
     return true;
 }
 
@@ -128,7 +132,7 @@ WALTZ_REPAIR_AVX2 inline bool finite4(__m256d values) noexcept {
 }
 
 WALTZ_REPAIR_AVX2
-bool vector_repairs_f32(const float* original, const float* reconstructed, std::uint32_t n,
+bool vector_repairs(const float* original, const float* reconstructed, std::uint32_t n,
                           double bound, std::uint32_t* indices, float* errors,
                           std::uint32_t& count) noexcept {
     const float native_bound = float(bound);
@@ -186,7 +190,7 @@ bool vector_repairs_f32(const float* original, const float* reconstructed, std::
 }
 
 WALTZ_REPAIR_AVX2
-bool vector_repairs_f64(const double* original, const double* reconstructed, std::uint32_t n,
+bool vector_repairs(const double* original, const double* reconstructed, std::uint32_t n,
                           double bound, std::uint32_t* indices, double* errors,
                           std::uint32_t& count) noexcept {
     const __m256d patch_bound = _mm256_set1_pd(bound);
@@ -233,19 +237,27 @@ bool vector_repairs_f64(const double* original, const double* reconstructed, std
     return scalar_repairs(original, reconstructed, i, n, bound, indices, errors, count);
 }
 
-WALTZ_REPAIR_AVX2
-bool vector_finite_f32(const float* values, std::uint32_t n) noexcept {
+template<bool Copy=false> WALTZ_REPAIR_AVX2
+bool vector_finite(const float* values, std::uint32_t n, float* dest=nullptr) noexcept {
     const std::uint32_t end = n & ~std::uint32_t(7);
     std::uint32_t i = 0;
-    for (; i < end; i += 8) if (!finite8(_mm256_loadu_ps(values + i))) return false;
-    return scalar_finite(values, i, n);
+    for (; i < end; i += 8) {
+        const __m256 v=_mm256_loadu_ps(values+i);
+        if (!finite8(v)) return false;
+        if constexpr (Copy) _mm256_storeu_ps(dest+i,v);
+    }
+    return scalar_finite<Copy>(values,i,n,dest);
 }
-WALTZ_REPAIR_AVX2
-bool vector_finite_f64(const double* values, std::uint32_t n) noexcept {
+template<bool Copy=false> WALTZ_REPAIR_AVX2
+bool vector_finite(const double* values, std::uint32_t n, double* dest=nullptr) noexcept {
     const std::uint32_t end = n & ~std::uint32_t(3);
     std::uint32_t i = 0;
-    for (; i < end; i += 4) if (!finite4(_mm256_loadu_pd(values + i))) return false;
-    return scalar_finite(values, i, n);
+    for (; i < end; i += 4) {
+        const __m256d v=_mm256_loadu_pd(values+i);
+        if (!finite4(v)) return false;
+        if constexpr (Copy) _mm256_storeu_pd(dest+i,v);
+    }
+    return scalar_finite<Copy>(values,i,n,dest);
 }
 #endif
 
@@ -270,31 +282,25 @@ bool repair_has_avx2() noexcept {
 #endif
 }
 
-bool repairs_f32(const float* original, const float* reconstructed, std::uint32_t n,
-                   double bound, std::uint32_t* indices, float* errors,
-                   std::uint32_t* count) noexcept {
+template<class T>
+bool collect_repairs(const T* original,const T* reconstructed,std::uint32_t n,double bound,
+                     std::uint32_t* indices,T* errors,std::uint32_t* count,bool avx2) noexcept {
     if (!valid_arguments(original, reconstructed, n, bound, indices, errors, count)) return false;
     if (!n) return true;
 #if WALTZ_REPAIR_X86
-    if (repair_has_avx2()) return vector_repairs_f32(original, reconstructed, n, bound, indices, errors, *count);
+    if (avx2 && repair_has_avx2()) return vector_repairs(original, reconstructed, n, bound, indices, errors, *count);
+#else
+    (void)avx2;
 #endif
     return scalar_repairs(original, reconstructed, 0, n, bound, indices, errors, *count);
 }
-bool repairs_f64(const double* original, const double* reconstructed, std::uint32_t n,
-                   double bound, std::uint32_t* indices, double* errors,
-                   std::uint32_t* count) noexcept {
-    if (!valid_arguments(original, reconstructed, n, bound, indices, errors, count)) return false;
-    if (!n) return true;
-#if WALTZ_REPAIR_X86
-    if (repair_has_avx2()) return vector_repairs_f64(original, reconstructed, n, bound, indices, errors, *count);
-#endif
-    return scalar_repairs(original, reconstructed, 0, n, bound, indices, errors, *count);
-}
+template bool collect_repairs(const float*,const float*,std::uint32_t,double,std::uint32_t*,float*,std::uint32_t*,bool) noexcept;
+template bool collect_repairs(const double*,const double*,std::uint32_t,double,std::uint32_t*,double*,std::uint32_t*,bool) noexcept;
 bool finite_f32(const float* values, std::uint32_t n) noexcept {
     if (!n) return true;
     if (!values) return false;
 #if WALTZ_REPAIR_X86
-    if (repair_has_avx2()) return vector_finite_f32(values, n);
+    if (repair_has_avx2()) return vector_finite(values, n);
 #endif
     return scalar_finite(values, 0, n);
 }
@@ -302,8 +308,21 @@ bool finite_f64(const double* values, std::uint32_t n) noexcept {
     if (!n) return true;
     if (!values) return false;
 #if WALTZ_REPAIR_X86
-    if (repair_has_avx2()) return vector_finite_f64(values, n);
+    if (repair_has_avx2()) return vector_finite(values, n);
 #endif
     return scalar_finite(values, 0, n);
 }
+template<class T>
+bool copy_finite(const T* input,T* dest,std::uint32_t n,bool avx2) noexcept {
+    if (!n) return true;
+    if (!input || !dest) return false;
+#if WALTZ_REPAIR_X86
+    if (avx2 && repair_has_avx2()) return vector_finite<true>(input,n,dest);
+#else
+    (void)avx2;
+#endif
+    return scalar_finite<true>(input,0,n,dest);
+}
+template bool copy_finite(const float*,float*,std::uint32_t,bool) noexcept;
+template bool copy_finite(const double*,double*,std::uint32_t,bool) noexcept;
 } // namespace waltz_cpu_detail

@@ -26,8 +26,6 @@ inline size_t mul(size_t a,size_t b) {
     need(!a || b<=std::numeric_limits<size_t>::max()/a,"batch size overflow");return a*b;
 }
 inline unsigned divup(unsigned n,unsigned k){return 1+(n-1)/k;}
-inline unsigned levels(unsigned n) {unsigned l=0;while(n>8 && l<5){n=(n+1)/2;++l;}return l;}
-__host__ __device__ inline size_t pad8(size_t n){return (n+7)&~size_t(7);}
 template<class T> struct Intermediate {
     T* out;
     __device__ void set_job(unsigned j,size_t stride){out+=j*stride;}
@@ -60,18 +58,17 @@ template<class T,bool Quant> __global__ void patches(const unsigned char* src,co
     if(!spans[2*j+1])return;
     const unsigned char* a=src+spans[2*j];const auto& h=*reinterpret_cast<const WaltzBlobHeader*>(a);
     if(i>=(Quant?h.n_qo:h.n_pwe))return;
-    size_t base=BlobSize+pad8(h.mag_comp_bytes);
-    if constexpr(Quant)base+=pad8(size_t(h.n_pwe)*4)+pad8(h.pwe_bytes);
-    const auto* indices=reinterpret_cast<const unsigned*>(a+base);
+    const auto l=BlobLayout::from_sizes(h.mag_comp_bytes,h.n_pwe,h.pwe_bytes,h.n_qo);
+    const auto* indices=reinterpret_cast<const unsigned*>(a+(Quant?l.qi:l.pi));
     const unsigned at=indices[i];
     if(at>=n || (i && indices[i-1]>=at)){atomicOr(status,1u);return;}
     if constexpr(Quant) {
-        const int v=reinterpret_cast<const int*>(a+base+pad8(size_t(h.n_qo)*4))[i];
+        const int v=reinterpret_cast<const int*>(a+l.qv)[i];
         if(v<=65535){atomicOr(status,1u);return;}
         T& dest=coeff[j*stride+at];T mag=T(v)*T(h.q);dest=dest<T(0)?-mag:mag;
     } else {
         out.set_job(j,stride);
-        if(T* dest=out.ptr(at))*dest-=reinterpret_cast<const T*>(a+base+pad8(size_t(h.n_pwe)*4))[i];
+        if(T* dest=out.ptr(at))*dest-=reinterpret_cast<const T*>(a+l.pv)[i];
     }
 }
 template<class T> void run(const waltz_batch_shape& d,const unsigned char* host,const unsigned char* packed,
@@ -83,7 +80,7 @@ template<class T> void run(const waltz_batch_shape& d,const unsigned char* host,
     const unsigned n=n64,jobs=jobs64;
     need(outbytes==mul(mul(mul(d.fx,d.fy),d.fz),mul(mul(d.samples,d.sides),sizeof(T))),"incorrect output size");
     const size_t stride=(n64+3)&~size_t(3),bank=stride*jobs;
-    const unsigned lx=levels(std::min(d.x,d.y)),lz=levels(d.z),bz=lossless::select_block_zband(tile,lz,lx==lz);
+    const unsigned lx=dwt_levels(std::min(d.x,d.y)),lz=dwt_levels(d.z),bz=lossless::select_block_zband(tile,lz,lx==lz);
     need(cap>=3*bank*sizeof(T)+8*256*bz*4+4 && bytes>=16*jobs64,"short batch buffers");
     const size_t table=bytes-16*jobs64;
     need(!(table%16),"unaligned batch spans");
@@ -99,7 +96,7 @@ template<class T> void run(const waltz_batch_shape& d,const unsigned char* host,
             && h.levels_xy==lx && h.levels_z==lz && h.reorder_bz==bz && T(h.q)>0 && std::isfinite(T(h.q))
             && h.mag_comp_bytes>=3*chunks+4*divup(chunks,16) && h.mag_comp_bytes<=sz-BlobSize
             && h.n_pwe<=n && h.n_qo<=n && h.pwe_bytes==h.n_pwe*sizeof(T)
-            && sz==BlobSize+pad8(h.mag_comp_bytes)+pad8(size_t(h.n_pwe)*4)+pad8(h.pwe_bytes)+2*pad8(size_t(h.n_qo)*4),
+            && sz==BlobLayout::checked(h).end,
             "invalid canonical batch archive");
         maxq=std::max(maxq,h.n_qo);maxp=std::max(maxp,h.n_pwe);
     }

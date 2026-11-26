@@ -262,7 +262,7 @@ void encode_kernel(const byte* __restrict__ input,
     uint32_t input_bytes, const uint32_t* __restrict__ sign_bitmap, byte* __restrict__ slots,
     byte* __restrict__ sign_slots, byte* __restrict__ meta,
     byte* __restrict__ cmpdata, unsigned int* __restrict__ group_done,
-    unsigned long long* __restrict__ group_carry) {
+    unsigned long long* __restrict__ group_carry, uint32_t* archive_payload) {
     const uint32_t chunks = input_bytes / CS + (input_bytes % CS != 0U);
     __shared__ __align__(16) long long storage[STORAGE_BYTES / sizeof(long long)];
     constexpr int counter_slot = STORAGE_BYTES / sizeof(long long) - 2 - WS;
@@ -279,7 +279,7 @@ void encode_kernel(const byte* __restrict__ input,
         __syncthreads();
         const uint32_t chunk = static_cast<uint32_t>(storage[counter_slot]);
         if (chunk >= chunks) {
-            if (threadIdx.x == 0 && block_nnz != 0U)
+            if (!archive_payload && threadIdx.x == 0 && block_nnz != 0U)
                 atomicAdd(&nnz_counter, block_nnz);
             return;
         }
@@ -437,8 +437,10 @@ void encode_kernel(const byte* __restrict__ input,
                 if (lane + 1u == group_count) {
                     group_offset = group_lookback(group_carry, group, inclusive);
                     group_offsets[group] = inclusive ? group_offset : 0U;
-                    if (first + group_count == chunks)
-                        payload_size = group_offset + inclusive;
+                    if (first + group_count == chunks) {
+                        if (archive_payload) *archive_payload = group_offset + inclusive;
+                        else payload_size = group_offset + inclusive;
+                    }
                 }
             }
             __syncthreads();
@@ -1097,8 +1099,8 @@ size_t wzp_encode_with_sign(const uint16_t* input,
     return wzp_encode_with_sign_finish(nnz, ms);
 }
 
-void wzp_encode(const uint16_t* input, const uint32_t* sign_bitmap,
-                                 uint32_t n, cudaStream_t stream) {
+size_t wzp_enqueue(const uint16_t* input, const uint32_t* sign_bitmap, uint32_t n,
+                   uint32_t* archive_payload, cudaStream_t stream) {
     reserve(n, stream);
     const uint32_t input_bytes = n * sizeof(uint16_t);
     const uint32_t chunks = (input_bytes + CS - 1u) / CS;
@@ -1111,13 +1113,20 @@ void wzp_encode(const uint16_t* input, const uint32_t* sign_bitmap,
     cudaMemsetAsync(WZPConfig::group_carry, 0, size_t(groups) * sizeof(unsigned long long), stream);
     encode_kernel<<<512, TPB, 0, stream>>>(raw, input_bytes, sign_bitmap,
         WZPConfig::slots, WZPConfig::sign_slots, metadata, WZPConfig::cmpdata,
-        WZPConfig::group_done, WZPConfig::group_carry);
+        WZPConfig::group_done, WZPConfig::group_carry, archive_payload);
 
-    cudaMemcpyFromSymbolAsync(WZPConfig::host_results, payload_size, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyFromSymbolAsync(WZPConfig::host_results + 1, nnz_counter, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream);
+    if (!archive_payload) {
+        cudaMemcpyFromSymbolAsync(WZPConfig::host_results, payload_size, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyFromSymbolAsync(WZPConfig::host_results + 1, nnz_counter, sizeof(uint32_t), 0, cudaMemcpyDeviceToHost, stream);
+    }
     cudaEventRecord(WZPConfig::timing_end, stream);
     reset_counter_kernel<<<1, 1, 0, stream>>>();
     cudaGetLastError();
+    return WZPConfig::signed_payload_offset;
+}
+
+void wzp_encode(const uint16_t* input, const uint32_t* sign_bitmap, uint32_t n,cudaStream_t stream) {
+    wzp_enqueue(input,sign_bitmap,n,nullptr,stream);
 }
 
 size_t wzp_encode_with_sign_finish(uint32_t* nnz, double* ms) {
@@ -1135,11 +1144,12 @@ const void* wzp_encoded_buf() {
     return WZPConfig::cmpdata;
 }
 
-double wzp_decode_elapsed() {
+double wzp_elapsed() {
     float ms = 0;
     cudaEventElapsedTime(&ms, WZPConfig::timing_begin, WZPConfig::timing_end);
     return ms;
 }
+double wzp_decode_elapsed() { return wzp_elapsed(); }
 
 void wzp_decode_with_sign(const void* cmpdata,
                           uint32_t n,
